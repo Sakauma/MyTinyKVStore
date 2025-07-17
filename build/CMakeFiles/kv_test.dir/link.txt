@@ -1,0 +1,1 @@
+/usr/bin/c++  -g   CMakeFiles/kv_test.dir/tests/main.cpp.o  -o ../target/bin/kv_test  -Wl,-rpath,/home/sakauma/code/lpue/target/lib: ../target/lib/libkvstore.so -lpthread 
