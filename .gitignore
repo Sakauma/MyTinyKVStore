@@ -39,3 +39,17 @@
 
 # debug information files
 *.dwo
+
+# 忽略所有在 build 目录下的内容
+/build/
+
+# 忽略所有在 target 目录下的内容
+/target/
+
+# 忽略其他编译产物
+*.o
+*.so
+*.a
+
+# 忽略IDE或编辑器相关的配置（可选，但推荐）
+.vscode/

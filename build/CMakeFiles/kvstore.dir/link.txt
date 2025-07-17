@@ -1,1 +1,0 @@
-/usr/bin/c++ -fPIC -g  -shared -Wl,-soname,libkvstore.so -o ../target/lib/libkvstore.so CMakeFiles/kvstore.dir/src/kvstore.cpp.o  -lpthread 
