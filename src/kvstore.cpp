@@ -153,7 +153,6 @@ public:
     std::optional<Value> Get(int key) {
         if (fatal_error_) return std::nullopt;
 
-        // FIX: 优先检查是否已被逻辑删除
         if (deleted_keys_.count(key)) {
             return std::nullopt;
         }
@@ -259,18 +258,12 @@ private:
             if (wal_file_.fail()) { handle_io_error("WAL recovery: read header failed"); return; }
 
             if (header.type == WAL_PUT) {
-                // 当日志中有一个PUT操作，我们只需确保它不在“已删除”集合里即可。
-                // 我们不调用physical_put，因为load_metadata已经从.dat文件加载了它。
                 deleted_keys_.erase(header.key);
-
-                // 跳过value数据，因为我们不需要它
                 wal_file_.seekg(header.value_size, std::ios::cur);
                 if (!wal_file_) { handle_io_error("WAL recovery: seek past value failed"); return; }
 
             } else if (header.type == WAL_DELETE) {
-                // 当日志中有一个DELETE操作，我们更新内存状态
                 deleted_keys_.insert(header.key);
-                //metadata_.erase(header.key);
                 cache_.erase(header.key);
             }
             count++;
@@ -346,7 +339,7 @@ private:
             } else if (task.type == DELETE) {
                 wal_log_delete(task.key);
                 if(fatal_error_) continue;
-                physical_delete(task.key); // 现在是逻辑删除
+                physical_delete(task.key);
             } else if (task.type == COMPACT) {
                 handle_compaction();
             }
@@ -407,7 +400,7 @@ private:
 
         DBHeader new_header;
         strncpy(new_header.name, "SimpleKV v1.0", sizeof(new_header.name));
-        new_header.free_list_head = 0; // 新文件没有自由链表
+        new_header.free_list_head = 0;
         compact_db_file.write(reinterpret_cast<char*>(&new_header), sizeof(new_header));
         if (!compact_db_file) {
             std::cerr << "ERROR: Compaction: failed to write new header." << std::endl;
@@ -420,7 +413,7 @@ private:
         // 遍历所有未被删除的key
         for (const auto& pair : metadata_) {
             int key = pair.first;
-            // 跳过已删除的key (虽然理论上它们已经从metadata_中移除，但双重保险)
+            // 跳过已删除的key
             if (deleted_keys_.count(key)) continue; 
             
             const DataRecordMeta& meta = pair.second;
@@ -467,7 +460,7 @@ private:
         
         metadata_ = new_metadata;
         deleted_keys_.clear(); // 清空删除标记
-        open_db_files(); // 重新打开文件句柄，特别是截断并重建WAL
+        open_db_files(); // 重新打开文件句柄，截断并重建WAL
 
         std::cout << "Compaction finished." << std::endl;
     }
