@@ -13,7 +13,8 @@
 #include <cstring>
 #include <sys/types.h>
 #include <unistd.h>
-
+#include <atomic>
+#include <set>
 
 // --- 文件格式定义 ---
 #pragma pack(1)
@@ -99,10 +100,14 @@ public:
     };
 
     Impl(const std::string& db_path, int num_consumers)
-        : db_file_path_(db_path), wal_file_path_(db_path + ".wal"), stop_(false), cache_(1000) {
+        : db_file_path_(db_path), wal_file_path_(db_path + ".wal"), stop_(false), fatal_error_(false), cache_(1000) {
         open_db_files();
+        if (fatal_error_) return;
+        load_metadata();  
+        if (fatal_error_) return;
         recover_from_wal();
-        load_metadata();
+        if (fatal_error_) return;
+
         for (int i = 0; i < num_consumers; ++i) {
             consumers_.emplace_back(&Impl::consumer_thread_worker, this);
         }
@@ -117,52 +122,66 @@ public:
         for (std::thread& t : consumers_) {
             if (t.joinable()) t.join();
         }
+        
+        // 在关闭前确保所有WAL日志都已落盘
+        if (wal_file_.is_open() && !fatal_error_) {
+            wal_file_.flush();
+        }
+
         if (db_file_.is_open()) db_file_.close();
         if (wal_file_.is_open()) wal_file_.close();
     }
 
     void Put(int key, const Value& value) {
+        if (fatal_error_) return;
         Task t = {PUT, key, value};
         enqueue_task(t);
     }
     
     void Delete(int key) {
+        if (fatal_error_) return;
         Task t = {DELETE, key};
         enqueue_task(t);
     }
 
     void Compact() {
+        if (fatal_error_) return;
         Task t = {COMPACT};
         enqueue_task(t);
     }
-
-    // --- FIX #1: 修复 Get 与消费者线程的AB-BA死锁 ---
-    // 通过规定统一的加锁顺序 (先锁db_mutex_, 后锁cache_mutex_) 来解决死锁问题。
+    
     std::optional<Value> Get(int key) {
-        // 1. 乐观地检查一次缓存，这步不锁DB，性能最好
+        if (fatal_error_) return std::nullopt;
+
+        // FIX: 优先检查是否已被逻辑删除
+        if (deleted_keys_.count(key)) {
+            return std::nullopt;
+        }
+
         auto cached_value = cache_.get(key);
         if (cached_value) {
             return cached_value;
         }
 
-        // 2. 缓存未命中。现在必须锁定数据库以从文件读取。
         std::lock_guard<std::mutex> lock(db_mutex_);
+        if (fatal_error_) return std::nullopt;
 
-        // 3. 关键：在持有数据库锁之后，再次检查缓存，防止“竞赛条件”。
         cached_value = cache_.get(key);
         if (cached_value) {
             return cached_value;
         }
 
-        // 4. 现在可以安全地从文件读取了。
         auto it = metadata_.find(key);
         if (it == metadata_.end()) {
             return std::nullopt;
         }
-
+        
         db_file_.seekg(it->second.offset);
+        if (!db_file_) { handle_io_error("Get: seekg failed"); return std::nullopt; }
+
         DataRecordHeader header;
         db_file_.read(reinterpret_cast<char*>(&header), sizeof(header));
+        if (!db_file_) { handle_io_error("Get: read header failed"); return std::nullopt; }
 
         if (header.magic != 0xDEADBEEF || header.key != key) {
             std::cerr << "ERROR: Corrupted data record for key " << key << std::endl;
@@ -173,8 +192,8 @@ public:
         val.size = header.value_size;
         val.data = std::shared_ptr<char[]>(new char[val.size]);
         db_file_.read(val.data.get(), val.size);
+        if (!db_file_) { handle_io_error("Get: read value failed"); return std::nullopt; }
 
-        // 5. 将从磁盘读取的数据放入缓存
         cache_.put(key, val);
         return val;
     }
@@ -190,81 +209,106 @@ private:
     std::fstream wal_file_;
     DBHeader db_header_;
     std::map<int, DataRecordMeta> metadata_;
+    std::set<int> deleted_keys_;
     std::mutex db_mutex_;
     std::queue<Task> task_queue_;
     std::mutex queue_mutex_;
     std::condition_variable cv_;
     std::vector<std::thread> consumers_;
     bool stop_;
+    std::atomic<bool> fatal_error_;
     LruCache cache_;
+
+    void handle_io_error(const std::string& context) {
+        if (fatal_error_) return;
+        std::cerr << "FATAL I/O ERROR: " << context << ". Halting operations." << std::endl;
+        fatal_error_ = true; 
+    }
 
     void open_db_files() {
         db_file_.open(db_file_path_, std::ios::in | std::ios::out | std::ios::binary);
         if (!db_file_.is_open()) {
             db_file_.open(db_file_path_, std::ios::out | std::ios::binary);
+            if (!db_file_.is_open()) { handle_io_error("Failed to create DB file"); return; }
             strncpy(db_header_.name, "SimpleKV v1.0", sizeof(db_header_.name));
             db_header_.free_list_head = 0;
             db_file_.write(reinterpret_cast<char*>(&db_header_), sizeof(db_header_));
+            if (!db_file_) { handle_io_error("Failed to write initial DB header"); return; }
             db_file_.close();
             db_file_.open(db_file_path_, std::ios::in | std::ios::out | std::ios::binary);
+            if (!db_file_.is_open()) { handle_io_error("Failed to reopen DB file"); return; }
         } else {
             db_file_.read(reinterpret_cast<char*>(&db_header_), sizeof(db_header_));
+            if (!db_file_) { handle_io_error("Failed to read DB header"); return; }
         }
         wal_file_.open(wal_file_path_, std::ios::in | std::ios::out | std::ios::binary | std::ios::app);
+        if (!wal_file_.is_open()) { handle_io_error("Failed to open WAL file"); return; }
     }
-    
+
     void recover_from_wal() {
         std::lock_guard<std::mutex> lock(db_mutex_);
         wal_file_.seekg(0);
+        if (!wal_file_) { handle_io_error("WAL recovery: seekg failed"); return; }
+        
         std::cout << "Starting WAL recovery..." << std::endl;
         int count = 0;
         while(true) {
             WalRecordHeader header;
             wal_file_.read(reinterpret_cast<char*>(&header), sizeof(header));
             if (wal_file_.eof()) break;
+            if (wal_file_.fail()) { handle_io_error("WAL recovery: read header failed"); return; }
 
             if (header.type == WAL_PUT) {
-                Value val;
-                val.size = header.value_size;
-                val.data = std::shared_ptr<char[]>(new char[val.size]);
-                wal_file_.read(val.data.get(), val.size);
-                physical_put(header.key, val);
+                // 当日志中有一个PUT操作，我们只需确保它不在“已删除”集合里即可。
+                // 我们不调用physical_put，因为load_metadata已经从.dat文件加载了它。
+                deleted_keys_.erase(header.key);
+
+                // 跳过value数据，因为我们不需要它
+                wal_file_.seekg(header.value_size, std::ios::cur);
+                if (!wal_file_) { handle_io_error("WAL recovery: seek past value failed"); return; }
+
             } else if (header.type == WAL_DELETE) {
-                physical_delete(header.key);
+                // 当日志中有一个DELETE操作，我们更新内存状态
+                deleted_keys_.insert(header.key);
+                //metadata_.erase(header.key);
+                cache_.erase(header.key);
             }
             count++;
         }
         std::cout << "WAL recovery finished. " << count << " records replayed." << std::endl;
-
-        wal_file_.close();
-        wal_file_.open(wal_file_path_, std::ios::out | std::ios::trunc);
-        wal_file_.close();
-        wal_file_.open(wal_file_path_, std::ios::in | std::ios::out | std::ios::binary | std::ios::app);
+        
+        wal_file_.clear();
     }
 
     void load_metadata() {
         std::lock_guard<std::mutex> lock(db_mutex_);
         metadata_.clear();
+        db_file_.seekg(0, std::ios::end);
+        if (!db_file_) { handle_io_error("Load metadata: seek to end failed"); return; }
+        off_t file_size = db_file_.tellg();
+
         db_file_.seekg(sizeof(DBHeader));
+        if (!db_file_) { handle_io_error("Load metadata: seek to start failed"); return; }
+        
         std::cout << "Loading metadata from DB file..." << std::endl;
-        while(true) {
+        
+        while (db_file_.tellg() < file_size) {
             off_t current_offset = db_file_.tellg();
             DataRecordHeader header;
             db_file_.read(reinterpret_cast<char*>(&header), sizeof(header));
             if (db_file_.eof()) break;
+            if (db_file_.fail()) { handle_io_error("Load metadata: read header failed"); return; }
 
             if (header.magic == 0xDEADBEEF) {
                 metadata_[header.key] = {current_offset, static_cast<uint32_t>(sizeof(DataRecordHeader) + header.value_size)};
-                db_file_.seekg(header.value_size, std::ios::cur);
-            } else if (header.magic == 0xCAFEFEED) {
-                 FreeListNode node;
-                 db_file_.seekg(- (long)sizeof(header.magic), std::ios::cur);
-                 db_file_.read(reinterpret_cast<char*>(&node), sizeof(node));
-                 db_file_.seekg(node.total_size - sizeof(FreeListNode), std::ios::cur);
+                db_file_.seekg(current_offset + sizeof(DataRecordHeader) + header.value_size);
+                if (!db_file_) { handle_io_error("Load metadata: seek past data record failed"); return; }
             } else {
-                 break;
+                std::cerr << "WARN: Unknown magic number encountered at offset " << current_offset << ". Stopping metadata load." << std::endl;
+                break; 
             }
         }
+        db_file_.clear();
         std::cout << "Metadata loaded. " << metadata_.size() << " keys found." << std::endl;
     }
 
@@ -275,107 +319,82 @@ private:
         }
         cv_.notify_one();
     }
-    
+
     void consumer_thread_worker() {
         while (true) {
             Task task;
             {
                 std::unique_lock<std::mutex> lock(queue_mutex_);
+                if (task_queue_.empty() && !stop_) {
+                    wal_file_.flush();
+                    if(!wal_file_) handle_io_error("Consumer flush failed");
+                }
                 cv_.wait(lock, [this] { return !task_queue_.empty() || stop_; });
                 if (stop_ && task_queue_.empty()) return;
                 task = task_queue_.front();
                 task_queue_.pop();
             }
+            if (fatal_error_) continue;
 
             std::lock_guard<std::mutex> lock(db_mutex_);
+            if (fatal_error_) continue;
+
             if (task.type == PUT) {
                 wal_log_put(task.key, task.value);
+                if(fatal_error_) continue;
                 physical_put(task.key, task.value);
             } else if (task.type == DELETE) {
                 wal_log_delete(task.key);
-                physical_delete(task.key);
+                if(fatal_error_) continue;
+                physical_delete(task.key); // 现在是逻辑删除
             } else if (task.type == COMPACT) {
                 handle_compaction();
             }
         }
     }
-    
+
     void wal_log_put(int key, const Value& value) {
         WalRecordHeader header = {WAL_PUT, key, (uint32_t)value.size};
         wal_file_.write(reinterpret_cast<char*>(&header), sizeof(header));
+        if (!wal_file_) { handle_io_error("WAL log put: write header failed"); return; }
         wal_file_.write(value.data.get(), value.size);
-        wal_file_.flush();
+        if (!wal_file_) { handle_io_error("WAL log put: write value failed"); return; }
     }
-
+    
     void wal_log_delete(int key) {
         WalRecordHeader header = {WAL_DELETE, key, 0};
         wal_file_.write(reinterpret_cast<char*>(&header), sizeof(header));
-        wal_file_.flush();
+        if (!wal_file_) { handle_io_error("WAL log delete: write header failed"); return; }
     }
 
     void physical_put(int key, const Value& value) {
         if (metadata_.count(key)) {
-            physical_delete(key);
         }
-        uint32_t required_size = sizeof(DataRecordHeader) + value.size;
-        off_t write_offset = find_free_space(required_size);
-        db_file_.seekp(write_offset);
+        
+        db_file_.seekp(0, std::ios::end);
+        if (!db_file_) { handle_io_error("Physical put: seekp to end failed"); return; }
+        off_t write_offset = db_file_.tellp();
+
         DataRecordHeader header = {0xDEADBEEF, key, (uint32_t)value.size};
         db_file_.write(reinterpret_cast<char*>(&header), sizeof(header));
+        if (!db_file_) { handle_io_error("Physical put: write header failed"); return; }
+
         db_file_.write(value.data.get(), value.size);
-        metadata_[key] = {write_offset, required_size};
+        if (!db_file_) { handle_io_error("Physical put: write value failed"); return; }
+
+        metadata_[key] = {write_offset, static_cast<uint32_t>(sizeof(DataRecordHeader) + value.size)};
         cache_.put(key, value);
-    }
-    
-    void physical_delete(int key) {
-        auto it = metadata_.find(key);
-        if (it == metadata_.end()) return;
-        DataRecordMeta meta = it->second;
-        FreeListNode free_node;
-        free_node.magic = 0xCAFEFEED;
-        free_node.total_size = meta.total_size;
-        free_node.next_offset = db_header_.free_list_head;
-        db_file_.seekp(meta.offset);
-        db_file_.write(reinterpret_cast<char*>(&free_node), sizeof(free_node));
-        db_header_.free_list_head = meta.offset;
-        db_file_.seekp(0);
-        db_file_.write(reinterpret_cast<char*>(&db_header_), sizeof(db_header_));
-        metadata_.erase(it);
-        cache_.erase(key);
+        deleted_keys_.erase(key);
     }
 
-    off_t find_free_space(uint32_t required_size) {
-        off_t current_offset = db_header_.free_list_head;
-        off_t prev_offset = 0;
-        while(current_offset != 0) {
-            db_file_.seekg(current_offset);
-            FreeListNode node;
-            db_file_.read(reinterpret_cast<char*>(&node), sizeof(node));
-            if (node.total_size >= required_size) {
-                if (prev_offset == 0) {
-                    db_header_.free_list_head = node.next_offset;
-                    db_file_.seekp(0);
-                    db_file_.write(reinterpret_cast<char*>(&db_header_), sizeof(db_header_));
-                } else {
-                    FreeListNode prev_node;
-                    db_file_.seekg(prev_offset);
-                    db_file_.read(reinterpret_cast<char*>(&prev_node), sizeof(prev_node));
-                    prev_node.next_offset = node.next_offset;
-                    db_file_.seekp(prev_offset);
-                    db_file_.write(reinterpret_cast<char*>(&prev_node), sizeof(prev_node));
-                }
-                return current_offset;
-            }
-            prev_offset = current_offset;
-            current_offset = node.next_offset;
+    void physical_delete(int key) {
+        if (metadata_.count(key)) {
+            deleted_keys_.insert(key);
+            metadata_.erase(key);
+            cache_.erase(key);
         }
-        db_file_.seekp(0, std::ios::end);
-        return db_file_.tellp();
     }
-    
-    // --- FIX #2: 修复 Compaction 内部调用 Get 导致的递归锁死锁 ---
-    // 新的实现不再调用 Get()，而是直接从旧的数据文件读取裸数据并写入新文件，
-    // 从而避免了对 db_mutex_ 的重复加锁。
+
     void handle_compaction() {
         std::cout << "Starting compaction..." << std::endl;
         std::string compact_db_path = db_file_path_ + ".compact";
@@ -388,57 +407,73 @@ private:
 
         DBHeader new_header;
         strncpy(new_header.name, "SimpleKV v1.0", sizeof(new_header.name));
-        new_header.free_list_head = 0;
+        new_header.free_list_head = 0; // 新文件没有自由链表
         compact_db_file.write(reinterpret_cast<char*>(&new_header), sizeof(new_header));
+        if (!compact_db_file) {
+            std::cerr << "ERROR: Compaction: failed to write new header." << std::endl;
+            compact_db_file.close(); remove(compact_db_path.c_str()); return;
+        }
         
         std::map<int, DataRecordMeta> new_metadata;
-        Value val_buffer; // 可复用的 value buffer
+        std::vector<char> val_buffer;
 
+        // 遍历所有未被删除的key
         for (const auto& pair : metadata_) {
             int key = pair.first;
+            // 跳过已删除的key (虽然理论上它们已经从metadata_中移除，但双重保险)
+            if (deleted_keys_.count(key)) continue; 
+            
             const DataRecordMeta& meta = pair.second;
             
-            // 直接从旧文件读取数据，不调用 Get()
             db_file_.seekg(meta.offset);
+            if (!db_file_) { handle_io_error("Compaction: seekg to old record failed"); return; }
             DataRecordHeader data_header;
             db_file_.read(reinterpret_cast<char*>(&data_header), sizeof(data_header));
+            if (db_file_.fail()) { handle_io_error("Compaction: read old header failed"); return; }
             
-            // 验证一下我们读到的数据是否正确
             if (data_header.magic != 0xDEADBEEF || data_header.key != key) {
-                continue; // 跳过损坏或不一致的数据
+                std::cerr << "WARN: Compaction: skipping corrupted record for key " << key << std::endl;
+                continue;
             }
             
-            val_buffer.size = data_header.value_size;
-            val_buffer.data.reset(new char[val_buffer.size]);
-            db_file_.read(val_buffer.data.get(), val_buffer.size);
+            if (val_buffer.size() < data_header.value_size) {
+                val_buffer.resize(data_header.value_size);
+            }
+            db_file_.read(val_buffer.data(), data_header.value_size);
+            if (db_file_.fail()) { handle_io_error("Compaction: read old value failed"); return; }
 
-            // 将干净的数据写入新文件
             off_t write_offset = compact_db_file.tellp();
             compact_db_file.write(reinterpret_cast<char*>(&data_header), sizeof(data_header));
-            compact_db_file.write(val_buffer.data.get(), val_buffer.size);
+            if (!compact_db_file) { handle_io_error("Compaction: write new header failed"); return; }
+            compact_db_file.write(val_buffer.data(), data_header.value_size);
+            if (!compact_db_file) { handle_io_error("Compaction: write new value failed"); return; }
 
             new_metadata[key] = {write_offset, meta.total_size};
         }
         
         compact_db_file.close();
 
-        // 原子地替换旧文件
         db_file_.close();
         wal_file_.close();
         
-        remove(wal_file_path_.c_str());
-        rename(compact_db_path.c_str(), db_file_path_.c_str());
-
-        // 重新打开文件并加载新元数据
+        if(remove(db_file_path_.c_str()) != 0 || remove(wal_file_path_.c_str()) != 0) {
+            std::cerr << "ERROR: Compaction: failed to remove old files." << std::endl;
+        }
+        if(rename(compact_db_path.c_str(), db_file_path_.c_str()) != 0) {
+            std::cerr << "ERROR: Compaction: failed to rename compact file." << std::endl;
+            fatal_error_ = true;
+            return;
+        }
+        
         metadata_ = new_metadata;
-        open_db_files();
+        deleted_keys_.clear(); // 清空删除标记
+        open_db_files(); // 重新打开文件句柄，特别是截断并重建WAL
 
         std::cout << "Compaction finished." << std::endl;
     }
-
 };
 
-// --- KVStore 公共方法实现 (不变) ---
+// --- KVStore 公共方法实现 ---
 KVStore::KVStore(const std::string& db_path, int num_consumers)
     : pimpl_(std::make_unique<Impl>(db_path, num_consumers)) {}
 
