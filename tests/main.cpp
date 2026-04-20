@@ -1,398 +1,1295 @@
 #include "kvstore.h"
-#include <iostream>
-#include <thread>
-#include <vector>
-#include <cstring>
-#include <cassert>
-#include <chrono>
-#include <random>
-#include <atomic>
-#include <iomanip>
-#include <algorithm> 
-#include <numeric>  
-#include <variant>   
-#include <map>
-#include <set>
 
-// 序列化标签
-enum class DataType : uint8_t {
-    STRING = 0,
-    INT32  = 1,
-    DOUBLE = 2,
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iostream>
+#include <optional>
+#include <random>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include <unistd.h>
+
+namespace {
+
+#pragma pack(push, 1)
+struct WalRecordHeader {
+    uint32_t magic;
+    uint16_t version;
+    uint8_t type;
+    uint8_t reserved;
+    int32_t key;
+    uint32_t value_size;
+    uint32_t checksum;
+};
+#pragma pack(pop)
+
+Value text(const std::string& input) {
+    return Value(std::vector<uint8_t>(input.begin(), input.end()));
+}
+
+std::string as_string(const Value& value) {
+    return std::string(value.bytes.begin(), value.bytes.end());
+}
+
+void require(bool condition, const std::string& message) {
+    if (!condition) {
+        throw std::runtime_error(message);
+    }
+}
+
+class TestDir {
+public:
+    explicit TestDir(const std::string& name) : path_(std::filesystem::temp_directory_path() / ("kvstore_" + name + "_" + std::to_string(::getpid()))) {
+        std::filesystem::remove_all(path_);
+        std::filesystem::create_directories(path_);
+    }
+
+    ~TestDir() {
+        std::error_code ec;
+        std::filesystem::remove_all(path_, ec);
+    }
+
+    std::string file(const std::string& name) const {
+        return (path_ / name).string();
+    }
+
+private:
+    std::filesystem::path path_;
 };
 
-// 根据类型标签打印值
-void print_value(const Value& val) {
-    if (val.size < 1) {
-        std::cout << "[INVALID DATA]";
-        return;
+void append_bytes(const std::string& path, std::initializer_list<uint8_t> data) {
+    std::ofstream out(path, std::ios::binary | std::ios::app);
+    for (uint8_t byte : data) {
+        out.put(static_cast<char>(byte));
     }
-    // 读取第一个字节作为类型标签
-    DataType type = static_cast<DataType>(val.data.get()[0]);
-    const char* raw_data = val.data.get() + 1;
-    size_t data_size = val.size - 1;
+}
 
-    switch(type) {
-        case DataType::STRING: {
-            std::cout << "(string): \"" << std::string(raw_data, data_size) << "\"";
-            break;
+void flip_byte(const std::string& path, std::streamoff offset) {
+    std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+    file.seekg(offset);
+    const int original = file.get();
+    require(original != EOF, "Expected byte to corrupt");
+    file.seekp(offset);
+    file.put(static_cast<char>(original ^ 0xFF));
+}
+
+uintmax_t file_size_or_zero(const std::string& path) {
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path, ec);
+    return ec ? 0 : size;
+}
+
+uint64_t histogram_total(const std::array<uint64_t, kWriteLatencyBucketCount>& histogram) {
+    uint64_t total = 0;
+    for (uint64_t value : histogram) {
+        total += value;
+    }
+    return total;
+}
+
+void wait_for_start(std::atomic<int>& ready, std::atomic<bool>& start_signal, int target_count) {
+    ready.fetch_add(1, std::memory_order_relaxed);
+    while (ready.load(std::memory_order_acquire) < target_count) {
+        std::this_thread::yield();
+    }
+    while (!start_signal.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+}
+
+template <typename Predicate>
+void wait_until(Predicate predicate, const std::string& failure_message, int timeout_ms = 2000) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (predicate()) {
+            return;
         }
-        case DataType::INT32: {
-            if (data_size != sizeof(int32_t)) { std::cout << "[INVALID INT32]"; break; }
-            int32_t int_val;
-            memcpy(&int_val, raw_data, sizeof(int32_t));
-            std::cout << "(int32): " << int_val;
-            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (!predicate()) {
+        throw std::runtime_error(failure_message);
+    }
+}
+
+void test_basic_persistence() {
+    TestDir dir("basic");
+    const std::string db_path = dir.file("store.dat");
+
+    {
+        KVStore store(db_path);
+        store.Put(1, text("alpha"));
+        store.Put(2, text("beta"));
+    }
+
+    KVStore reopened(db_path);
+    const auto value1 = reopened.Get(1);
+    const auto value2 = reopened.Get(2);
+    require(value1.has_value(), "key 1 should exist after reopen");
+    require(value2.has_value(), "key 2 should exist after reopen");
+    require(as_string(*value1) == "alpha", "key 1 should keep its value");
+    require(as_string(*value2) == "beta", "key 2 should keep its value");
+}
+
+void test_put_copies_input_value() {
+    TestDir dir("copy");
+    const std::string db_path = dir.file("store.dat");
+    KVStore store(db_path);
+
+    Value original = text("alpha");
+    store.Put(7, original);
+    original.bytes[0] = static_cast<uint8_t>('x');
+
+    const auto stored = store.Get(7);
+    require(stored.has_value(), "copied value should exist");
+    require(as_string(*stored) == "alpha", "stored value should not alias caller buffer");
+}
+
+void test_recovery_from_wal_without_compaction() {
+    TestDir dir("wal_recovery");
+    const std::string db_path = dir.file("store.dat");
+    const std::string wal_path = db_path + ".wal";
+
+    {
+        KVStore store(db_path);
+        store.Put(10, text("first"));
+        store.Put(11, text("second"));
+        store.Delete(10);
+    }
+
+    require(file_size_or_zero(db_path) == 16, "snapshot should still only contain the header before compaction");
+    require(file_size_or_zero(wal_path) > sizeof(WalRecordHeader), "WAL should contain persisted operations");
+
+    KVStore reopened(db_path);
+    require(!reopened.Get(10).has_value(), "deleted key should stay deleted after WAL replay");
+    const auto value = reopened.Get(11);
+    require(value.has_value(), "remaining key should survive WAL replay");
+    require(as_string(*value) == "second", "WAL replay should restore the latest value");
+}
+
+void test_ordering_and_updates() {
+    TestDir dir("ordering");
+    const std::string db_path = dir.file("store.dat");
+
+    {
+        KVStore store(db_path);
+        store.Put(3, text("v1"));
+        store.Delete(3);
+        store.Put(3, text("v2"));
+        store.Put(4, text("keep"));
+    }
+
+    KVStore reopened(db_path);
+    const auto latest = reopened.Get(3);
+    const auto other = reopened.Get(4);
+    require(latest.has_value(), "key 3 should exist after final put");
+    require(other.has_value(), "key 4 should exist after replay");
+    require(as_string(*latest) == "v2", "operations must replay in commit order");
+    require(as_string(*other) == "keep", "other keys should be unaffected");
+}
+
+void test_compaction_persists_snapshot_and_resets_wal() {
+    TestDir dir("compaction");
+    const std::string db_path = dir.file("store.dat");
+    const std::string wal_path = db_path + ".wal";
+
+    {
+        KVStore store(db_path);
+        store.Put(1, text("one"));
+        store.Put(2, text("two"));
+        store.Delete(1);
+        store.Compact();
+    }
+
+    require(file_size_or_zero(db_path) > 16, "compaction should materialize live data into the snapshot");
+    require(file_size_or_zero(wal_path) == 0, "compaction should rotate to an empty WAL");
+
+    KVStore reopened(db_path);
+    require(!reopened.Get(1).has_value(), "deleted key must not reappear after compaction");
+    const auto survivor = reopened.Get(2);
+    require(survivor.has_value(), "live key must survive compaction");
+    require(as_string(*survivor) == "two", "compaction should keep the latest snapshot value");
+}
+
+void test_truncated_wal_tail_is_ignored() {
+    TestDir dir("truncated_tail");
+    const std::string db_path = dir.file("store.dat");
+    const std::string wal_path = db_path + ".wal";
+
+    {
+        KVStore store(db_path);
+        store.Put(9, text("stable"));
+    }
+
+    append_bytes(wal_path, {0xAA, 0xBB, 0xCC});
+
+    KVStore reopened(db_path);
+    const auto value = reopened.Get(9);
+    require(value.has_value(), "valid WAL records should survive a truncated tail");
+    require(as_string(*value) == "stable", "truncated WAL tail must be ignored");
+}
+
+void test_corrupted_wal_record_throws() {
+    TestDir dir("corrupt_wal");
+    const std::string db_path = dir.file("store.dat");
+    const std::string wal_path = db_path + ".wal";
+
+    {
+        KVStore store(db_path);
+        store.Put(5, text("first"));
+        store.Put(6, text("second"));
+    }
+
+    flip_byte(wal_path, static_cast<std::streamoff>(sizeof(WalRecordHeader) + 1));
+
+    bool threw = false;
+    try {
+        KVStore reopened(db_path);
+        (void)reopened;
+    } catch (const KVStoreError&) {
+        threw = true;
+    }
+    require(threw, "corrupted WAL payload should raise KVStoreError");
+}
+
+void test_concurrent_reads_and_writes() {
+    TestDir dir("concurrency");
+    const std::string db_path = dir.file("store.dat");
+    KVStore store(db_path);
+
+    std::thread writer([&store]() {
+        for (int i = 0; i < 200; ++i) {
+            store.Put(i, text("value_" + std::to_string(i)));
         }
-        case DataType::DOUBLE: {
-            if (data_size != sizeof(double)) { std::cout << "[INVALID DOUBLE]"; break; }
-            double double_val;
-            memcpy(&double_val, raw_data, sizeof(double));
-            std::cout << "(double): " << double_val;
-            break;
+    });
+
+    std::thread reader([&store]() {
+        for (int i = 0; i < 400; ++i) {
+            const int key = i % 200;
+            const auto value = store.Get(key);
+            if (value.has_value()) {
+                require(as_string(*value).rfind("value_", 0) == 0, "reader should only observe complete values");
+            }
         }
-        default: {
-            std::cout << "[UNKNOWN TYPE]";
-            break;
+    });
+
+    writer.join();
+    reader.join();
+
+    KVStore reopened(db_path);
+    for (int i = 0; i < 200; ++i) {
+        const auto value = reopened.Get(i);
+        require(value.has_value(), "all committed keys should persist after reopen");
+    }
+}
+
+void test_many_concurrent_writers() {
+    TestDir dir("many_writers");
+    const std::string db_path = dir.file("store.dat");
+    KVStore store(db_path);
+
+    constexpr int kWriterCount = 8;
+    constexpr int kWritesPerThread = 150;
+    std::vector<std::thread> writers;
+
+    for (int writer_id = 0; writer_id < kWriterCount; ++writer_id) {
+        writers.emplace_back([&store, writer_id]() {
+            for (int index = 0; index < kWritesPerThread; ++index) {
+                const int key = writer_id * 10000 + index;
+                store.Put(key, text("writer_" + std::to_string(writer_id) + "_" + std::to_string(index)));
+            }
+        });
+    }
+
+    for (auto& writer : writers) {
+        writer.join();
+    }
+
+    KVStore reopened(db_path);
+    for (int writer_id = 0; writer_id < kWriterCount; ++writer_id) {
+        for (int index = 0; index < kWritesPerThread; ++index) {
+            const int key = writer_id * 10000 + index;
+            const auto value = reopened.Get(key);
+            require(value.has_value(), "all concurrent writer keys should persist");
+            require(as_string(*value) == "writer_" + std::to_string(writer_id) + "_" + std::to_string(index),
+                    "concurrent writers must preserve each committed value");
         }
     }
 }
 
-// --- 全局原子计数器，用于跨线程统计 ---
-std::atomic<uint64_t> puts_done(0);
-std::atomic<uint64_t> gets_done(0);
-std::atomic<uint64_t> deletes_done(0);
-std::atomic<uint64_t> verification_failures(0);
-std::atomic<bool> stop_test(false);
+void test_concurrent_compaction_with_writes() {
+    TestDir dir("compact_with_writes");
+    const std::string db_path = dir.file("store.dat");
+    KVStore store(db_path);
 
-// --- 生成测试数据 ---
-std::string generate_value_from_key(int key) {
-    return "value_for_key_" + std::to_string(key) + "_with_some_padding_to_make_it_longer";
-}
+    constexpr int kWriterCount = 4;
+    constexpr int kWritesPerThread = 120;
 
-// --- 写入线程的工作函数 ---
-void writer_worker(KVStore& store, int key_start, int key_end) {
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> distrib(key_start, key_end - 1);
-
-    while (!stop_test) {
-        int key = distrib(gen);
-        std::string s_val = generate_value_from_key(key);
-        
-        Value val;
-        val.size = s_val.length();
-        val.data.reset(new char[val.size]);
-        memcpy(val.data.get(), s_val.c_str(), val.size);
-        
-        store.Put(key, val);
-        puts_done++;
-        std::this_thread::sleep_for(std::chrono::microseconds(100)); // 控制写入速度
-    }
-}
-
-// --- 读/删线程的工作函数 ---
-void reader_deleter_worker(KVStore& store, int key_range_max) {
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> key_distrib(0, key_range_max - 1);
-    std::uniform_int_distribution<> op_distrib(0, 99);
-
-    while (!stop_test) {
-        int key = key_distrib(gen);
-        int operation = op_distrib(gen);
-
-        if (operation < 90) {
-            auto result = store.Get(key);
-            gets_done++;
-            if (result.has_value()) {
-                if (op_distrib(gen) < 1) { // 1%的概率进行验证
-                    std::string expected_val_str = generate_value_from_key(key);
-                    Value expected_val;
-                    expected_val.size = expected_val_str.length();
-                    expected_val.data.reset(new char[expected_val.size]);
-                    memcpy(expected_val.data.get(), expected_val_str.c_str(), expected_val.size);
-                    if (!(*result == expected_val)) {
-                        verification_failures++;
-                    }
+    std::vector<std::thread> writers;
+    for (int writer_id = 0; writer_id < kWriterCount; ++writer_id) {
+        writers.emplace_back([&store, writer_id]() {
+            for (int index = 0; index < kWritesPerThread; ++index) {
+                const int key = writer_id * 10000 + index;
+                store.Put(key, text("value_" + std::to_string(writer_id) + "_" + std::to_string(index)));
+                if (index % 20 == 0) {
+                    store.Delete(key);
+                    store.Put(key, text("value_" + std::to_string(writer_id) + "_" + std::to_string(index) + "_final"));
                 }
             }
-        } else { 
-            store.Delete(key);
-            deletes_done++;
-        }
-        std::this_thread::sleep_for(std::chrono::microseconds(50)); // 控制读/删速度
+        });
     }
-}
 
-// --- 压力测试函数 ---
-void stress_test() {
-    std::cout << "--- Starting 12-Hour Stress Test ---" << std::endl;
-    const auto test_start_time = std::chrono::steady_clock::now();
-    const auto test_end_time = test_start_time + std::chrono::hours(12);
-    
-    // 清理环境
-    const char* db_name = "stress_test.dat";
-    remove(db_name);
-    remove((std::string(db_name) + ".wal").c_str());
-
-    // 初始化KVStore
-    const int num_writers = 4;
-    const int num_readers_deleters = 8;
-    const int key_range = 15000000; // 键空间范围，确保能插入超过1000万个唯一对象
-    KVStore store(db_name, 8); // 使用8个消费者线程
-
-    // 启动工作线程
-    std::vector<std::thread> threads;
-    for (int i = 0; i < num_writers; ++i) {
-        threads.emplace_back(writer_worker, std::ref(store), i * (key_range/num_writers), (i+1) * (key_range/num_writers));
-    }
-    for (int i = 0; i < num_readers_deleters; ++i) {
-        threads.emplace_back(reader_deleter_worker, std::ref(store), key_range);
-    }
-    
-    // 监控和报告循环
-    auto last_report_time = test_start_time;
-    auto last_compact_time = test_start_time;
-    uint64_t last_puts = 0, last_gets = 0, last_deletes = 0;
-
-    while (std::chrono::steady_clock::now() < test_end_time) {
-        std::this_thread::sleep_for(std::chrono::seconds(60)); // 每分钟报告一次
-        
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed_since_last_report = std::chrono::duration_cast<std::chrono::seconds>(now - last_report_time).count();
-        if (elapsed_since_last_report == 0) elapsed_since_last_report = 1;
-        auto total_elapsed = std::chrono::duration_cast<std::chrono::minutes>(now - test_start_time);
-        
-        uint64_t current_puts = puts_done.load();
-        uint64_t current_gets = gets_done.load();
-        uint64_t current_deletes = deletes_done.load();
-
-        double put_rate = (double)(current_puts - last_puts) / elapsed_since_last_report;
-        double get_rate = (double)(current_gets - last_gets) / elapsed_since_last_report;
-        double delete_rate = (double)(current_deletes - last_deletes) / elapsed_since_last_report;
-
-        std::cout << "---[ " << std::setw(4) << total_elapsed.count() << " min ]---"
-                  << " Puts: " << std::setw(9) << current_puts << " (" << std::fixed << std::setprecision(2) << std::setw(7) << put_rate << "/s) |"
-                  << " Gets: " << std::setw(9) << current_gets << " (" << std::fixed << std::setprecision(2) << std::setw(7) << get_rate << "/s) |"
-                  << " Dels: " << std::setw(9) << current_deletes << " (" << std::fixed << std::setprecision(2) << std::setw(7) << delete_rate << "/s) |"
-                  << " Fails: " << verification_failures.load() 
-                  << std::endl;
-
-        last_puts = current_puts;
-        last_gets = current_gets;
-        last_deletes = current_deletes;
-        last_report_time = now;
-        
-        // 每小时触发一次Compaction
-        if (std::chrono::duration_cast<std::chrono::hours>(now - last_compact_time).count() >= 1) {
-            std::cout << ">>> Triggering hourly compaction..." << std::endl;
+    std::thread compactor([&store]() {
+        for (int round = 0; round < 6; ++round) {
             store.Compact();
-            std::cout << ">>> Compaction finished." << std::endl;
-            last_compact_time = now;
         }
+    });
+
+    for (auto& writer : writers) {
+        writer.join();
     }
-    
-    // 停止所有线程
-    stop_test = true;
-    for (auto& t : threads) {
-        t.join();
-    }
-    
-    std::cout << "--- 12-Hour Stress Test Finished ---" << std::endl;
-    std::cout << "Total Puts: " << puts_done.load() << std::endl;
-    std::cout << "Total Gets: " << gets_done.load() << std::endl;
-    std::cout << "Total Deletes: " << deletes_done.load() << std::endl;
-    std::cout << "Verification Failures: " << verification_failures.load() << std::endl;
-}
+    compactor.join();
+    store.Compact();
 
-// --- 一般测试函数 ---
-void simple_test() {
-    std::cout << "--- Running Simple Test ---" << std::endl;
-    // 清理旧文件
-    remove("test_db.dat");
-    remove("test_db.dat.wal");
-
-    Value val1;
-    std::string s1 = "hello";
-    val1.size = s1.length();
-    val1.data.reset(new char[val1.size]);
-    memcpy(val1.data.get(), s1.c_str(), val1.size);
-
-    Value val2;
-    std::string s2 = "world";
-    val2.size = s2.length();
-    val2.data.reset(new char[val2.size]);
-    memcpy(val2.data.get(), s2.c_str(), val2.size);
-
-    // 1. 创建DB并写入数据
-    {
-        KVStore store("test_db.dat");
-        store.Put(100, val1);
-        store.Put(200, val2);
-        // 等待任务处理
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-    } // store析构，自动关闭
-
-    // 2. 重新打开DB，验证数据是否存在
-    {
-        KVStore store("test_db.dat");
-        auto res1 = store.Get(100);
-        auto res2 = store.Get(200);
-        assert(res1.has_value() && *res1 == val1);
-        assert(res2.has_value() && *res2 == val2);
-        std::cout << "Persistence Test PASSED." << std::endl;
-        
-        // 测试删除和更新
-        store.Delete(100);
-        store.Put(200, val1); // Update 200 with val1
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-    }
-    
-    // 3. 再次打开，验证删除和更新
-    {
-        KVStore store("test_db.dat");
-        auto res1 = store.Get(100);
-        auto res2 = store.Get(200);
-        assert(!res1.has_value());
-        assert(res2.has_value() && *res2 == val1);
-        std::cout << "Delete and Update Test PASSED." << std::endl;
-    }
-    std::cout << "---------------------------\n" << std::endl;
-}
-
-// +++ 测试函数 +++
-void demo_test() {
-    std::cout << "--- Running Demonstration Test (with Mixed Data Types) ---" << std::endl;
-    const char* db_name = "demo_db.dat";
-
-    remove(db_name);
-    remove((std::string(db_name) + ".wal").c_str());
-
-    std::map<int, DataType> inserted_items;
-    const int num_to_insert = 20;
-    const int num_to_delete = 5;
-
-    std::mt19937 gen(1337); 
-    std::uniform_int_distribution<> key_distrib(1, 10000);
-    std::uniform_int_distribution<> type_distrib(0, 2); // 0: string, 1: int32, 2: double
-
-    // --- 阶段1: 插入不同类型的键值对 ---
-    std::cout << "\n[PHASE 1] Inserting " << num_to_insert << " key-value pairs of random types..." << std::endl;
-    {
-        KVStore store(db_name);
-        std::set<int> unique_keys;
-        while(unique_keys.size() < num_to_insert) {
-            unique_keys.insert(key_distrib(gen));
-        }
-
-        for (int key : unique_keys) {
-            DataType type = static_cast<DataType>(type_distrib(gen));
-            inserted_items[key] = type;
-            
-            Value val;
-            
-            // 根据随机类型创建并序列化 Value
-            switch(type) {
-                case DataType::STRING: {
-                    std::string s = "key_" + std::to_string(key);
-                    val.size = 1 + s.length();
-                    val.data.reset(new char[val.size]);
-                    val.data.get()[0] = static_cast<uint8_t>(DataType::STRING);
-                    memcpy(val.data.get() + 1, s.c_str(), s.length());
-                    break;
-                }
-                case DataType::INT32: {
-                    int32_t i = key * 10;
-                    val.size = 1 + sizeof(int32_t);
-                    val.data.reset(new char[val.size]);
-                    val.data.get()[0] = static_cast<uint8_t>(DataType::INT32);
-                    memcpy(val.data.get() + 1, &i, sizeof(int32_t));
-                    break;
-                }
-                case DataType::DOUBLE: {
-                    double d = key / 3.14;
-                    val.size = 1 + sizeof(double);
-                    val.data.reset(new char[val.size]);
-                    val.data.get()[0] = static_cast<uint8_t>(DataType::DOUBLE);
-                    memcpy(val.data.get() + 1, &d, sizeof(double));
-                    break;
-                }
+    KVStore reopened(db_path);
+    for (int writer_id = 0; writer_id < kWriterCount; ++writer_id) {
+        for (int index = 0; index < kWritesPerThread; ++index) {
+            const int key = writer_id * 10000 + index;
+            const auto value = reopened.Get(key);
+            require(value.has_value(), "keys written during compaction should persist");
+            std::string expected = "value_" + std::to_string(writer_id) + "_" + std::to_string(index);
+            if (index % 20 == 0) {
+                expected += "_final";
             }
-            store.Put(key, val);
+            require(as_string(*value) == expected, "compaction must preserve the latest committed value");
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        std::cout << "Insertion complete." << std::endl;
-    } // DB关闭
-
-    // --- 阶段2: 验证持久化和数据类型 ---
-    std::cout << "\n[PHASE 2] Reopening DB to verify data..." << std::endl;
-    {
-        KVStore store(db_name);
-        std::cout << "Reading all inserted keys:" << std::endl;
-        for(auto const& [key, type] : inserted_items) {
-            auto result = store.Get(key);
-            assert(result.has_value());
-            std::cout << "  Key: " << std::setw(5) << key << " -> Value: ";
-            print_value(*result);
-            std::cout << std::endl;
-        }
-        std::cout << "Initial verification PASSED." << std::endl;
-    } // DB关闭
-
-    // --- 阶段3: 删除并最终验证 ---
-    std::cout << "\n[PHASE 3] Deleting " << num_to_delete << " keys and final verification..." << std::endl;
-    {
-        KVStore store(db_name);
-        std::vector<int> keys_to_delete;
-        auto it = inserted_items.begin();
-        for (int i = 0; i < num_to_delete; ++i) {
-            store.Delete(it->first);   // 直接删除
-            ++it;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        std::cout << "Deleted keys: ";
-        for(int k : keys_to_delete) { std::cout << k << " "; }
-        std::cout << std::endl;
-    } // DB关闭
-
-    std::cout << "\nVerifying final state after deletion:" << std::endl;
-    {
-        KVStore store(db_name);
-        int found_count = 0;
-        for(auto const& [key, type] : inserted_items) {
-            auto result = store.Get(key);
-            if (!result.has_value()) {
-            std::cout << "  Deleted - Key: " << key << std::endl;
-            } else {
-                std::cout << "  Exists  - Key: " << std::setw(5) << key << " -> Value: ";
-                print_value(*result);
-                std::cout << std::endl;
-                found_count++;
-            }
-        }
-        assert(found_count <= num_to_insert);
-        assert(found_count >= num_to_insert - num_to_delete);
-        std::cout << "Final verification PASSED." << std::endl;
     }
-    
-    std::cout << "\n---Demonstration Test Finished Successfully! ---" << std::endl;
 }
+
+void test_batching_metrics_are_reported() {
+    TestDir dir("batch_metrics");
+    const std::string db_path = dir.file("store.dat");
+    KVStoreOptions options;
+    options.max_batch_size = 8;
+    options.max_batch_delay_us = 20000;
+    KVStore store(db_path, options);
+
+    constexpr int kWriterCount = 8;
+    std::atomic<int> ready {0};
+    std::atomic<bool> start_signal {false};
+    std::vector<std::thread> writers;
+
+    for (int writer_id = 0; writer_id < kWriterCount; ++writer_id) {
+        writers.emplace_back([&store, &ready, &start_signal, writer_id]() {
+            wait_for_start(ready, start_signal, kWriterCount);
+            store.Put(writer_id, text("value_" + std::to_string(writer_id)));
+        });
+    }
+
+    while (ready.load(std::memory_order_acquire) < kWriterCount) {
+        std::this_thread::yield();
+    }
+    start_signal.store(true, std::memory_order_release);
+
+    for (auto& writer : writers) {
+        writer.join();
+    }
+
+    const KVStoreMetrics metrics = store.GetMetrics();
+    require(metrics.enqueued_write_requests == kWriterCount, "metrics should count all enqueued writes");
+    require(metrics.committed_write_requests == kWriterCount, "metrics should count all committed writes");
+    require(metrics.committed_write_batches >= 1, "writer should report at least one committed batch");
+    require(metrics.max_committed_batch_size > 1, "batched writer should group concurrent writes");
+    require(metrics.wal_fsync_calls < metrics.committed_write_requests, "batching should reduce fsync count below write count");
+    require(metrics.pending_queue_depth == 0, "queue should drain after all writers finish");
+    require(histogram_total(metrics.write_latency_histogram) == metrics.committed_write_requests,
+            "latency histogram should account for every committed write");
+}
+
+void test_auto_compaction_triggers_and_preserves_state() {
+    TestDir dir("auto_compaction");
+    const std::string db_path = dir.file("store.dat");
+    const std::string wal_path = db_path + ".wal";
+
+    KVStoreOptions options;
+    options.max_batch_size = 4;
+    options.max_batch_delay_us = 5000;
+    options.auto_compact_wal_bytes_threshold = 128;
+
+    {
+        KVStore store(db_path, options);
+        for (int i = 0; i < 12; ++i) {
+            store.Put(i, text("auto_value_" + std::to_string(i)));
+        }
+
+        wait_until(
+            [&store, &options]() {
+                const KVStoreMetrics metrics = store.GetMetrics();
+                return metrics.auto_compactions_completed >= 1 &&
+                       metrics.wal_bytes_since_compaction < options.auto_compact_wal_bytes_threshold;
+            },
+            "auto compaction did not settle within the expected time");
+
+        const KVStoreMetrics metrics = store.GetMetrics();
+        require(metrics.auto_compactions_completed >= 1, "auto compaction should trigger after WAL crosses the threshold");
+        require(metrics.wal_bytes_since_compaction < options.auto_compact_wal_bytes_threshold,
+                "auto compaction should reset accumulated WAL bytes");
+        require(file_size_or_zero(wal_path) < options.auto_compact_wal_bytes_threshold,
+                "WAL should be rotated down after auto compaction");
+    }
+
+    KVStore reopened(db_path);
+    for (int i = 0; i < 12; ++i) {
+        const auto value = reopened.Get(i);
+        require(value.has_value(), "auto compaction must preserve committed values");
+        require(as_string(*value) == "auto_value_" + std::to_string(i),
+                "reopened state should match values written before auto compaction");
+    }
+}
+
+void test_manual_and_auto_compaction_metrics_coexist() {
+    TestDir dir("manual_auto_metrics");
+    const std::string db_path = dir.file("store.dat");
+
+    KVStoreOptions options;
+    options.max_batch_size = 2;
+    options.max_batch_delay_us = 0;
+    options.auto_compact_wal_bytes_threshold = 96;
+
+    KVStore store(db_path, options);
+    for (int i = 0; i < 6; ++i) {
+        store.Put(i, text("payload_" + std::to_string(i)));
+    }
+    store.Compact();
+
+    const KVStoreMetrics metrics = store.GetMetrics();
+    require(metrics.auto_compactions_completed >= 1, "auto compaction count should be visible in metrics");
+    require(metrics.manual_compactions_completed == 1, "manual compaction count should be tracked separately");
+    require(metrics.compact_requests == 1, "only explicit compaction requests should increment compact_requests");
+}
+
+void test_invalid_wal_ratio_triggers_auto_compaction() {
+    TestDir dir("invalid_ratio_compaction");
+    const std::string db_path = dir.file("store.dat");
+
+    KVStoreOptions options;
+    options.max_batch_size = 1;
+    options.max_batch_delay_us = 0;
+    options.auto_compact_invalid_wal_ratio_percent = 50;
+
+    {
+        KVStore store(db_path, options);
+        for (int i = 0; i < 12; ++i) {
+            store.Put(42, text("overwrite_" + std::to_string(i)));
+        }
+
+        wait_until(
+            [&store]() {
+                const KVStoreMetrics metrics = store.GetMetrics();
+                return metrics.auto_compactions_completed >= 1 &&
+                       metrics.obsolete_wal_bytes_since_compaction <= metrics.live_wal_bytes_since_compaction;
+            },
+            "invalid WAL ratio auto compaction did not settle within the expected time");
+
+        const KVStoreMetrics metrics = store.GetMetrics();
+        require(metrics.auto_compactions_completed >= 1, "invalid WAL ratio should trigger auto compaction");
+    }
+
+    KVStore reopened(db_path);
+    const auto value = reopened.Get(42);
+    require(value.has_value(), "latest overwritten value should survive invalid-ratio compaction");
+    require(as_string(*value) == "overwrite_11", "reopened state should contain the latest overwritten value");
+}
+
+void test_wal_obsolete_byte_metrics_are_consistent() {
+    TestDir dir("wal_byte_metrics");
+    const std::string db_path = dir.file("store.dat");
+
+    KVStore store(db_path);
+    store.Put(1, text("first"));
+    store.Put(1, text("second"));
+    store.Delete(1);
+
+    const KVStoreMetrics metrics = store.GetMetrics();
+    require(metrics.wal_bytes_since_compaction == metrics.live_wal_bytes_since_compaction + metrics.obsolete_wal_bytes_since_compaction,
+            "live and obsolete WAL bytes should partition the accumulated WAL size");
+    require(metrics.obsolete_wal_bytes_since_compaction > 0,
+            "overwrites and deletes should create obsolete WAL bytes");
+}
+
+void test_batch_wal_byte_limit_is_respected() {
+    TestDir dir("batch_byte_limit");
+    const std::string db_path = dir.file("store.dat");
+
+    KVStoreOptions options;
+    options.max_batch_size = 64;
+    options.max_batch_wal_bytes = 60;
+    options.max_batch_delay_us = 20000;
+
+    KVStore store(db_path, options);
+
+    constexpr int kWriterCount = 4;
+    std::atomic<int> ready {0};
+    std::atomic<bool> start_signal {false};
+    std::vector<std::thread> writers;
+
+    for (int writer_id = 0; writer_id < kWriterCount; ++writer_id) {
+        writers.emplace_back([&store, &ready, &start_signal, writer_id]() {
+            wait_for_start(ready, start_signal, kWriterCount);
+            store.Put(writer_id, text("payload_1234567890"));
+        });
+    }
+
+    while (ready.load(std::memory_order_acquire) < kWriterCount) {
+        std::this_thread::yield();
+    }
+    start_signal.store(true, std::memory_order_release);
+
+    for (auto& writer : writers) {
+        writer.join();
+    }
+
+    const KVStoreMetrics metrics = store.GetMetrics();
+    require(metrics.committed_write_requests == kWriterCount, "all writes should commit under byte-limited batching");
+    require(metrics.max_committed_batch_size <= 1, "small WAL byte limit should prevent multi-request batches");
+}
+
+void test_latency_histogram_tracks_write_requests() {
+    TestDir dir("latency_histogram");
+    const std::string db_path = dir.file("store.dat");
+    KVStore store(db_path);
+
+    for (int i = 0; i < 10; ++i) {
+        store.Put(i, text("latency_" + std::to_string(i)));
+    }
+    store.Delete(5);
+
+    const KVStoreMetrics metrics = store.GetMetrics();
+    require(histogram_total(metrics.write_latency_histogram) == metrics.committed_write_requests,
+            "histogram total should equal the number of committed writes");
+    require(histogram_total(metrics.write_latency_histogram) == 11,
+            "histogram should include puts and deletes but not compaction");
+}
+
+void test_adaptive_batching_expands_batch_under_queue_pressure() {
+    TestDir dir("adaptive_batching");
+    const std::string db_path = dir.file("store.dat");
+
+    KVStoreOptions options;
+    options.max_batch_size = 2;
+    options.max_batch_delay_us = 20000;
+    options.adaptive_batching_enabled = true;
+    options.adaptive_queue_depth_threshold = 4;
+    options.adaptive_batch_size_multiplier = 4;
+
+    KVStore store(db_path, options);
+
+    constexpr int kWriterCount = 8;
+    std::atomic<int> ready {0};
+    std::atomic<bool> start_signal {false};
+    std::vector<std::thread> writers;
+
+    for (int writer_id = 0; writer_id < kWriterCount; ++writer_id) {
+        writers.emplace_back([&store, &ready, &start_signal, writer_id]() {
+            wait_for_start(ready, start_signal, kWriterCount);
+            store.Put(writer_id, text("adaptive_" + std::to_string(writer_id)));
+        });
+    }
+
+    while (ready.load(std::memory_order_acquire) < kWriterCount) {
+        std::this_thread::yield();
+    }
+    start_signal.store(true, std::memory_order_release);
+
+    for (auto& writer : writers) {
+        writer.join();
+    }
+
+    const KVStoreMetrics metrics = store.GetMetrics();
+    require(metrics.committed_write_requests == kWriterCount, "adaptive batching should still commit all queued writes");
+    require(metrics.max_committed_batch_size > options.max_batch_size,
+            "adaptive batching should grow batch size beyond the base limit under queue pressure");
+    require(metrics.adaptive_batches_completed >= 1, "adaptive batching should report at least one adaptive batch");
+}
+
+void test_percentile_and_writer_metrics_are_reported() {
+    TestDir dir("writer_metrics");
+    const std::string db_path = dir.file("store.dat");
+
+    KVStoreOptions options;
+    options.max_batch_size = 4;
+    options.max_batch_delay_us = 5000;
+    KVStore store(db_path, options);
+
+    constexpr int kWriterCount = 6;
+    std::atomic<int> ready {0};
+    std::atomic<bool> start_signal {false};
+    std::vector<std::thread> writers;
+
+    for (int writer_id = 0; writer_id < kWriterCount; ++writer_id) {
+        writers.emplace_back([&store, &ready, &start_signal, writer_id]() {
+            wait_for_start(ready, start_signal, kWriterCount);
+            store.Put(writer_id, text("writer_metric_payload_" + std::to_string(writer_id)));
+        });
+    }
+
+    while (ready.load(std::memory_order_acquire) < kWriterCount) {
+        std::this_thread::yield();
+    }
+    start_signal.store(true, std::memory_order_release);
+
+    for (auto& writer : writers) {
+        writer.join();
+    }
+
+    wait_until(
+        [&store]() {
+            const KVStoreMetrics metrics = store.GetMetrics();
+            return metrics.writer_wait_events >= 1 && metrics.writer_wait_time_us > 0;
+        },
+        "writer thread did not report idle waiting after draining the queue");
+
+    const KVStoreMetrics metrics = store.GetMetrics();
+    require(metrics.max_pending_queue_depth >= 1, "queue high-water mark should be tracked");
+    require(metrics.last_committed_batch_wal_bytes > 0, "last committed batch WAL bytes should be reported");
+    require(metrics.max_committed_batch_wal_bytes >= metrics.last_committed_batch_wal_bytes,
+            "max batch WAL bytes should be at least the last batch size");
+    require(metrics.approx_write_latency_p50_us > 0, "p50 write latency should be reported");
+    require(metrics.approx_write_latency_p95_us >= metrics.approx_write_latency_p50_us,
+            "p95 write latency should not be below p50");
+    require(metrics.approx_write_latency_p99_us >= metrics.approx_write_latency_p95_us,
+            "p99 write latency should not be below p95");
+}
+
+void test_adaptive_flush_shortens_batch_delay() {
+    TestDir dir("adaptive_flush");
+    const std::string db_path = dir.file("store.dat");
+
+    KVStoreOptions options;
+    options.max_batch_size = 16;
+    options.max_batch_delay_us = 50000;
+    options.adaptive_flush_enabled = true;
+    options.adaptive_flush_queue_depth_threshold = 2;
+    options.adaptive_flush_delay_divisor = 10;
+    options.adaptive_flush_min_batch_delay_us = 1000;
+
+    KVStore store(db_path, options);
+
+    std::atomic<int> ready {0};
+    std::atomic<bool> start_signal {false};
+
+    std::thread writer1([&store, &ready, &start_signal]() {
+        wait_for_start(ready, start_signal, 2);
+        store.Put(1, text("flush_1"));
+    });
+    std::thread writer2([&store, &ready, &start_signal]() {
+        wait_for_start(ready, start_signal, 2);
+        store.Put(2, text("flush_2"));
+    });
+
+    while (ready.load(std::memory_order_acquire) < 2) {
+        std::this_thread::yield();
+    }
+    start_signal.store(true, std::memory_order_release);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(8));
+    std::thread writer3([&store]() {
+        store.Put(3, text("flush_3"));
+    });
+
+    writer1.join();
+    writer2.join();
+    writer3.join();
+
+    const KVStoreMetrics metrics = store.GetMetrics();
+    require(metrics.committed_write_requests == 3, "adaptive flush test should commit all writes");
+    require(metrics.committed_write_batches >= 2, "adaptive flush should flush the early batch before the delayed write arrives");
+    require(metrics.adaptive_flush_batches_completed >= 1, "adaptive flush should record at least one shortened-delay batch");
+    require(metrics.min_effective_batch_delay_us > 0 &&
+                metrics.min_effective_batch_delay_us < options.max_batch_delay_us,
+            "adaptive flush should reduce the effective batch delay below the configured base delay");
+}
+
+void test_compaction_long_term_metrics_accumulate() {
+    TestDir dir("compaction_totals");
+    const std::string db_path = dir.file("store.dat");
+
+    KVStore store(db_path);
+    store.Put(1, text("first"));
+    store.Compact();
+    store.Put(2, text("second"));
+    store.Delete(1);
+    store.Compact();
+
+    const KVStoreMetrics metrics = store.GetMetrics();
+    require(metrics.manual_compactions_completed == 2, "manual compaction count should reflect both runs");
+    require(metrics.total_snapshot_bytes_written > sizeof(uint32_t),
+            "compaction should accumulate snapshot bytes written over time");
+    require(metrics.total_wal_bytes_reclaimed_by_compaction > 0,
+            "compaction should accumulate reclaimed WAL bytes over time");
+}
+
+void test_latency_target_adaptive_flush_kicks_in() {
+    TestDir dir("latency_target_flush");
+    const std::string db_path = dir.file("store.dat");
+
+    KVStoreOptions options;
+    options.max_batch_size = 16;
+    options.max_batch_delay_us = 50000;
+    options.adaptive_flush_enabled = true;
+    options.adaptive_flush_queue_depth_threshold = 1000;
+    options.adaptive_flush_delay_divisor = 10;
+    options.adaptive_flush_min_batch_delay_us = 1000;
+    options.adaptive_latency_target_p95_us = 50;
+
+    KVStore store(db_path, options);
+    for (int i = 0; i < 4; ++i) {
+        store.Put(i, text("warmup_" + std::to_string(i)));
+    }
+
+    std::atomic<int> ready {0};
+    std::atomic<bool> start_signal {false};
+    std::thread writer1([&store, &ready, &start_signal]() {
+        wait_for_start(ready, start_signal, 2);
+        store.Put(10, text("latency_target_a"));
+    });
+    std::thread writer2([&store, &ready, &start_signal]() {
+        wait_for_start(ready, start_signal, 2);
+        store.Put(11, text("latency_target_b"));
+    });
+
+    while (ready.load(std::memory_order_acquire) < 2) {
+        std::this_thread::yield();
+    }
+    start_signal.store(true, std::memory_order_release);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(8));
+    std::thread writer3([&store]() {
+        store.Put(12, text("latency_target_c"));
+    });
+
+    writer1.join();
+    writer2.join();
+    writer3.join();
+
+    const KVStoreMetrics metrics = store.GetMetrics();
+    require(metrics.adaptive_latency_target_batches_completed >= 1,
+            "latency target should trigger at least one earlier-flush batch");
+    require(metrics.min_effective_batch_delay_us > 0 &&
+                metrics.min_effective_batch_delay_us < options.max_batch_delay_us,
+            "latency target should reduce effective batch delay below the base delay");
+}
+
+void test_fsync_pressure_can_relax_batch_delay() {
+    TestDir dir("fsync_pressure");
+    const std::string db_path = dir.file("store.dat");
+
+    KVStoreOptions options;
+    options.max_batch_size = 1;
+    options.max_batch_delay_us = 1000;
+    options.adaptive_fsync_pressure_per_1000_writes_threshold = 900;
+    options.adaptive_fsync_pressure_delay_multiplier = 10;
+    options.adaptive_fsync_pressure_max_batch_delay_us = 10000;
+
+    KVStore store(db_path, options);
+    for (int i = 0; i < 4; ++i) {
+        store.Put(i, text("pressure_" + std::to_string(i)));
+    }
+
+    store.Put(100, text("pressure_probe"));
+
+    const KVStoreMetrics metrics = store.GetMetrics();
+    require(metrics.adaptive_fsync_pressure_batches_completed >= 1,
+            "high fsync pressure should trigger a relaxed-delay batch");
+    require(metrics.last_effective_batch_delay_us > options.max_batch_delay_us,
+            "fsync pressure should expand the effective batch delay above the base delay");
+    require(metrics.observed_fsync_pressure_per_1000_writes >=
+                options.adaptive_fsync_pressure_per_1000_writes_threshold,
+            "observed fsync pressure metric should reflect the singleton-write workload");
+    require(metrics.max_effective_batch_delay_us >= metrics.last_effective_batch_delay_us,
+            "max effective batch delay should track the expanded delay");
+}
+
+void test_recent_window_metrics_capture_bursts() {
+    TestDir dir("recent_window");
+    const std::string db_path = dir.file("store.dat");
+
+    KVStoreOptions options;
+    options.max_batch_size = 4;
+    options.max_batch_delay_us = 5000;
+    options.adaptive_recent_window_batches = 4;
+    options.adaptive_recent_write_sample_limit = 16;
+    KVStore store(db_path, options);
+
+    constexpr int kWriterCount = 4;
+    std::atomic<int> ready {0};
+    std::atomic<bool> start_signal {false};
+    std::vector<std::thread> writers;
+
+    for (int writer_id = 0; writer_id < kWriterCount; ++writer_id) {
+        writers.emplace_back([&store, &ready, &start_signal, writer_id]() {
+            wait_for_start(ready, start_signal, kWriterCount);
+            store.Put(writer_id, text("recent_" + std::to_string(writer_id)));
+        });
+    }
+
+    while (ready.load(std::memory_order_acquire) < kWriterCount) {
+        std::this_thread::yield();
+    }
+    start_signal.store(true, std::memory_order_release);
+
+    for (auto& writer : writers) {
+        writer.join();
+    }
+
+    const KVStoreMetrics metrics = store.GetMetrics();
+    require(metrics.recent_window_batch_count >= 1, "recent batch window should track completed batches");
+    require(metrics.recent_peak_queue_depth >= 2,
+            "recent queue peak should reflect that the burst created queue pressure");
+    require(metrics.recent_avg_batch_size >= 1, "recent batch window should track average batch size");
+    require(metrics.recent_observed_write_latency_p95_us > 0,
+            "recent latency window should expose a non-zero recent p95");
+}
+
+void test_read_heavy_signal_prefers_shorter_batches() {
+    TestDir dir("read_heavy");
+    const std::string db_path = dir.file("store.dat");
+
+    KVStoreOptions options;
+    options.max_batch_size = 16;
+    options.max_batch_delay_us = 30000;
+    options.adaptive_read_heavy_read_per_1000_ops_threshold = 800;
+    options.adaptive_read_heavy_delay_divisor = 10;
+    options.adaptive_read_heavy_batch_size_divisor = 4;
+    options.adaptive_flush_min_batch_delay_us = 500;
+    KVStore store(db_path, options);
+
+    for (int i = 0; i < 128; ++i) {
+        (void)store.Get(i);
+    }
+
+    std::thread writer1([&store]() {
+        store.Put(1, text("read_heavy_a"));
+    });
+    std::thread writer2([&store]() {
+        store.Put(2, text("read_heavy_b"));
+    });
+    writer1.join();
+    writer2.join();
+
+    const KVStoreMetrics metrics = store.GetMetrics();
+    require(metrics.adaptive_read_heavy_batches_completed >= 1,
+            "read-heavy workload should trigger reader-friendly batching");
+    require(metrics.recent_read_ratio_per_1000_ops >= 800,
+            "recent read ratio should reflect the read-heavy workload");
+    require(metrics.last_effective_batch_delay_us < options.max_batch_delay_us,
+            "read-heavy workload should shorten the effective batch delay");
+}
+
+void test_compaction_pressure_signal_relaxes_batch_delay() {
+    TestDir dir("compaction_pressure");
+    const std::string db_path = dir.file("store.dat");
+
+    KVStoreOptions options;
+    options.max_batch_size = 1;
+    options.max_batch_delay_us = 1000;
+    options.adaptive_compaction_pressure_obsolete_ratio_percent_threshold = 50;
+    options.adaptive_compaction_pressure_delay_multiplier = 5;
+    KVStore store(db_path, options);
+
+    for (int i = 0; i < 6; ++i) {
+        store.Put(7, text("obsolete_" + std::to_string(i)));
+    }
+    store.Put(8, text("pressure_probe"));
+
+    const KVStoreMetrics metrics = store.GetMetrics();
+    require(metrics.observed_obsolete_wal_ratio_percent >= 50,
+            "obsolete WAL ratio should reflect repeated overwrites");
+    require(metrics.adaptive_compaction_pressure_batches_completed >= 1,
+            "high obsolete WAL ratio should relax batching before compaction");
+    require(metrics.last_effective_batch_delay_us > options.max_batch_delay_us,
+            "compaction pressure should expand the effective batch delay");
+}
+
+void test_wal_growth_signal_relaxes_batch_delay() {
+    TestDir dir("wal_growth");
+    const std::string db_path = dir.file("store.dat");
+
+    KVStoreOptions options;
+    options.max_batch_size = 1;
+    options.max_batch_delay_us = 1000;
+    options.adaptive_wal_growth_bytes_per_batch_threshold = 40;
+    options.adaptive_wal_growth_delay_multiplier = 4;
+    options.adaptive_wal_growth_max_batch_delay_us = 8000;
+    options.adaptive_recent_window_batches = 8;
+    KVStore store(db_path, options);
+
+    for (int i = 0; i < 4; ++i) {
+        store.Put(i, text("payload_abcdefghijklmnopqrstuvwxyz_" + std::to_string(i)));
+    }
+    store.Put(99, text("growth_probe"));
+
+    const KVStoreMetrics metrics = store.GetMetrics();
+    require(metrics.recent_avg_batch_wal_bytes >= options.adaptive_wal_growth_bytes_per_batch_threshold,
+            "recent WAL growth metric should reflect large write batches");
+    require(metrics.adaptive_wal_growth_batches_completed >= 1,
+            "large recent WAL growth should relax the next batch delay");
+    require(metrics.last_effective_batch_delay_us > options.max_batch_delay_us,
+            "WAL growth signal should expand the effective batch delay");
+}
+
+void test_objective_policy_prefers_short_delay_under_latency_pressure() {
+    TestDir dir("objective_short_delay");
+    const std::string db_path = dir.file("store.dat");
+
+    KVStoreOptions options;
+    options.max_batch_size = 1;
+    options.max_batch_delay_us = 20000;
+    options.adaptive_objective_enabled = true;
+    options.adaptive_objective_queue_weight = 0;
+    options.adaptive_objective_latency_weight = 4;
+    options.adaptive_objective_read_weight = 0;
+    options.adaptive_objective_fsync_weight = 0;
+    options.adaptive_objective_compaction_weight = 0;
+    options.adaptive_objective_wal_growth_weight = 0;
+    options.adaptive_objective_short_delay_score_threshold = 500;
+    options.adaptive_objective_short_delay_divisor = 10;
+    options.adaptive_flush_min_batch_delay_us = 500;
+    options.adaptive_latency_target_p95_us = 1000;
+    KVStore store(db_path, options);
+
+    store.Put(1, text("objective_latency_a"));
+    store.Put(2, text("objective_latency_b"));
+    store.Put(3, text("objective_latency_probe"));
+
+    const KVStoreMetrics metrics = store.GetMetrics();
+    require(metrics.recent_observed_write_latency_p95_us >= options.adaptive_latency_target_p95_us,
+            "recent p95 should exceed the configured latency target");
+    require(metrics.adaptive_objective_short_delay_batches_completed >= 1,
+            "objective policy should shorten the batch delay under latency pressure");
+    require(metrics.last_effective_batch_delay_us < options.max_batch_delay_us,
+            "objective pressure score should shorten the effective batch delay");
+    require(metrics.last_objective_pressure_score > metrics.last_objective_cost_score,
+            "objective pressure score should dominate the cost score in the latency-heavy scenario");
+    require(metrics.last_objective_balance_score > 0,
+            "objective balance should be positive when pressure favors shorter delays");
+}
+
+void test_objective_policy_prefers_long_delay_under_cost_pressure() {
+    TestDir dir("objective_long_delay");
+    const std::string db_path = dir.file("store.dat");
+
+    KVStoreOptions options;
+    options.max_batch_size = 1;
+    options.max_batch_delay_us = 500;
+    options.adaptive_recent_window_batches = 8;
+    options.adaptive_objective_enabled = true;
+    options.adaptive_objective_queue_weight = 0;
+    options.adaptive_objective_latency_weight = 0;
+    options.adaptive_objective_read_weight = 0;
+    options.adaptive_objective_fsync_weight = 2;
+    options.adaptive_objective_compaction_weight = 2;
+    options.adaptive_objective_wal_growth_weight = 1;
+    options.adaptive_objective_long_delay_score_threshold = 500;
+    options.adaptive_objective_long_delay_multiplier = 6;
+    options.adaptive_objective_max_batch_delay_us = 5000;
+    options.adaptive_fsync_pressure_per_1000_writes_threshold = 800;
+    options.adaptive_compaction_pressure_obsolete_ratio_percent_threshold = 50;
+    options.adaptive_wal_growth_bytes_per_batch_threshold = 40;
+    KVStore store(db_path, options);
+
+    for (int i = 0; i < 6; ++i) {
+        store.Put(42, text("objective_cost_payload_abcdefghijklmnopqrstuvwxyz_" + std::to_string(i)));
+    }
+    store.Put(99, text("objective_cost_probe_payload"));
+
+    const KVStoreMetrics metrics = store.GetMetrics();
+    require(metrics.observed_fsync_pressure_per_1000_writes >= options.adaptive_fsync_pressure_per_1000_writes_threshold,
+            "recent fsync pressure should exceed the configured objective cost scale");
+    require(metrics.observed_obsolete_wal_ratio_percent >= options.adaptive_compaction_pressure_obsolete_ratio_percent_threshold,
+            "obsolete WAL ratio should exceed the configured objective cost scale");
+    require(metrics.adaptive_objective_long_delay_batches_completed >= 1,
+            "objective policy should relax the batch delay when cost signals dominate");
+    require(metrics.last_effective_batch_delay_us > options.max_batch_delay_us,
+            "objective cost score should expand the effective batch delay");
+    require(metrics.last_objective_cost_score > metrics.last_objective_pressure_score,
+            "objective cost score should dominate the pressure score in the cost-heavy scenario");
+    require(metrics.last_objective_balance_score < 0,
+            "objective balance should be negative when cost favors longer delays");
+}
+
+void test_objective_throughput_score_can_dominate_latency_pressure() {
+    TestDir dir("objective_throughput");
+    const std::string db_path = dir.file("store.dat");
+
+    KVStoreOptions options;
+    options.max_batch_size = 1;
+    options.max_batch_delay_us = 500;
+    options.adaptive_recent_window_batches = 8;
+    options.adaptive_objective_enabled = true;
+    options.adaptive_objective_queue_weight = 0;
+    options.adaptive_objective_latency_weight = 1;
+    options.adaptive_objective_read_weight = 0;
+    options.adaptive_objective_throughput_weight = 6;
+    options.adaptive_objective_target_batch_size = 8;
+    options.adaptive_objective_fsync_weight = 0;
+    options.adaptive_objective_compaction_weight = 0;
+    options.adaptive_objective_wal_growth_weight = 0;
+    options.adaptive_objective_long_delay_score_threshold = 250;
+    options.adaptive_objective_long_delay_multiplier = 6;
+    options.adaptive_objective_max_batch_delay_us = 5000;
+    options.adaptive_flush_min_batch_delay_us = 100;
+    options.adaptive_latency_target_p95_us = 50;
+    KVStore store(db_path, options);
+
+    store.Put(1, text("objective_tp_a"));
+    store.Put(2, text("objective_tp_b"));
+    store.Put(3, text("objective_tp_probe"));
+
+    const KVStoreMetrics metrics = store.GetMetrics();
+    require(metrics.recent_observed_write_latency_p95_us >= options.adaptive_latency_target_p95_us,
+            "recent p95 should still reflect latency pressure");
+    require(metrics.recent_avg_batch_size < options.adaptive_objective_target_batch_size,
+            "recent average batch size should remain below the throughput target");
+    require(metrics.adaptive_objective_throughput_batches_completed >= 1,
+            "objective controller should record batches influenced by throughput deficit");
+    require(metrics.last_objective_throughput_score > 0,
+            "objective controller should expose a non-zero throughput score");
+    require(metrics.last_objective_cost_score > metrics.last_objective_pressure_score,
+            "throughput deficit should outweigh latency pressure in this scenario");
+    require(metrics.last_objective_mode < 0,
+            "objective mode should report a long-delay decision when throughput dominates");
+    require(metrics.last_effective_batch_delay_us > options.max_batch_delay_us,
+            "throughput-dominated objective control should expand the effective batch delay");
+}
+
+void run_benchmark() {
+    TestDir dir("bench");
+    const std::string db_path = dir.file("store.dat");
+    KVStoreOptions options;
+    options.max_batch_size = 32;
+    options.max_batch_wal_bytes = 1 << 20;
+    options.max_batch_delay_us = 2000;
+    options.adaptive_recent_window_batches = 64;
+    options.adaptive_recent_write_sample_limit = 512;
+    options.adaptive_objective_enabled = true;
+    options.adaptive_objective_queue_weight = 1;
+    options.adaptive_objective_latency_weight = 3;
+    options.adaptive_objective_read_weight = 2;
+    options.adaptive_objective_throughput_weight = 2;
+    options.adaptive_objective_target_batch_size = 16;
+    options.adaptive_objective_fsync_weight = 2;
+    options.adaptive_objective_compaction_weight = 1;
+    options.adaptive_objective_wal_growth_weight = 1;
+    options.adaptive_objective_short_delay_score_threshold = 500;
+    options.adaptive_objective_long_delay_score_threshold = 500;
+    options.adaptive_objective_short_delay_divisor = 2;
+    options.adaptive_objective_long_delay_multiplier = 2;
+    options.adaptive_objective_max_batch_delay_us = 8000;
+    options.adaptive_read_heavy_read_per_1000_ops_threshold = 700;
+    options.adaptive_read_heavy_delay_divisor = 4;
+    options.adaptive_read_heavy_batch_size_divisor = 2;
+    options.adaptive_flush_enabled = true;
+    options.adaptive_flush_queue_depth_threshold = 8;
+    options.adaptive_flush_delay_divisor = 4;
+    options.adaptive_flush_min_batch_delay_us = 100;
+    options.adaptive_latency_target_p95_us = 12000;
+    options.adaptive_fsync_pressure_per_1000_writes_threshold = 350;
+    options.adaptive_fsync_pressure_delay_multiplier = 2;
+    options.adaptive_fsync_pressure_max_batch_delay_us = 8000;
+    options.adaptive_compaction_pressure_obsolete_ratio_percent_threshold = 50;
+    options.adaptive_compaction_pressure_delay_multiplier = 2;
+    options.adaptive_wal_growth_bytes_per_batch_threshold = 200;
+    options.adaptive_wal_growth_delay_multiplier = 2;
+    options.adaptive_wal_growth_max_batch_delay_us = 6000;
+    options.adaptive_batching_enabled = true;
+    options.adaptive_queue_depth_threshold = 8;
+    options.adaptive_batch_size_multiplier = 4;
+    options.adaptive_batch_wal_bytes_multiplier = 4;
+    KVStore store(db_path, options);
+
+    constexpr int kWriterCount = 8;
+    constexpr int kReaderCount = 4;
+    constexpr int kDurationSeconds = 3;
+    constexpr int kKeySpace = 50000;
+
+    std::atomic<bool> stop {false};
+    std::atomic<uint64_t> write_ops {0};
+    std::atomic<uint64_t> read_ops {0};
+    std::atomic<uint64_t> write_latency_ns {0};
+
+    std::vector<std::thread> threads;
+    for (int writer_id = 0; writer_id < kWriterCount; ++writer_id) {
+        threads.emplace_back([&store, &stop, &write_ops, &write_latency_ns, writer_id]() {
+            std::mt19937 gen(1337 + writer_id);
+            std::uniform_int_distribution<int> key_dist(writer_id * 100000, writer_id * 100000 + kKeySpace - 1);
+            while (!stop.load(std::memory_order_acquire)) {
+                const int key = key_dist(gen);
+                const auto begin = std::chrono::steady_clock::now();
+                store.Put(key, text("payload_" + std::to_string(key)));
+                const auto end = std::chrono::steady_clock::now();
+                write_ops.fetch_add(1, std::memory_order_relaxed);
+                write_latency_ns.fetch_add(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count(),
+                    std::memory_order_relaxed);
+            }
+        });
+    }
+
+    for (int reader_id = 0; reader_id < kReaderCount; ++reader_id) {
+        threads.emplace_back([&store, &stop, &read_ops, reader_id]() {
+            std::mt19937 gen(4242 + reader_id);
+            std::uniform_int_distribution<int> key_dist(0, kWriterCount * 100000 + kKeySpace - 1);
+            while (!stop.load(std::memory_order_acquire)) {
+                (void)store.Get(key_dist(gen));
+                read_ops.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    std::this_thread::sleep_for(std::chrono::seconds(kDurationSeconds));
+    stop.store(true, std::memory_order_release);
+
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    const auto end = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(end - start).count();
+    const uint64_t writes = write_ops.load(std::memory_order_relaxed);
+    const uint64_t reads = read_ops.load(std::memory_order_relaxed);
+    const double avg_write_latency_us =
+        writes == 0 ? 0.0 : static_cast<double>(write_latency_ns.load(std::memory_order_relaxed)) / writes / 1000.0;
+    const KVStoreMetrics metrics = store.GetMetrics();
+
+    std::cout << "[BENCH] duration_s=" << seconds
+              << " writes=" << writes
+              << " reads=" << reads
+              << " write_ops_per_s=" << (writes / seconds)
+              << " read_ops_per_s=" << (reads / seconds)
+              << " avg_write_latency_us=" << avg_write_latency_us
+              << " p50_write_latency_us=" << metrics.approx_write_latency_p50_us
+              << " p95_write_latency_us=" << metrics.approx_write_latency_p95_us
+              << " p99_write_latency_us=" << metrics.approx_write_latency_p99_us
+              << " recent_read_ratio_per_1000_ops=" << metrics.recent_read_ratio_per_1000_ops
+              << " recent_p95_write_latency_us=" << metrics.recent_observed_write_latency_p95_us
+              << " recent_peak_queue_depth=" << metrics.recent_peak_queue_depth
+              << " recent_avg_batch_size=" << metrics.recent_avg_batch_size
+              << " recent_avg_batch_wal_bytes=" << metrics.recent_avg_batch_wal_bytes
+              << " recent_window_batch_count=" << metrics.recent_window_batch_count
+              << " observed_fsync_pressure_per_1000_writes=" << metrics.observed_fsync_pressure_per_1000_writes
+              << " observed_obsolete_wal_ratio_percent=" << metrics.observed_obsolete_wal_ratio_percent
+              << " objective_pressure_score=" << metrics.last_objective_pressure_score
+              << " objective_cost_score=" << metrics.last_objective_cost_score
+              << " objective_throughput_score=" << metrics.last_objective_throughput_score
+              << " objective_balance_score=" << metrics.last_objective_balance_score
+              << " objective_mode=" << metrics.last_objective_mode
+              << " last_batch_delay_us=" << metrics.last_effective_batch_delay_us
+              << " min_batch_delay_us=" << metrics.min_effective_batch_delay_us
+              << " max_batch_delay_us=" << metrics.max_effective_batch_delay_us
+              << " committed_batches=" << metrics.committed_write_batches
+              << " max_batch_size=" << metrics.max_committed_batch_size
+              << " max_batch_wal_bytes=" << metrics.max_committed_batch_wal_bytes
+              << " adaptive_batches=" << metrics.adaptive_batches_completed
+              << " adaptive_flush_batches=" << metrics.adaptive_flush_batches_completed
+              << " latency_target_batches=" << metrics.adaptive_latency_target_batches_completed
+              << " fsync_pressure_batches=" << metrics.adaptive_fsync_pressure_batches_completed
+              << " read_heavy_batches=" << metrics.adaptive_read_heavy_batches_completed
+              << " objective_throughput_batches=" << metrics.adaptive_objective_throughput_batches_completed
+              << " compaction_pressure_batches=" << metrics.adaptive_compaction_pressure_batches_completed
+              << " wal_growth_batches=" << metrics.adaptive_wal_growth_batches_completed
+              << " objective_short_delay_batches=" << metrics.adaptive_objective_short_delay_batches_completed
+              << " objective_long_delay_batches=" << metrics.adaptive_objective_long_delay_batches_completed
+              << " wal_fsync_calls=" << metrics.wal_fsync_calls
+              << " wal_bytes_written=" << metrics.wal_bytes_written
+              << " snapshot_bytes_written_total=" << metrics.total_snapshot_bytes_written
+              << " wal_bytes_reclaimed_total=" << metrics.total_wal_bytes_reclaimed_by_compaction
+              << " writer_wait_events=" << metrics.writer_wait_events
+              << " writer_wait_time_us=" << metrics.writer_wait_time_us
+              << " queue_high_watermark=" << metrics.max_pending_queue_depth
+              << " recent_batch_fill_per_1000=" << metrics.recent_batch_fill_per_1000
+              << " latency_histogram=";
+    for (size_t i = 0; i < metrics.write_latency_histogram.size(); ++i) {
+        if (i != 0) {
+            std::cout << ',';
+        }
+        std::cout << metrics.write_latency_histogram[i];
+    }
+    std::cout
+              << std::endl;
+}
+
+}  // namespace
 
 int main(int argc, char* argv[]) {
     if (argc > 1) {
-        std::string arg = argv[1];
-        if (arg == "stress") {
-            stress_test();
-        } else if (arg == "demo") {
-            demo_test();
-        } else {
-            std::cout << "Unknown command: " << arg << std::endl;
-            std::cout << "Usage: ./kv_test [stress|demo]" << std::endl;
+        const std::string command = argv[1];
+        if (command == "bench") {
+            run_benchmark();
+            return 0;
         }
-    } else {
-        std::cout << "Running basic tests. Use './kv_test demo' for a demonstration or './kv_test stress' for the long-running test." << std::endl;
-        simple_test();
+        std::cerr << "Unknown command: " << command << '\n';
+        std::cerr << "Usage: kv_test [bench]" << std::endl;
+        return 1;
     }
+
+    const std::vector<std::pair<std::string, std::function<void()>>> tests = {
+        {"basic persistence", test_basic_persistence},
+        {"put copies input value", test_put_copies_input_value},
+        {"recovery from WAL without compaction", test_recovery_from_wal_without_compaction},
+        {"ordering and updates", test_ordering_and_updates},
+        {"compaction persists snapshot and resets WAL", test_compaction_persists_snapshot_and_resets_wal},
+        {"truncated WAL tail is ignored", test_truncated_wal_tail_is_ignored},
+        {"corrupted WAL record throws", test_corrupted_wal_record_throws},
+        {"concurrent reads and writes", test_concurrent_reads_and_writes},
+        {"many concurrent writers", test_many_concurrent_writers},
+        {"concurrent compaction with writes", test_concurrent_compaction_with_writes},
+        {"batching metrics are reported", test_batching_metrics_are_reported},
+        {"auto compaction triggers and preserves state", test_auto_compaction_triggers_and_preserves_state},
+        {"manual and auto compaction metrics coexist", test_manual_and_auto_compaction_metrics_coexist},
+        {"invalid wal ratio triggers auto compaction", test_invalid_wal_ratio_triggers_auto_compaction},
+        {"wal obsolete byte metrics are consistent", test_wal_obsolete_byte_metrics_are_consistent},
+        {"batch wal byte limit is respected", test_batch_wal_byte_limit_is_respected},
+        {"latency histogram tracks write requests", test_latency_histogram_tracks_write_requests},
+        {"adaptive batching expands batch under queue pressure", test_adaptive_batching_expands_batch_under_queue_pressure},
+        {"percentile and writer metrics are reported", test_percentile_and_writer_metrics_are_reported},
+        {"adaptive flush shortens batch delay", test_adaptive_flush_shortens_batch_delay},
+        {"compaction long term metrics accumulate", test_compaction_long_term_metrics_accumulate},
+        {"latency target adaptive flush kicks in", test_latency_target_adaptive_flush_kicks_in},
+        {"fsync pressure can relax batch delay", test_fsync_pressure_can_relax_batch_delay},
+        {"recent window metrics capture bursts", test_recent_window_metrics_capture_bursts},
+        {"read heavy signal prefers shorter batches", test_read_heavy_signal_prefers_shorter_batches},
+        {"compaction pressure signal relaxes batch delay", test_compaction_pressure_signal_relaxes_batch_delay},
+        {"wal growth signal relaxes batch delay", test_wal_growth_signal_relaxes_batch_delay},
+        {"objective policy prefers short delay under latency pressure",
+         test_objective_policy_prefers_short_delay_under_latency_pressure},
+        {"objective policy prefers long delay under cost pressure",
+         test_objective_policy_prefers_long_delay_under_cost_pressure},
+        {"objective throughput score can dominate latency pressure",
+         test_objective_throughput_score_can_dominate_latency_pressure},
+    };
+
+    size_t passed = 0;
+    for (const auto& [name, test] : tests) {
+        try {
+            test();
+            ++passed;
+            std::cout << "[PASS] " << name << '\n';
+        } catch (const std::exception& ex) {
+            std::cerr << "[FAIL] " << name << ": " << ex.what() << '\n';
+            return 1;
+        }
+    }
+
+    std::cout << "All " << passed << " tests passed." << std::endl;
     return 0;
 }
