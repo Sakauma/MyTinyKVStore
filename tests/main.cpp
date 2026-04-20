@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -24,6 +25,12 @@
 namespace {
 
 #pragma pack(push, 1)
+struct SnapshotHeader {
+    char magic[8];
+    uint32_t version;
+    uint32_t reserved;
+};
+
 struct WalRecordHeader {
     uint32_t magic;
     uint16_t version;
@@ -34,6 +41,8 @@ struct WalRecordHeader {
     uint32_t checksum;
 };
 #pragma pack(pop)
+
+constexpr char kSnapshotMagic[8] = {'K', 'V', 'S', 'N', 'A', 'P', '0', '1'};
 
 Value text(const std::string& input) {
     return Value(std::vector<uint8_t>(input.begin(), input.end()));
@@ -192,6 +201,59 @@ int run_fault_injection_scenario(const std::string& scenario, const std::string&
 
     std::cerr << "Unknown fault-injection scenario: " << scenario << '\n';
     return 1;
+}
+
+int run_inspect_format(const std::string& db_path) {
+    const std::string wal_path = db_path + ".wal";
+    std::ifstream snapshot(db_path, std::ios::binary);
+    if (!snapshot.is_open()) {
+        std::cerr << "snapshot_exists=0" << std::endl;
+        return 1;
+    }
+
+    SnapshotHeader snapshot_header {};
+    snapshot.read(reinterpret_cast<char*>(&snapshot_header), sizeof(snapshot_header));
+    if (snapshot.gcount() != static_cast<std::streamsize>(sizeof(snapshot_header))) {
+        std::cerr << "snapshot_exists=1 snapshot_truncated=1" << std::endl;
+        return 2;
+    }
+
+    std::cout << "snapshot_exists=1"
+              << " snapshot_magic_ok=" << (std::memcmp(snapshot_header.magic, kSnapshotMagic, sizeof(kSnapshotMagic)) == 0 ? 1 : 0)
+              << " snapshot_version=" << snapshot_header.version
+              << " snapshot_size=" << file_size_or_zero(db_path);
+
+    std::ifstream wal(wal_path, std::ios::binary);
+    if (!wal.is_open()) {
+        std::cout << " wal_exists=0" << std::endl;
+        return 0;
+    }
+
+    WalRecordHeader wal_header {};
+    wal.read(reinterpret_cast<char*>(&wal_header), sizeof(wal_header));
+    if (wal.gcount() == 0) {
+        std::cout << " wal_exists=1 wal_empty=1 wal_size=" << file_size_or_zero(wal_path) << std::endl;
+        return 0;
+    }
+    if (wal.gcount() != static_cast<std::streamsize>(sizeof(wal_header))) {
+        std::cout << " wal_exists=1 wal_truncated=1 wal_size=" << file_size_or_zero(wal_path) << std::endl;
+        return 0;
+    }
+
+    std::cout << " wal_exists=1"
+              << " wal_empty=0"
+              << " wal_magic=0x" << std::hex << wal_header.magic << std::dec
+              << " wal_version=" << wal_header.version
+              << " wal_first_type=" << static_cast<int>(wal_header.type)
+              << " wal_size=" << file_size_or_zero(wal_path)
+              << std::endl;
+    return 0;
+}
+
+int run_rewrite_format(const std::string& db_path) {
+    KVStore store(db_path);
+    store.Compact();
+    return 0;
 }
 
 void test_basic_persistence() {
@@ -1517,6 +1579,20 @@ int main(int argc, char* argv[]) {
             run_soak_test(duration_seconds);
             return 0;
         }
+        if (command == "inspect-format") {
+            if (argc != 3) {
+                std::cerr << "Usage: kv_test inspect-format <db_path>" << std::endl;
+                return 1;
+            }
+            return run_inspect_format(argv[2]);
+        }
+        if (command == "rewrite-format") {
+            if (argc != 3) {
+                std::cerr << "Usage: kv_test rewrite-format <db_path>" << std::endl;
+                return 1;
+            }
+            return run_rewrite_format(argv[2]);
+        }
         if (command == "fault-inject") {
             if (argc != 4) {
                 std::cerr << "Usage: kv_test fault-inject <scenario> <db_path>" << std::endl;
@@ -1525,7 +1601,7 @@ int main(int argc, char* argv[]) {
             return run_fault_injection_scenario(argv[2], argv[3]);
         }
         std::cerr << "Unknown command: " << command << '\n';
-        std::cerr << "Usage: kv_test [bench|soak|fault-inject]" << std::endl;
+        std::cerr << "Usage: kv_test [bench|soak|inspect-format|rewrite-format|fault-inject]" << std::endl;
         return 1;
     }
 

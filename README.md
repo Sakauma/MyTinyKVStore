@@ -143,8 +143,12 @@ cd build && ctest --output-on-failure
 - `bash scripts/coverage.sh`：执行 coverage 构建与测试；若本地安装了 `gcovr`，会直接打印 coverage 摘要。
 - `bash scripts/bench.sh`：构建并运行 benchmark。
 - `bash scripts/soak.sh 10`：运行带 compaction 的混合读写 soak test，并在结束后重启校验数据一致性。
+- `bash scripts/inspect-format.sh <db_path>`：检查快照和 WAL 的格式版本。
+- `bash scripts/rewrite-format.sh <db_path>`：加载数据库并执行一次 `Compact()`，把数据重写到当前格式。
 
 当前测试程序还内置了故障注入入口 `kv_test fault-inject <scenario> <db_path>`，用于在 WAL `fsync` 之后、快照 rename 前后、WAL 轮转后等关键持久化点模拟进程崩溃。常规测试会自动通过子进程调用这些场景来验证重启恢复。
+
+磁盘格式说明见 [docs/file-format.md](/home/sakauma/code/lpue/docs/file-format.md)。
 
 ### 可选 Sanitizer
 
