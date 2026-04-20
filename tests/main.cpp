@@ -8,6 +8,8 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <map>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <stdexcept>
@@ -17,6 +19,7 @@
 #include <vector>
 
 #include <unistd.h>
+#include <sys/wait.h>
 
 namespace {
 
@@ -82,6 +85,13 @@ void flip_byte(const std::string& path, std::streamoff offset) {
     file.put(static_cast<char>(original ^ 0xFF));
 }
 
+void write_u32_at(const std::string& path, std::streamoff offset, uint32_t value) {
+    std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+    require(file.is_open(), "Expected file to exist for overwrite");
+    file.seekp(offset);
+    file.write(reinterpret_cast<const char*>(&value), sizeof(value));
+}
+
 uintmax_t file_size_or_zero(const std::string& path) {
     std::error_code ec;
     const auto size = std::filesystem::file_size(path, ec);
@@ -118,6 +128,70 @@ void wait_until(Predicate predicate, const std::string& failure_message, int tim
     if (!predicate()) {
         throw std::runtime_error(failure_message);
     }
+}
+
+std::string g_program_path;
+
+void run_failpoint_child(const std::string& scenario, const std::string& db_path) {
+    pid_t child = ::fork();
+    require(child >= 0, "fork should succeed");
+    if (child == 0) {
+        ::execl(
+            g_program_path.c_str(),
+            g_program_path.c_str(),
+            "fault-inject",
+            scenario.c_str(),
+            db_path.c_str(),
+            static_cast<char*>(nullptr));
+        ::_exit(127);
+    }
+
+    int status = 0;
+    require(::waitpid(child, &status, 0) == child, "waitpid should return the child pid");
+    require(WIFEXITED(status), "fault-injection child should exit normally");
+    require(WEXITSTATUS(status) == 86, "fault-injection child should terminate at the configured failpoint");
+}
+
+int run_fault_injection_scenario(const std::string& scenario, const std::string& db_path) {
+    ::setenv("KVSTORE_FAIL_ACTION", "crash", 1);
+
+    if (scenario == "wal_after_fsync") {
+        KVStore store(db_path);
+        store.Put(1, text("stable"));
+        ::setenv("KVSTORE_FAILPOINT", "after_wal_fsync_before_apply", 1);
+        store.Put(2, text("latest"));
+        return 2;
+    }
+
+    if (scenario == "snapshot_after_rename") {
+        KVStore store(db_path);
+        store.Put(1, text("one"));
+        store.Put(2, text("two"));
+        ::setenv("KVSTORE_FAILPOINT", "after_snapshot_rename_before_wal_reset", 1);
+        store.Compact();
+        return 3;
+    }
+
+    if (scenario == "wal_rotation_before_reopen") {
+        KVStore store(db_path);
+        store.Put(10, text("ten"));
+        store.Put(20, text("twenty"));
+        ::setenv("KVSTORE_FAILPOINT", "after_wal_rotation_before_reopen", 1);
+        store.Compact();
+        return 4;
+    }
+
+    if (scenario == "snapshot_before_rename") {
+        KVStore store(db_path);
+        store.Put(7, text("seven"));
+        store.Put(8, text("eight"));
+        ::setenv("KVSTORE_FAILPOINT", "after_snapshot_fsync_before_rename", 1);
+        store.Compact();
+        return 5;
+    }
+
+    std::cerr << "Unknown fault-injection scenario: " << scenario << '\n';
+    return 1;
 }
 
 void test_basic_persistence() {
@@ -258,6 +332,110 @@ void test_corrupted_wal_record_throws() {
         threw = true;
     }
     require(threw, "corrupted WAL payload should raise KVStoreError");
+}
+
+void test_corrupted_snapshot_throws() {
+    TestDir dir("corrupt_snapshot");
+    const std::string db_path = dir.file("store.dat");
+
+    {
+        KVStore store(db_path);
+        store.Put(1, text("snap"));
+        store.Compact();
+    }
+
+    flip_byte(db_path, 0);
+
+    bool threw = false;
+    try {
+        KVStore reopened(db_path);
+        (void)reopened;
+    } catch (const KVStoreError&) {
+        threw = true;
+    }
+    require(threw, "corrupted snapshot magic should raise KVStoreError");
+}
+
+void test_unsupported_snapshot_version_throws() {
+    TestDir dir("snapshot_version");
+    const std::string db_path = dir.file("store.dat");
+
+    {
+        KVStore store(db_path);
+        store.Put(1, text("versioned"));
+        store.Compact();
+    }
+
+    write_u32_at(db_path, 8, 99);
+
+    bool threw = false;
+    try {
+        KVStore reopened(db_path);
+        (void)reopened;
+    } catch (const KVStoreError&) {
+        threw = true;
+    }
+    require(threw, "unsupported snapshot version should raise KVStoreError");
+}
+
+void test_crash_after_wal_fsync_recovers_latest_write() {
+    TestDir dir("crash_wal_fsync");
+    const std::string db_path = dir.file("store.dat");
+
+    run_failpoint_child("wal_after_fsync", db_path);
+
+    KVStore reopened(db_path);
+    const auto stable = reopened.Get(1);
+    const auto latest = reopened.Get(2);
+    require(stable.has_value(), "stable key should persist after WAL-fsync crash");
+    require(latest.has_value(), "latest WAL-synced key should be recovered after crash");
+    require(as_string(*stable) == "stable", "stable key should preserve its value");
+    require(as_string(*latest) == "latest", "replayed WAL should restore the latest synced value");
+}
+
+void test_crash_after_snapshot_rename_recovers_consistent_state() {
+    TestDir dir("crash_snapshot_rename");
+    const std::string db_path = dir.file("store.dat");
+
+    run_failpoint_child("snapshot_after_rename", db_path);
+
+    KVStore reopened(db_path);
+    const auto one = reopened.Get(1);
+    const auto two = reopened.Get(2);
+    require(one.has_value() && two.has_value(),
+            "snapshot-rename crash should preserve all compacted keys");
+    require(as_string(*one) == "one", "recovered state should keep key 1");
+    require(as_string(*two) == "two", "recovered state should keep key 2");
+}
+
+void test_crash_before_snapshot_rename_replays_old_wal() {
+    TestDir dir("crash_before_snapshot_rename");
+    const std::string db_path = dir.file("store.dat");
+
+    run_failpoint_child("snapshot_before_rename", db_path);
+
+    KVStore reopened(db_path);
+    const auto seven = reopened.Get(7);
+    const auto eight = reopened.Get(8);
+    require(seven.has_value() && eight.has_value(),
+            "crash before snapshot rename should fall back to old snapshot plus WAL");
+    require(as_string(*seven) == "seven", "recovered state should keep key 7");
+    require(as_string(*eight) == "eight", "recovered state should keep key 8");
+}
+
+void test_crash_after_wal_rotation_recovers_snapshot() {
+    TestDir dir("crash_wal_rotation");
+    const std::string db_path = dir.file("store.dat");
+
+    run_failpoint_child("wal_rotation_before_reopen", db_path);
+
+    KVStore reopened(db_path);
+    const auto ten = reopened.Get(10);
+    const auto twenty = reopened.Get(20);
+    require(ten.has_value() && twenty.has_value(),
+            "crash after WAL rotation should preserve compacted snapshot state");
+    require(as_string(*ten) == "ten", "recovered state should keep key 10");
+    require(as_string(*twenty) == "twenty", "recovered state should keep key 20");
 }
 
 void test_concurrent_reads_and_writes() {
@@ -1071,6 +1249,102 @@ void test_objective_throughput_score_can_dominate_latency_pressure() {
             "throughput-dominated objective control should expand the effective batch delay");
 }
 
+void run_soak_test(int duration_seconds) {
+    TestDir dir("soak");
+    const std::string db_path = dir.file("store.dat");
+
+    KVStoreOptions options;
+    options.max_batch_size = 32;
+    options.max_batch_wal_bytes = 1 << 20;
+    options.max_batch_delay_us = 2000;
+    options.auto_compact_wal_bytes_threshold = 4096;
+    options.auto_compact_invalid_wal_ratio_percent = 60;
+    options.adaptive_flush_enabled = true;
+    options.adaptive_flush_queue_depth_threshold = 8;
+    options.adaptive_flush_delay_divisor = 4;
+    options.adaptive_flush_min_batch_delay_us = 100;
+    KVStore store(db_path, options);
+
+    constexpr int kWriterCount = 4;
+    constexpr int kReaderCount = 2;
+    constexpr int kKeySpace = 256;
+
+    std::atomic<bool> stop {false};
+    std::map<int, std::optional<std::string>> oracle;
+    std::mutex oracle_mutex;
+    std::vector<std::thread> threads;
+
+    for (int writer_id = 0; writer_id < kWriterCount; ++writer_id) {
+        threads.emplace_back([&store, &stop, &oracle, &oracle_mutex, writer_id]() {
+            std::mt19937 gen(9000 + writer_id);
+            std::uniform_int_distribution<int> key_dist(0, kKeySpace - 1);
+            std::uniform_int_distribution<int> op_dist(0, 9);
+            uint64_t version = 0;
+            while (!stop.load(std::memory_order_acquire)) {
+                const int key = key_dist(gen);
+                const bool do_delete = op_dist(gen) < 3;
+                if (do_delete) {
+                    store.Delete(key);
+                    std::lock_guard<std::mutex> lock(oracle_mutex);
+                    oracle[key] = std::nullopt;
+                } else {
+                    const std::string payload =
+                        "value_" + std::to_string(writer_id) + "_" + std::to_string(key) + "_" + std::to_string(version++);
+                    store.Put(key, text(payload));
+                    std::lock_guard<std::mutex> lock(oracle_mutex);
+                    oracle[key] = payload;
+                }
+            }
+        });
+    }
+
+    for (int reader_id = 0; reader_id < kReaderCount; ++reader_id) {
+        threads.emplace_back([&store, &stop, reader_id]() {
+            std::mt19937 gen(12000 + reader_id);
+            std::uniform_int_distribution<int> key_dist(0, kKeySpace - 1);
+            while (!stop.load(std::memory_order_acquire)) {
+                const auto value = store.Get(key_dist(gen));
+                if (value.has_value()) {
+                    require(as_string(*value).rfind("value_", 0) == 0, "soak readers should only observe complete values");
+                }
+            }
+        });
+    }
+
+    threads.emplace_back([&store, &stop]() {
+        while (!stop.load(std::memory_order_acquire)) {
+            store.Compact();
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    });
+
+    std::this_thread::sleep_for(std::chrono::seconds(duration_seconds));
+    stop.store(true, std::memory_order_release);
+
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    store.Compact();
+
+    std::map<int, std::optional<std::string>> expected;
+    {
+        std::lock_guard<std::mutex> lock(oracle_mutex);
+        expected = oracle;
+    }
+
+    KVStore reopened(db_path);
+    for (const auto& [key, expected_value] : expected) {
+        const auto actual = reopened.Get(key);
+        if (!expected_value.has_value()) {
+            require(!actual.has_value(), "deleted keys should remain deleted after soak restart");
+            continue;
+        }
+        require(actual.has_value(), "expected live key missing after soak restart");
+        require(as_string(*actual) == *expected_value, "reopened state should match soak oracle");
+    }
+}
+
 void run_benchmark() {
     TestDir dir("bench");
     const std::string db_path = dir.file("store.dat");
@@ -1231,14 +1505,27 @@ void run_benchmark() {
 }  // namespace
 
 int main(int argc, char* argv[]) {
+    g_program_path = std::filesystem::absolute(argv[0]).string();
     if (argc > 1) {
         const std::string command = argv[1];
         if (command == "bench") {
             run_benchmark();
             return 0;
         }
+        if (command == "soak") {
+            const int duration_seconds = argc > 2 ? std::stoi(argv[2]) : 10;
+            run_soak_test(duration_seconds);
+            return 0;
+        }
+        if (command == "fault-inject") {
+            if (argc != 4) {
+                std::cerr << "Usage: kv_test fault-inject <scenario> <db_path>" << std::endl;
+                return 1;
+            }
+            return run_fault_injection_scenario(argv[2], argv[3]);
+        }
         std::cerr << "Unknown command: " << command << '\n';
-        std::cerr << "Usage: kv_test [bench]" << std::endl;
+        std::cerr << "Usage: kv_test [bench|soak|fault-inject]" << std::endl;
         return 1;
     }
 
@@ -1250,6 +1537,13 @@ int main(int argc, char* argv[]) {
         {"compaction persists snapshot and resets WAL", test_compaction_persists_snapshot_and_resets_wal},
         {"truncated WAL tail is ignored", test_truncated_wal_tail_is_ignored},
         {"corrupted WAL record throws", test_corrupted_wal_record_throws},
+        {"corrupted snapshot throws", test_corrupted_snapshot_throws},
+        {"unsupported snapshot version throws", test_unsupported_snapshot_version_throws},
+        {"crash after wal fsync recovers latest write", test_crash_after_wal_fsync_recovers_latest_write},
+        {"crash after snapshot rename recovers consistent state",
+         test_crash_after_snapshot_rename_recovers_consistent_state},
+        {"crash before snapshot rename replays old wal", test_crash_before_snapshot_rename_replays_old_wal},
+        {"crash after wal rotation recovers snapshot", test_crash_after_wal_rotation_recovers_snapshot},
         {"concurrent reads and writes", test_concurrent_reads_and_writes},
         {"many concurrent writers", test_many_concurrent_writers},
         {"concurrent compaction with writes", test_concurrent_compaction_with_writes},

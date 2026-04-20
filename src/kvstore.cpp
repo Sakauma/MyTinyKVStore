@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -266,6 +267,20 @@ SnapshotHeader make_snapshot_header() {
     header.version = kSnapshotVersion;
     header.reserved = 0;
     return header;
+}
+
+void maybe_trigger_failpoint(const char* name) {
+    const char* configured = std::getenv("KVSTORE_FAILPOINT");
+    if (configured == nullptr || std::strcmp(configured, name) != 0) {
+        return;
+    }
+
+    const char* action = std::getenv("KVSTORE_FAIL_ACTION");
+    if (action != nullptr && std::strcmp(action, "throw") == 0) {
+        throw KVStoreError(std::string("Injected failpoint: ") + name);
+    }
+
+    ::_exit(86);
 }
 
 }  // namespace
@@ -1017,6 +1032,7 @@ private:
             }
         }
         fsync_file(wal_fd_, wal_file_path_);
+        maybe_trigger_failpoint("after_wal_fsync_before_apply");
 
         {
             std::unique_lock<std::shared_mutex> lock(state_mutex_);
@@ -1189,6 +1205,7 @@ private:
                 }
             }
             fsync_file(snapshot_fd, temp_snapshot_path);
+            maybe_trigger_failpoint("after_snapshot_fsync_before_rename");
             ::close(snapshot_fd);
             snapshot_fd = -1;
 
@@ -1196,6 +1213,7 @@ private:
                 throw io_error("rename", temp_snapshot_path);
             }
             fsync_directory(db_file_path_);
+            maybe_trigger_failpoint("after_snapshot_rename_before_wal_reset");
 
             close_if_open(wal_fd_);
             wal_fd_ = -1;
@@ -1209,6 +1227,7 @@ private:
                 throw io_error("rename", temp_wal_path);
             }
             fsync_directory(wal_file_path_);
+            maybe_trigger_failpoint("after_wal_rotation_before_reopen");
             open_wal_for_append();
             wal_bytes_since_compaction_.store(0, std::memory_order_relaxed);
             live_wal_bytes_since_compaction_.store(0, std::memory_order_relaxed);

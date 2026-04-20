@@ -142,6 +142,9 @@ cd build && ctest --output-on-failure
 - `bash scripts/ci-sanitizers.sh`：分别执行 ASan 和 UBSan 构建与测试。
 - `bash scripts/coverage.sh`：执行 coverage 构建与测试；若本地安装了 `gcovr`，会直接打印 coverage 摘要。
 - `bash scripts/bench.sh`：构建并运行 benchmark。
+- `bash scripts/soak.sh 10`：运行带 compaction 的混合读写 soak test，并在结束后重启校验数据一致性。
+
+当前测试程序还内置了故障注入入口 `kv_test fault-inject <scenario> <db_path>`，用于在 WAL `fsync` 之后、快照 rename 前后、WAL 轮转后等关键持久化点模拟进程崩溃。常规测试会自动通过子进程调用这些场景来验证重启恢复。
 
 ### 可选 Sanitizer
 
