@@ -15,5 +15,10 @@
     "avg_write_latency_us": 12000.0
   },
   "options": {},
-  "metrics": {}
+  "metrics": {
+    "approx_write_latency_p95_us": 20000,
+    "approx_write_latency_p99_us": 25000,
+    "observed_fsync_pressure_per_1000_writes": 400,
+    "recent_batch_fill_per_1000": 300
+  }
 }

@@ -37,6 +37,10 @@ baseline JSON 包含四部分：
 - `write_ops_per_s` 不得低于参考基线的 `85%`
 - `read_ops_per_s` 不得低于参考基线的 `85%`
 - `avg_write_latency_us` 不得高于参考基线的 `125%`
+- `approx_write_latency_p95_us` 不得高于参考基线的 `150%`
+- `approx_write_latency_p99_us` 不得高于参考基线的 `175%`
+- `observed_fsync_pressure_per_1000_writes` 不得高于参考基线的 `150%`
+- `recent_batch_fill_per_1000` 不得低于参考基线的 `75%`
 
 这些阈值目前是保守门槛，用来挡住明显退化，而不是替代长期性能分析。
 

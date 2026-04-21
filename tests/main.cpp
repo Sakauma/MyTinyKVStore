@@ -766,7 +766,11 @@ int run_compare_benchmark_baseline(
     const std::string& candidate_path,
     double min_write_ratio_pct = 85.0,
     double min_read_ratio_pct = 85.0,
-    double max_latency_ratio_pct = 125.0) {
+    double max_latency_ratio_pct = 125.0,
+    double max_p95_latency_ratio_pct = 150.0,
+    double max_p99_latency_ratio_pct = 175.0,
+    double max_fsync_pressure_ratio_pct = 150.0,
+    double min_batch_fill_ratio_pct = 75.0) {
     const std::string baseline_json = read_text_file(baseline_path);
     const std::string candidate_json = read_text_file(candidate_path);
 
@@ -776,28 +780,57 @@ int run_compare_benchmark_baseline(
     const double candidate_read_ops_per_s = extract_json_number(candidate_json, "read_ops_per_s");
     const double baseline_avg_write_latency_us = extract_json_number(baseline_json, "avg_write_latency_us");
     const double candidate_avg_write_latency_us = extract_json_number(candidate_json, "avg_write_latency_us");
+    const double baseline_p95_latency_us = extract_json_number(baseline_json, "approx_write_latency_p95_us");
+    const double candidate_p95_latency_us = extract_json_number(candidate_json, "approx_write_latency_p95_us");
+    const double baseline_p99_latency_us = extract_json_number(baseline_json, "approx_write_latency_p99_us");
+    const double candidate_p99_latency_us = extract_json_number(candidate_json, "approx_write_latency_p99_us");
+    const double baseline_fsync_pressure = extract_json_number(baseline_json, "observed_fsync_pressure_per_1000_writes");
+    const double candidate_fsync_pressure = extract_json_number(candidate_json, "observed_fsync_pressure_per_1000_writes");
+    const double baseline_batch_fill = extract_json_number(baseline_json, "recent_batch_fill_per_1000");
+    const double candidate_batch_fill = extract_json_number(candidate_json, "recent_batch_fill_per_1000");
 
     require(baseline_write_ops_per_s > 0.0, "baseline write throughput must be positive");
     require(baseline_read_ops_per_s > 0.0, "baseline read throughput must be positive");
     require(baseline_avg_write_latency_us > 0.0, "baseline write latency must be positive");
+    require(baseline_p95_latency_us > 0.0, "baseline p95 write latency must be positive");
+    require(baseline_p99_latency_us > 0.0, "baseline p99 write latency must be positive");
+    require(baseline_fsync_pressure > 0.0, "baseline fsync pressure must be positive");
+    require(baseline_batch_fill > 0.0, "baseline batch fill must be positive");
 
     const double write_ratio_pct = (candidate_write_ops_per_s / baseline_write_ops_per_s) * 100.0;
     const double read_ratio_pct = (candidate_read_ops_per_s / baseline_read_ops_per_s) * 100.0;
     const double latency_ratio_pct = (candidate_avg_write_latency_us / baseline_avg_write_latency_us) * 100.0;
+    const double p95_latency_ratio_pct = (candidate_p95_latency_us / baseline_p95_latency_us) * 100.0;
+    const double p99_latency_ratio_pct = (candidate_p99_latency_us / baseline_p99_latency_us) * 100.0;
+    const double fsync_pressure_ratio_pct = (candidate_fsync_pressure / baseline_fsync_pressure) * 100.0;
+    const double batch_fill_ratio_pct = (candidate_batch_fill / baseline_batch_fill) * 100.0;
 
     const bool write_ok = write_ratio_pct >= min_write_ratio_pct;
     const bool read_ok = read_ratio_pct >= min_read_ratio_pct;
     const bool latency_ok = latency_ratio_pct <= max_latency_ratio_pct;
-    const bool pass = write_ok && read_ok && latency_ok;
+    const bool p95_latency_ok = p95_latency_ratio_pct <= max_p95_latency_ratio_pct;
+    const bool p99_latency_ok = p99_latency_ratio_pct <= max_p99_latency_ratio_pct;
+    const bool fsync_pressure_ok = fsync_pressure_ratio_pct <= max_fsync_pressure_ratio_pct;
+    const bool batch_fill_ok = batch_fill_ratio_pct >= min_batch_fill_ratio_pct;
+    const bool pass = write_ok && read_ok && latency_ok && p95_latency_ok && p99_latency_ok &&
+                      fsync_pressure_ok && batch_fill_ok;
 
     std::cout << "baseline=" << baseline_path
               << " candidate=" << candidate_path
               << " write_ratio_pct=" << write_ratio_pct
               << " read_ratio_pct=" << read_ratio_pct
               << " latency_ratio_pct=" << latency_ratio_pct
+              << " p95_latency_ratio_pct=" << p95_latency_ratio_pct
+              << " p99_latency_ratio_pct=" << p99_latency_ratio_pct
+              << " fsync_pressure_ratio_pct=" << fsync_pressure_ratio_pct
+              << " batch_fill_ratio_pct=" << batch_fill_ratio_pct
               << " min_write_ratio_pct=" << min_write_ratio_pct
               << " min_read_ratio_pct=" << min_read_ratio_pct
               << " max_latency_ratio_pct=" << max_latency_ratio_pct
+              << " max_p95_latency_ratio_pct=" << max_p95_latency_ratio_pct
+              << " max_p99_latency_ratio_pct=" << max_p99_latency_ratio_pct
+              << " max_fsync_pressure_ratio_pct=" << max_fsync_pressure_ratio_pct
+              << " min_batch_fill_ratio_pct=" << min_batch_fill_ratio_pct
               << " status=" << (pass ? "pass" : "fail")
               << std::endl;
     return pass ? 0 : 2;
@@ -1434,12 +1467,20 @@ void test_compare_benchmark_baseline_passes_within_thresholds() {
     baseline.write_ops_per_s = 1000.0;
     baseline.read_ops_per_s = 2000.0;
     baseline.avg_write_latency_us = 100.0;
+    baseline.metrics.approx_write_latency_p95_us = 1000;
+    baseline.metrics.approx_write_latency_p99_us = 1200;
+    baseline.metrics.observed_fsync_pressure_per_1000_writes = 200;
+    baseline.metrics.recent_batch_fill_per_1000 = 500;
 
     BenchmarkResult candidate = baseline;
     candidate.config.label = "candidate";
     candidate.write_ops_per_s = 900.0;
     candidate.read_ops_per_s = 1800.0;
     candidate.avg_write_latency_us = 115.0;
+    candidate.metrics.approx_write_latency_p95_us = 1300;
+    candidate.metrics.approx_write_latency_p99_us = 1800;
+    candidate.metrics.observed_fsync_pressure_per_1000_writes = 250;
+    candidate.metrics.recent_batch_fill_per_1000 = 450;
 
     write_text_file(baseline_path, BenchmarkResultToJson(baseline));
     write_text_file(candidate_path, BenchmarkResultToJson(candidate));
@@ -1461,12 +1502,20 @@ void test_compare_benchmark_baseline_rejects_regression() {
     baseline.write_ops_per_s = 1000.0;
     baseline.read_ops_per_s = 2000.0;
     baseline.avg_write_latency_us = 100.0;
+    baseline.metrics.approx_write_latency_p95_us = 1000;
+    baseline.metrics.approx_write_latency_p99_us = 1200;
+    baseline.metrics.observed_fsync_pressure_per_1000_writes = 200;
+    baseline.metrics.recent_batch_fill_per_1000 = 500;
 
     BenchmarkResult candidate = baseline;
     candidate.config.label = "candidate";
     candidate.write_ops_per_s = 700.0;
     candidate.read_ops_per_s = 1500.0;
     candidate.avg_write_latency_us = 140.0;
+    candidate.metrics.approx_write_latency_p95_us = 1700;
+    candidate.metrics.approx_write_latency_p99_us = 2300;
+    candidate.metrics.observed_fsync_pressure_per_1000_writes = 400;
+    candidate.metrics.recent_batch_fill_per_1000 = 300;
 
     write_text_file(baseline_path, BenchmarkResultToJson(baseline));
     write_text_file(candidate_path, BenchmarkResultToJson(candidate));

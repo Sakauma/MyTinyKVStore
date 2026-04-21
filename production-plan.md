@@ -30,7 +30,7 @@
 ### 5. Engineering and CI
 
 - 缺少稳定 CI 流程来持续执行构建、测试和 sanitizer。
-- 已有 coverage 入口、baseline JSON 产出链路，以及基于默认阈值的 baseline 比较入口。
+- 已有 coverage 入口、baseline JSON 产出链路，以及覆盖吞吐、平均/尾延迟、`fsync` 压力和 batch fill 的 baseline 比较入口。
 - 已有 CI 中的保守 benchmark regression gate，以及 baseline 趋势汇总入口。
 - 还缺少更细粒度的性能门槛和长期可视化趋势对比。
 

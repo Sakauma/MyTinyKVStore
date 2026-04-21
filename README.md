@@ -168,6 +168,7 @@ cd build && ctest --output-on-failure
 若需要可归档的 benchmark 基线，可调用 `kv_test bench-baseline-json` 或 `bash scripts/bench-baseline.sh`。
 若需要自动判断是否出现明显退化，可调用 `kv_test compare-baseline ...` 或 `bash scripts/bench-regression-check.sh ...`。
 若需要查看一段时间内的趋势，可调用 `kv_test trend-baselines ...` 或 `bash scripts/bench-trend.sh ...`。
+当前 regression gate 除了 `write/read throughput` 和平均写延迟外，也会检查 `p95/p99`、`fsync` 压力和 batch fill。
 若需要推荐配置模板，可调用 `kv_test profile-json <name>` 或 `RecommendedOptions(...)`。
 
 磁盘格式说明见 [docs/file-format.md](/home/sakauma/code/lpue/docs/file-format.md)。当前程序会写入版本 `2` 的 snapshot / WAL，同时保留对版本 `1` 整型键格式的读取兼容。
