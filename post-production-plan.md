@@ -59,6 +59,9 @@ Exit criteria:
 - `microbench`：单项能力，如 WAL append、compaction、scan
 - `stressbench`：混合真实负载，如当前 `bench`
 
+Current status:
+- 已完成。当前仓库已提供 `microbench` / `microbench-json` 入口，覆盖 `wal_append`、`scan`、`recovery` 三类单项能力；原有 `bench` 继续承担混合负载 `stressbench` 角色。
+
 ### 3.2 Baseline History Discipline
 
 - 规范 baseline 存档格式、命名和保留策略。

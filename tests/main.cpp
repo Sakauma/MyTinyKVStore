@@ -1,4 +1,6 @@
 #include "kvstore.h"
+#include "internal/format.h"
+#include "internal/metrics_helpers.h"
 
 #include <algorithm>
 #include <atomic>
@@ -247,6 +249,14 @@ struct BenchmarkResult {
     double write_ops_per_s = 0.0;
     double read_ops_per_s = 0.0;
     double avg_write_latency_us = 0.0;
+};
+
+struct MicrobenchCaseResult {
+    std::string name;
+    double duration_s = 0.0;
+    double ops_per_s = 0.0;
+    uint64_t operations = 0;
+    uint64_t bytes = 0;
 };
 
 struct BaselineSummary {
@@ -1201,6 +1211,25 @@ std::string BenchmarkResultToJson(const BenchmarkResult& result) {
     return out.str();
 }
 
+std::string MicrobenchResultsToJson(const std::vector<MicrobenchCaseResult>& results) {
+    std::ostringstream out;
+    out << "{\"cases\":[";
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (i != 0) {
+            out << ',';
+        }
+        out << '{'
+            << "\"name\":\"" << results[i].name << "\""
+            << ",\"duration_s\":" << results[i].duration_s
+            << ",\"ops_per_s\":" << results[i].ops_per_s
+            << ",\"operations\":" << results[i].operations
+            << ",\"bytes\":" << results[i].bytes
+            << '}';
+    }
+    out << "]}";
+    return out.str();
+}
+
 double extract_json_number(const std::string& json, const std::string& key) {
     const std::string needle = "\"" + key + "\":";
     const size_t pos = json.find(needle);
@@ -1808,6 +1837,20 @@ void test_benchmark_result_json_reports_summary_and_metrics() {
             "benchmark baseline json should include kv metrics");
 }
 
+void test_microbench_json_reports_cases() {
+    std::vector<MicrobenchCaseResult> results;
+    results.push_back({"wal_append", 0.1, 1000.0, 100, 4096});
+    results.push_back({"scan", 0.2, 500.0, 100, 0});
+
+    const std::string json = MicrobenchResultsToJson(results);
+    require(json.find("\"cases\":[") != std::string::npos,
+            "microbench json should include a cases array");
+    require(json.find("\"name\":\"wal_append\"") != std::string::npos,
+            "microbench json should include the wal_append case");
+    require(json.find("\"name\":\"scan\"") != std::string::npos,
+            "microbench json should include the scan case");
+}
+
 void test_compare_benchmark_baseline_passes_within_thresholds() {
     TestDir dir("compare_baseline_pass");
     const std::string baseline_path = dir.file("baseline.json");
@@ -1925,6 +1968,58 @@ void test_benchmark_trend_summarizes_history() {
             "benchmark trend should report latest-vs-oldest latency ratio");
     require(values.at("latency_trend") == "improving",
             "benchmark trend should classify lower latency as improving");
+}
+
+void test_internal_format_helpers_round_trip_keys() {
+    const std::string int_key = kvstore::internal::encode_int_key(42);
+    const std::string string_key = kvstore::internal::encode_string_key("alpha");
+    const std::string binary_key =
+        kvstore::internal::encode_binary_key(std::vector<uint8_t> {0x00, 0x7F, 0xFF});
+
+    require(!int_key.empty() && int_key.front() == kvstore::internal::kIntKeyTag,
+            "encoded int keys should carry the int namespace tag");
+    require(kvstore::internal::is_string_key(string_key),
+            "encoded string keys should be recognized as string keys");
+    require(kvstore::internal::decode_string_key(string_key) == "alpha",
+            "string key helpers should round-trip the original string key");
+    require(!binary_key.empty() && binary_key.front() == kvstore::internal::kBinaryKeyTag,
+            "encoded binary keys should carry the binary namespace tag");
+}
+
+void test_internal_format_helpers_checksum_distinguishes_payloads() {
+    const std::string key = kvstore::internal::encode_string_key("checksum");
+    const Value first = text("value_a");
+    const Value second = text("value_b");
+
+    const uint32_t first_checksum =
+        kvstore::internal::checksum_record(kvstore::internal::WalRecordType::kPut, key, first);
+    const uint32_t second_checksum =
+        kvstore::internal::checksum_record(kvstore::internal::WalRecordType::kPut, key, second);
+    const uint32_t delete_checksum =
+        kvstore::internal::checksum_record(kvstore::internal::WalRecordType::kDelete, key, Value {});
+
+    require(first_checksum != second_checksum,
+            "checksum helper should change when the payload changes");
+    require(first_checksum != delete_checksum,
+            "checksum helper should change when the record type changes");
+}
+
+void test_internal_metrics_helpers_compute_percentiles_and_ratios() {
+    std::array<uint64_t, kWriteLatencyBucketCount> histogram {};
+    histogram[0] = 1;
+    histogram[4] = 2;
+    histogram[7] = 1;
+
+    require(kvstore::internal::approximate_latency_percentile_us(histogram, 1, 2) == 1000,
+            "p50 helper should map into the first bucket that crosses the 50th percentile");
+    require(kvstore::internal::approximate_latency_percentile_us(histogram, 95, 100) == 10000,
+            "p95 helper should map into the tail bucket that crosses the percentile");
+    require(kvstore::internal::capped_ratio_milli(16, 4) == 4000,
+            "ratio helper should cap values at 4x");
+    require(kvstore::internal::weighted_signal_score(200, 100, 3) == 6000,
+            "weighted signal score should scale the capped ratio by the given weight");
+    require(kvstore::internal::weighted_deficit_score(4, 8, 2) == 1000,
+            "weighted deficit score should reflect the observed gap to target");
 }
 
 void test_soak_profiles_are_distinct() {
@@ -3366,6 +3461,111 @@ void run_benchmark_json() {
     std::cout << MetricsToJson(store.GetMetrics()) << std::endl;
 }
 
+std::vector<MicrobenchCaseResult> run_microbench_capture() {
+    std::vector<MicrobenchCaseResult> results;
+
+    {
+        TestDir dir("microbench_wal_append");
+        const std::string db_path = dir.file("store.dat");
+        KVStoreOptions options;
+        options.max_batch_size = 1;
+        options.max_batch_delay_us = 0;
+        options.auto_compact_wal_bytes_threshold = 0;
+        KVStore store(db_path, options);
+
+        constexpr int kOperations = 500;
+        const auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < kOperations; ++i) {
+            store.Put(i, text("microbench_payload_" + std::to_string(i)));
+        }
+        const auto end = std::chrono::steady_clock::now();
+        const double duration_s = std::chrono::duration<double>(end - start).count();
+        results.push_back({
+            "wal_append",
+            duration_s,
+            duration_s > 0.0 ? static_cast<double>(kOperations) / duration_s : 0.0,
+            kOperations,
+            store.GetMetrics().wal_bytes_written,
+        });
+    }
+
+    {
+        TestDir dir("microbench_scan");
+        const std::string db_path = dir.file("store.dat");
+        KVStore store(db_path);
+        constexpr int kKeys = 2000;
+        for (int i = 0; i < kKeys; ++i) {
+            store.Put("scan:" + std::to_string(i), text("value_" + std::to_string(i)));
+        }
+        store.Compact();
+
+        constexpr int kOperations = 250;
+        const auto start = std::chrono::steady_clock::now();
+        size_t scanned = 0;
+        for (int i = 0; i < kOperations; ++i) {
+            const auto rows = store.Scan("scan:100", "scan:399");
+            scanned += rows.size();
+        }
+        const auto end = std::chrono::steady_clock::now();
+        const double duration_s = std::chrono::duration<double>(end - start).count();
+        results.push_back({
+            "scan",
+            duration_s,
+            duration_s > 0.0 ? static_cast<double>(kOperations) / duration_s : 0.0,
+            kOperations,
+            scanned,
+        });
+    }
+
+    {
+        TestDir dir("microbench_recovery");
+        const std::string db_path = dir.file("store.dat");
+        {
+            KVStore store(db_path);
+            constexpr int kKeys = 1500;
+            for (int i = 0; i < kKeys; ++i) {
+                store.Put(i, text("recovery_" + std::to_string(i)));
+            }
+        }
+
+        constexpr int kReopens = 25;
+        const auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < kReopens; ++i) {
+            KVStore reopened(db_path);
+            const auto sample = reopened.Get(42);
+            require(sample.has_value(), "microbench recovery should reopen valid data");
+        }
+        const auto end = std::chrono::steady_clock::now();
+        const double duration_s = std::chrono::duration<double>(end - start).count();
+        results.push_back({
+            "recovery",
+            duration_s,
+            duration_s > 0.0 ? static_cast<double>(kReopens) / duration_s : 0.0,
+            kReopens,
+            0,
+        });
+    }
+
+    return results;
+}
+
+void run_microbench() {
+    const auto results = run_microbench_capture();
+    for (const auto& result : results) {
+        std::cout << "[MICROBENCH]"
+                  << " name=" << result.name
+                  << " duration_s=" << result.duration_s
+                  << " ops_per_s=" << result.ops_per_s
+                  << " operations=" << result.operations
+                  << " bytes=" << result.bytes
+                  << std::endl;
+    }
+}
+
+void run_microbench_json() {
+    std::cout << MicrobenchResultsToJson(run_microbench_capture()) << std::endl;
+}
+
 void run_benchmark_baseline_json() {
     const BenchmarkResult result = run_benchmark_capture(
         make_benchmark_config("default-baseline", 8, 4, 3000, 50000));
@@ -3380,6 +3580,14 @@ int main(int argc, char* argv[]) {
         const std::string command = argv[1];
         if (command == "bench") {
             run_benchmark();
+            return 0;
+        }
+        if (command == "microbench") {
+            run_microbench();
+            return 0;
+        }
+        if (command == "microbench-json") {
+            run_microbench_json();
             return 0;
         }
         if (command == "bench-json") {
@@ -3468,7 +3676,7 @@ int main(int argc, char* argv[]) {
             return run_fault_injection_scenario(argv[2], argv[3]);
         }
         std::cerr << "Unknown command: " << command << '\n';
-        std::cerr << "Usage: kv_test [bench|bench-json|bench-baseline-json|compare-baseline|trend-baselines|profile-json|soak|concurrency-stress|inspect-format|rewrite-format|verify-format|compat-matrix|fault-inject]" << std::endl;
+        std::cerr << "Usage: kv_test [bench|microbench|microbench-json|bench-json|bench-baseline-json|compare-baseline|trend-baselines|profile-json|soak|concurrency-stress|inspect-format|rewrite-format|verify-format|compat-matrix|fault-inject]" << std::endl;
         return 1;
     }
 
@@ -3492,9 +3700,13 @@ int main(int argc, char* argv[]) {
         {"rewrite format recovers truncated current wal", test_rewrite_format_recovers_truncated_current_wal},
         {"compatibility matrix command succeeds", test_compatibility_matrix_command_succeeds},
         {"benchmark result json reports summary and metrics", test_benchmark_result_json_reports_summary_and_metrics},
+        {"microbench json reports cases", test_microbench_json_reports_cases},
         {"compare benchmark baseline passes within thresholds", test_compare_benchmark_baseline_passes_within_thresholds},
         {"compare benchmark baseline rejects regression", test_compare_benchmark_baseline_rejects_regression},
         {"benchmark trend summarizes history", test_benchmark_trend_summarizes_history},
+        {"internal format helpers round trip keys", test_internal_format_helpers_round_trip_keys},
+        {"internal format helpers checksum distinguishes payloads", test_internal_format_helpers_checksum_distinguishes_payloads},
+        {"internal metrics helpers compute percentiles and ratios", test_internal_metrics_helpers_compute_percentiles_and_ratios},
         {"soak profiles are distinct", test_soak_profiles_are_distinct},
         {"ordering and updates", test_ordering_and_updates},
         {"compaction persists snapshot and resets WAL", test_compaction_persists_snapshot_and_resets_wal},

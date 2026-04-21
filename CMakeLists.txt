@@ -56,6 +56,7 @@ kvstore_apply_sanitizers(kvstore)
 kvstore_apply_coverage(kvstore)
 
 add_executable(kv_test tests/main.cpp)
+target_include_directories(kv_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(kv_test PRIVATE kvstore Threads::Threads)
 target_compile_options(kv_test PRIVATE -g -Wall -Wextra -Wpedantic)
 kvstore_apply_sanitizers(kv_test)

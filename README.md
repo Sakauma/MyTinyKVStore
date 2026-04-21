@@ -151,7 +151,8 @@ cd build && ctest --output-on-failure
 - `bash scripts/ci-build.sh`：执行常规构建、测试和 `ctest`。
 - `bash scripts/ci-sanitizers.sh`：分别执行 ASan 和 UBSan 构建与测试。
 - `bash scripts/coverage.sh`：执行 coverage 构建与测试；若本地安装了 `gcovr`，会直接打印 coverage 摘要。
-- `bash scripts/bench.sh`：构建并运行 benchmark。
+- `bash scripts/bench.sh`：构建并运行混合负载 `stressbench`。
+- `bash scripts/microbench.sh`：构建并运行按单项能力拆分的 `microbench`。
 - `bash scripts/bench-baseline.sh`：运行 benchmark，并把结构化 baseline JSON 落到 `benchmarks/baselines/`。
 - `bash scripts/bench-regression-check.sh <baseline_json>`：生成新的 candidate baseline，并按默认阈值与参考基线比较。
 - `bash scripts/ci-bench-regression.sh`：使用仓库内的 CI 参考 baseline 执行回归门槛检查。
@@ -167,6 +168,7 @@ cd build && ctest --output-on-failure
 
 当前测试程序还内置了故障注入入口 `kv_test fault-inject <scenario> <db_path>`，用于在 WAL `fsync` 之后、快照 rename 前后、WAL 轮转后等关键持久化点模拟进程崩溃。常规测试会自动通过子进程调用这些场景来验证重启恢复。
 若需要结构化指标，可调用 `kv_test bench-json` 或直接使用库函数 `MetricsToJson(store.GetMetrics())`。
+若需要按单项能力拆开的 benchmark，可调用 `kv_test microbench` 或 `kv_test microbench-json`。
 若需要可归档的 benchmark 基线，可调用 `kv_test bench-baseline-json` 或 `bash scripts/bench-baseline.sh`。
 若需要自动判断是否出现明显退化，可调用 `kv_test compare-baseline ...` 或 `bash scripts/bench-regression-check.sh ...`。
 若需要查看一段时间内的趋势，可调用 `kv_test trend-baselines ...` 或 `bash scripts/bench-trend.sh ...`。
@@ -177,7 +179,7 @@ cd build && ctest --output-on-failure
 磁盘格式说明见 [docs/file-format.md](/home/sakauma/code/lpue/docs/file-format.md)。当前程序会写入版本 `2` 的 snapshot / WAL，同时保留对版本 `1` 整型键格式的读取兼容。
 兼容矩阵说明见 [docs/compatibility-matrix.md](/home/sakauma/code/lpue/docs/compatibility-matrix.md)。
 迁移与 rewrite 策略见 [docs/migration-policy.md](/home/sakauma/code/lpue/docs/migration-policy.md)。
-性能基线工作流见 [docs/performance-baseline.md](/home/sakauma/code/lpue/docs/performance-baseline.md)。
+性能基线与 microbench/stressbench 工作流见 [docs/performance-baseline.md](/home/sakauma/code/lpue/docs/performance-baseline.md)。
 运维建议和调参说明见 [docs/runbook.md](/home/sakauma/code/lpue/docs/runbook.md)。
 持久化、可见性和 `WriteBatch` 原子性语义见 [docs/semantics.md](/home/sakauma/code/lpue/docs/semantics.md)。
 事务与快照读的设计边界见 [docs/transaction-boundary.md](/home/sakauma/code/lpue/docs/transaction-boundary.md)。
