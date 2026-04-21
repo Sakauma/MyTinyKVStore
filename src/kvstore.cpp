@@ -3,6 +3,7 @@
 #include "internal/format.h"
 #include "internal/io.h"
 #include "internal/metrics_helpers.h"
+#include "internal/metrics_snapshot.h"
 #include "internal/observability.h"
 #include "internal/recovery.h"
 #include "internal/writer_policy.h"
@@ -129,88 +130,65 @@ public:
     }
 
     KVStoreMetrics GetMetrics() {
-        KVStoreMetrics metrics;
-        metrics.read_requests = read_requests_.load(std::memory_order_relaxed);
-        metrics.enqueued_write_requests = enqueued_write_requests_.load(std::memory_order_relaxed);
-        metrics.committed_write_requests = committed_write_requests_.load(std::memory_order_relaxed);
-        metrics.committed_write_batches = committed_write_batches_.load(std::memory_order_relaxed);
-        metrics.compact_requests = compact_requests_.load(std::memory_order_relaxed);
-        metrics.wal_fsync_calls = wal_fsync_calls_.load(std::memory_order_relaxed);
-        metrics.wal_bytes_written = wal_bytes_written_.load(std::memory_order_relaxed);
-        metrics.wal_bytes_since_compaction = wal_bytes_since_compaction_.load(std::memory_order_relaxed);
-        metrics.live_wal_bytes_since_compaction = live_wal_bytes_since_compaction_.load(std::memory_order_relaxed);
-        metrics.obsolete_wal_bytes_since_compaction =
-            metrics.wal_bytes_since_compaction >= metrics.live_wal_bytes_since_compaction
-                ? metrics.wal_bytes_since_compaction - metrics.live_wal_bytes_since_compaction
-                : 0;
-        metrics.last_committed_batch_size = last_committed_batch_size_.load(std::memory_order_relaxed);
-        metrics.max_committed_batch_size = max_committed_batch_size_.load(std::memory_order_relaxed);
-        metrics.last_committed_batch_wal_bytes = last_committed_batch_wal_bytes_.load(std::memory_order_relaxed);
-        metrics.max_committed_batch_wal_bytes = max_committed_batch_wal_bytes_.load(std::memory_order_relaxed);
-        metrics.max_pending_queue_depth = max_pending_queue_depth_.load(std::memory_order_relaxed);
-        metrics.manual_compactions_completed = manual_compactions_completed_.load(std::memory_order_relaxed);
-        metrics.auto_compactions_completed = auto_compactions_completed_.load(std::memory_order_relaxed);
-        metrics.adaptive_batches_completed = adaptive_batches_completed_.load(std::memory_order_relaxed);
-        metrics.adaptive_flush_batches_completed = adaptive_flush_batches_completed_.load(std::memory_order_relaxed);
-        metrics.adaptive_latency_target_batches_completed =
-            adaptive_latency_target_batches_completed_.load(std::memory_order_relaxed);
-        metrics.adaptive_fsync_pressure_batches_completed =
-            adaptive_fsync_pressure_batches_completed_.load(std::memory_order_relaxed);
-        metrics.adaptive_read_heavy_batches_completed =
-            adaptive_read_heavy_batches_completed_.load(std::memory_order_relaxed);
-        metrics.adaptive_compaction_pressure_batches_completed =
-            adaptive_compaction_pressure_batches_completed_.load(std::memory_order_relaxed);
-        metrics.adaptive_wal_growth_batches_completed =
-            adaptive_wal_growth_batches_completed_.load(std::memory_order_relaxed);
-        metrics.adaptive_objective_short_delay_batches_completed =
-            adaptive_objective_short_delay_batches_completed_.load(std::memory_order_relaxed);
-        metrics.adaptive_objective_long_delay_batches_completed =
-            adaptive_objective_long_delay_batches_completed_.load(std::memory_order_relaxed);
-        metrics.adaptive_objective_throughput_batches_completed =
-            adaptive_objective_throughput_batches_completed_.load(std::memory_order_relaxed);
-        metrics.writer_wait_events = writer_wait_events_.load(std::memory_order_relaxed);
-        metrics.writer_wait_time_us = writer_wait_time_us_.load(std::memory_order_relaxed);
-        metrics.last_effective_batch_delay_us = last_effective_batch_delay_us_.load(std::memory_order_relaxed);
-        metrics.min_effective_batch_delay_us = min_effective_batch_delay_us_.load(std::memory_order_relaxed);
-        metrics.max_effective_batch_delay_us = max_effective_batch_delay_us_.load(std::memory_order_relaxed);
-        metrics.observed_fsync_pressure_per_1000_writes =
-            observed_fsync_pressure_per_1000_writes_.load(std::memory_order_relaxed);
-        metrics.last_objective_pressure_score =
-            last_objective_pressure_score_.load(std::memory_order_relaxed);
-        metrics.last_objective_cost_score =
-            last_objective_cost_score_.load(std::memory_order_relaxed);
-        metrics.last_objective_throughput_score =
-            last_objective_throughput_score_.load(std::memory_order_relaxed);
-        metrics.last_objective_balance_score =
-            last_objective_balance_score_.load(std::memory_order_relaxed);
-        metrics.last_objective_mode =
-            last_objective_mode_.load(std::memory_order_relaxed);
-        metrics.total_snapshot_bytes_written = total_snapshot_bytes_written_.load(std::memory_order_relaxed);
-        metrics.total_wal_bytes_reclaimed_by_compaction =
-            total_wal_bytes_reclaimed_by_compaction_.load(std::memory_order_relaxed);
-        for (size_t i = 0; i < kWriteLatencyBucketCount; ++i) {
-            metrics.write_latency_histogram[i] = write_latency_histogram_[i].load(std::memory_order_relaxed);
-        }
-        metrics.approx_write_latency_p50_us = approximate_latency_percentile_us(metrics.write_latency_histogram, 50, 100);
-        metrics.approx_write_latency_p95_us = approximate_latency_percentile_us(metrics.write_latency_histogram, 95, 100);
-        metrics.approx_write_latency_p99_us = approximate_latency_percentile_us(metrics.write_latency_histogram, 99, 100);
-        metrics.recent_read_requests = recent_read_requests_.load(std::memory_order_relaxed);
-        metrics.recent_write_requests = recent_write_requests_.load(std::memory_order_relaxed);
-        metrics.recent_read_ratio_per_1000_ops =
-            recent_read_ratio_per_1000_ops_.load(std::memory_order_relaxed);
-        metrics.recent_observed_write_latency_p95_us =
-            recent_observed_write_latency_p95_us_.load(std::memory_order_relaxed);
-        metrics.recent_peak_queue_depth = recent_peak_queue_depth_.load(std::memory_order_relaxed);
-        metrics.recent_avg_batch_size = recent_avg_batch_size_.load(std::memory_order_relaxed);
-        metrics.recent_batch_fill_per_1000 = recent_batch_fill_per_1000_.load(std::memory_order_relaxed);
-        metrics.recent_avg_batch_wal_bytes = recent_avg_batch_wal_bytes_.load(std::memory_order_relaxed);
-        metrics.recent_window_batch_count = recent_window_batch_count_.load(std::memory_order_relaxed);
-        metrics.observed_obsolete_wal_ratio_percent = current_obsolete_wal_ratio_percent();
+        const uint64_t obsolete_ratio = current_obsolete_wal_ratio_percent();
+        uint64_t pending_queue_depth = 0;
         {
             std::lock_guard<std::mutex> lock(queue_mutex_);
-            metrics.pending_queue_depth = request_queue_.size();
+            pending_queue_depth = request_queue_.size();
         }
-        return metrics;
+        return collect_metrics_snapshot(MetricsSnapshotInputs {
+            &read_requests_,
+            &enqueued_write_requests_,
+            &committed_write_requests_,
+            &committed_write_batches_,
+            &compact_requests_,
+            &wal_fsync_calls_,
+            &wal_bytes_written_,
+            &wal_bytes_since_compaction_,
+            &live_wal_bytes_since_compaction_,
+            &last_committed_batch_size_,
+            &max_committed_batch_size_,
+            &last_committed_batch_wal_bytes_,
+            &max_committed_batch_wal_bytes_,
+            &max_pending_queue_depth_,
+            &manual_compactions_completed_,
+            &auto_compactions_completed_,
+            &adaptive_batches_completed_,
+            &adaptive_flush_batches_completed_,
+            &adaptive_latency_target_batches_completed_,
+            &adaptive_fsync_pressure_batches_completed_,
+            &adaptive_read_heavy_batches_completed_,
+            &adaptive_compaction_pressure_batches_completed_,
+            &adaptive_wal_growth_batches_completed_,
+            &adaptive_objective_short_delay_batches_completed_,
+            &adaptive_objective_long_delay_batches_completed_,
+            &adaptive_objective_throughput_batches_completed_,
+            &writer_wait_events_,
+            &writer_wait_time_us_,
+            &last_effective_batch_delay_us_,
+            &min_effective_batch_delay_us_,
+            &max_effective_batch_delay_us_,
+            &observed_fsync_pressure_per_1000_writes_,
+            &last_objective_pressure_score_,
+            &last_objective_cost_score_,
+            &last_objective_throughput_score_,
+            &last_objective_balance_score_,
+            &last_objective_mode_,
+            &total_snapshot_bytes_written_,
+            &total_wal_bytes_reclaimed_by_compaction_,
+            &write_latency_histogram_,
+            &recent_read_requests_,
+            &recent_write_requests_,
+            &recent_read_ratio_per_1000_ops_,
+            &recent_observed_write_latency_p95_us_,
+            &recent_peak_queue_depth_,
+            &recent_avg_batch_size_,
+            &recent_batch_fill_per_1000_,
+            &recent_avg_batch_wal_bytes_,
+            &recent_window_batch_count_,
+            obsolete_ratio,
+            pending_queue_depth,
+        });
     }
 
 private:

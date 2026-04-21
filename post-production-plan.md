@@ -39,6 +39,7 @@ Current status:
 - 已将启动恢复中的“建空快照 / 读快照 / 重放 WAL”提炼到内部 recovery 模块，`src/kvstore.cpp` 继续缩小为状态编排层。
 - 已将 compaction 的快照重写与 WAL 轮转步骤提炼到内部 compaction 模块，主文件中对应流程继续收敛为编排逻辑。
 - 已将 writer policy 的批处理/延迟决策提炼到内部 writer-policy 模块，`current_batch_policy_locked()` 现只负责采样信号并调用统一计算逻辑。
+- 已将 metrics 聚合提炼到内部 metrics-snapshot 模块，`GetMetrics()` 现只保留即时队列深度和 obsolete ratio 的采样职责。
 
 ## Phase 2: Refactor-Safe Test Harness
 

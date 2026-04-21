@@ -49,6 +49,7 @@ add_library(kvstore SHARED
     src/internal/format.cpp
     src/internal/io.cpp
     src/internal/metrics_helpers.cpp
+    src/internal/metrics_snapshot.cpp
     src/internal/observability.cpp
     src/internal/recovery.cpp
     src/internal/writer_policy.cpp
