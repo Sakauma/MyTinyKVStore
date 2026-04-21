@@ -11,6 +11,7 @@
 - `bash scripts/bench-baseline.sh`：运行 baseline benchmark，并把 JSON 落到 `benchmarks/baselines/<timestamp>.json`。
 - `./build/target/bin/kv_test compare-baseline <baseline_json> <candidate_json> [min_write_ratio_pct min_read_ratio_pct max_latency_ratio_pct]`：比较两份 baseline。
 - `bash scripts/bench-regression-check.sh <baseline_json>`：生成 candidate baseline，并按默认阈值执行回归检查。
+- `bash scripts/ci-bench-regression.sh`：使用仓库提交的 `benchmarks/reference/ci-floor.json` 作为 CI floor。
 
 ## JSON Shape
 
@@ -36,3 +37,9 @@ baseline JSON 包含四部分：
 - `avg_write_latency_us` 不得高于参考基线的 `125%`
 
 这些阈值目前是保守门槛，用来挡住明显退化，而不是替代长期性能分析。
+
+## CI Floor
+
+- 仓库当前提交了 [benchmarks/reference/ci-floor.json](/home/sakauma/code/lpue/benchmarks/reference/ci-floor.json) 作为 CI floor。
+- 它不是“最佳成绩”，而是“明显退化不应低于的下限”。
+- GitHub Actions 会运行 `scripts/ci-bench-regression.sh`，并把本次 candidate baseline 作为 artifact 上传。

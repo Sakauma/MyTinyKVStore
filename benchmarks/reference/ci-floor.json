@@ -1,0 +1,19 @@
+{
+  "label": "ci-floor",
+  "workload": {
+    "writers": 8,
+    "readers": 4,
+    "duration_ms": 3000,
+    "key_space": 50000
+  },
+  "summary": {
+    "duration_s": 3.0,
+    "writes": 1800,
+    "reads": 6000000,
+    "write_ops_per_s": 600.0,
+    "read_ops_per_s": 2000000.0,
+    "avg_write_latency_us": 12000.0
+  },
+  "options": {},
+  "metrics": {}
+}
