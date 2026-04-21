@@ -88,7 +88,7 @@ Exit criteria:
 - 明确哪些信号重叠、哪些分支已经不再值得保留。
 
 Current status:
-- 进行中。`microbench` 已补齐 `compaction` / `rewrite` case，后续可基于这些结果把 compaction、rewrite、recovery 时间逐步纳入 gate。
+- 已推进。`microbench` 已补齐 `compaction` / `rewrite` case，并新增独立的 `microbench regression` 命令、脚本和 CI floor；下一步可继续细化各 case 的长期趋势和门槛策略。
 - 已完成第一轮审计，见 `docs/internal/controller-audit.md`。当前主要结论是 delay 决策已出现“单信号规则 + objective 规则”双层重叠，下一步应优先收缩 delay 路径，而不是继续叠加新开关。
 
 ### 4.2 Reduce Policy Surface

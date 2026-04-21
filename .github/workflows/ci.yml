@@ -41,3 +41,17 @@ jobs:
           name: benchmark-baselines
           path: benchmarks/baselines/*.json
           if-no-files-found: ignore
+
+  microbench-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run microbench regression gate
+        run: bash scripts/ci-microbench-regression.sh
+      - name: Upload microbench candidates
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: microbench-baselines
+          path: benchmarks/baselines/microbench-*.json
+          if-no-files-found: ignore

@@ -272,6 +272,14 @@ struct MicrobenchCaseResult {
     uint64_t bytes = 0;
 };
 
+struct MicrobenchComparisonResult {
+    std::string name;
+    double ops_ratio_pct = 0.0;
+    double min_ratio_pct = 0.0;
+};
+
+std::vector<MicrobenchCaseResult> parse_microbench_results_json(const std::string& json);
+
 struct BaselineSummary {
     std::string file_name;
     double write_ops_per_s = 0.0;
@@ -1031,6 +1039,66 @@ int run_compare_benchmark_baseline(
     return pass ? 0 : 2;
 }
 
+int run_compare_microbench(
+    const std::string& baseline_path,
+    const std::string& candidate_path,
+    double min_ops_ratio_pct = 80.0,
+    double min_compaction_ratio_pct = 75.0,
+    double min_rewrite_ratio_pct = 75.0,
+    double min_recovery_ratio_pct = 80.0) {
+    const std::vector<MicrobenchCaseResult> baseline_cases =
+        parse_microbench_results_json(read_text_file(baseline_path));
+    const std::vector<MicrobenchCaseResult> candidate_cases =
+        parse_microbench_results_json(read_text_file(candidate_path));
+    require(!baseline_cases.empty(), "microbench baseline must contain at least one case");
+    require(!candidate_cases.empty(), "microbench candidate must contain at least one case");
+
+    std::map<std::string, MicrobenchCaseResult> baseline_by_name;
+    std::map<std::string, MicrobenchCaseResult> candidate_by_name;
+    for (const auto& result : baseline_cases) {
+        baseline_by_name[result.name] = result;
+    }
+    for (const auto& result : candidate_cases) {
+        candidate_by_name[result.name] = result;
+    }
+
+    bool pass = true;
+    std::vector<MicrobenchComparisonResult> comparisons;
+    for (const auto& [name, baseline] : baseline_by_name) {
+        const auto candidate_it = candidate_by_name.find(name);
+        require(candidate_it != candidate_by_name.end(), "microbench candidate is missing a baseline case");
+        require(baseline.ops_per_s > 0.0, "microbench baseline ops_per_s must be positive");
+
+        double min_ratio_for_case = min_ops_ratio_pct;
+        if (name == "compaction") {
+            min_ratio_for_case = min_compaction_ratio_pct;
+        } else if (name == "rewrite") {
+            min_ratio_for_case = min_rewrite_ratio_pct;
+        } else if (name == "recovery") {
+            min_ratio_for_case = min_recovery_ratio_pct;
+        }
+
+        const double ops_ratio_pct = (candidate_it->second.ops_per_s / baseline.ops_per_s) * 100.0;
+        comparisons.push_back({name, ops_ratio_pct, min_ratio_for_case});
+        if (ops_ratio_pct < min_ratio_for_case) {
+            pass = false;
+        }
+    }
+
+    std::sort(comparisons.begin(), comparisons.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.name < rhs.name;
+    });
+    std::cout << "baseline=" << baseline_path
+              << " candidate=" << candidate_path;
+    for (const auto& comparison : comparisons) {
+        std::cout << ' '
+                  << comparison.name << "_ops_ratio_pct=" << comparison.ops_ratio_pct
+                  << ' ' << comparison.name << "_min_ratio_pct=" << comparison.min_ratio_pct;
+    }
+    std::cout << " status=" << (pass ? "pass" : "fail") << std::endl;
+    return pass ? 0 : 2;
+}
+
 BaselineSummary load_baseline_summary(const std::filesystem::path& path) {
     const std::string json = read_text_file(path.string());
     BaselineSummary summary;
@@ -1396,6 +1464,36 @@ std::string TrendSummaryToJson(const TrendSummary& summary) {
         << ",\"recent_latency_trend\":\"" << summary.recent_latency_trend << "\""
         << '}';
     return out.str();
+}
+
+std::vector<MicrobenchCaseResult> parse_microbench_results_json(const std::string& json) {
+    std::vector<MicrobenchCaseResult> results;
+    size_t search_from = 0;
+    while (true) {
+        const size_t name_pos = json.find("\"name\":\"", search_from);
+        if (name_pos == std::string::npos) {
+            break;
+        }
+        const size_t value_begin = name_pos + 8;
+        const size_t value_end = json.find('"', value_begin);
+        require(value_end != std::string::npos, "microbench json should contain a closing name quote");
+
+        const size_t object_begin = json.rfind('{', name_pos);
+        const size_t object_end = json.find('}', value_end);
+        require(object_begin != std::string::npos && object_end != std::string::npos,
+                "microbench json should contain complete case objects");
+
+        const std::string object_json = json.substr(object_begin, object_end - object_begin + 1);
+        MicrobenchCaseResult result;
+        result.name = json.substr(value_begin, value_end - value_begin);
+        result.duration_s = extract_json_number(object_json, "duration_s");
+        result.ops_per_s = extract_json_number(object_json, "ops_per_s");
+        result.operations = static_cast<uint64_t>(extract_json_number(object_json, "operations"));
+        result.bytes = static_cast<uint64_t>(extract_json_number(object_json, "bytes"));
+        results.push_back(result);
+        search_from = object_end + 1;
+    }
+    return results;
 }
 
 std::string StressSummaryToJson(const StressSummary& summary) {
@@ -2197,6 +2295,58 @@ void test_compare_benchmark_baseline_rejects_regression() {
 
     const int status = run_compare_benchmark_baseline(baseline_path, candidate_path);
     require(status == 2, "compare-baseline should reject throughput/latency regressions beyond thresholds");
+}
+
+void test_compare_microbench_passes_within_thresholds() {
+    TestDir dir("compare_microbench_pass");
+    const std::string baseline_path = dir.file("baseline.json");
+    const std::string candidate_path = dir.file("candidate.json");
+
+    const std::vector<MicrobenchCaseResult> baseline = {
+        {"wal_append", 1.0, 200.0, 500, 1000},
+        {"scan", 1.0, 1000.0, 250, 2000},
+        {"recovery", 1.0, 120.0, 25, 0},
+        {"compaction", 1.0, 30.0, 5, 4000},
+        {"rewrite", 1.0, 25.0, 5, 3000},
+    };
+    const std::vector<MicrobenchCaseResult> candidate = {
+        {"wal_append", 1.0, 170.0, 500, 1000},
+        {"scan", 1.0, 900.0, 250, 2000},
+        {"recovery", 1.0, 100.0, 25, 0},
+        {"compaction", 1.0, 24.0, 5, 4000},
+        {"rewrite", 1.0, 20.0, 5, 3000},
+    };
+
+    write_text_file(baseline_path, MicrobenchResultsToJson(baseline));
+    write_text_file(candidate_path, MicrobenchResultsToJson(candidate));
+    const int status = run_compare_microbench(baseline_path, candidate_path);
+    require(status == 0, "compare-microbench should pass when case ratios remain within thresholds");
+}
+
+void test_compare_microbench_rejects_regression() {
+    TestDir dir("compare_microbench_fail");
+    const std::string baseline_path = dir.file("baseline.json");
+    const std::string candidate_path = dir.file("candidate.json");
+
+    const std::vector<MicrobenchCaseResult> baseline = {
+        {"wal_append", 1.0, 200.0, 500, 1000},
+        {"scan", 1.0, 1000.0, 250, 2000},
+        {"recovery", 1.0, 120.0, 25, 0},
+        {"compaction", 1.0, 30.0, 5, 4000},
+        {"rewrite", 1.0, 25.0, 5, 3000},
+    };
+    const std::vector<MicrobenchCaseResult> candidate = {
+        {"wal_append", 1.0, 120.0, 500, 1000},
+        {"scan", 1.0, 700.0, 250, 2000},
+        {"recovery", 1.0, 80.0, 25, 0},
+        {"compaction", 1.0, 18.0, 5, 4000},
+        {"rewrite", 1.0, 15.0, 5, 3000},
+    };
+
+    write_text_file(baseline_path, MicrobenchResultsToJson(baseline));
+    write_text_file(candidate_path, MicrobenchResultsToJson(candidate));
+    const int status = run_compare_microbench(baseline_path, candidate_path);
+    require(status == 2, "compare-microbench should reject regressions beyond per-case thresholds");
 }
 
 void test_benchmark_trend_summarizes_history() {
@@ -3997,6 +4147,23 @@ int main(int argc, char* argv[]) {
             run_benchmark_baseline_json();
             return 0;
         }
+        if (command == "compare-microbench") {
+            if (argc < 4 || argc > 8) {
+                std::cerr << "Usage: kv_test compare-microbench <baseline_json> <candidate_json> [min_ops_ratio_pct min_compaction_ratio_pct min_rewrite_ratio_pct min_recovery_ratio_pct]" << std::endl;
+                return 1;
+            }
+            const double min_ops_ratio_pct = argc > 4 ? std::stod(argv[4]) : 80.0;
+            const double min_compaction_ratio_pct = argc > 5 ? std::stod(argv[5]) : 75.0;
+            const double min_rewrite_ratio_pct = argc > 6 ? std::stod(argv[6]) : 75.0;
+            const double min_recovery_ratio_pct = argc > 7 ? std::stod(argv[7]) : 80.0;
+            return run_compare_microbench(
+                argv[2],
+                argv[3],
+                min_ops_ratio_pct,
+                min_compaction_ratio_pct,
+                min_rewrite_ratio_pct,
+                min_recovery_ratio_pct);
+        }
         if (command == "compare-baseline") {
             if (argc < 4 || argc > 7) {
                 std::cerr << "Usage: kv_test compare-baseline <baseline_json> <candidate_json> [min_write_ratio_pct min_read_ratio_pct max_latency_ratio_pct]" << std::endl;
@@ -4095,7 +4262,7 @@ int main(int argc, char* argv[]) {
             return run_fault_injection_scenario(argv[2], argv[3]);
         }
         std::cerr << "Unknown command: " << command << '\n';
-        std::cerr << "Usage: kv_test [bench|microbench|microbench-json|bench-json|bench-baseline-json|compare-baseline|trend-baselines|trend-baselines-json|profile-json|soak|concurrency-stress|concurrency-stress-json|inspect-format|rewrite-format|verify-format|compat-matrix|fault-inject]" << std::endl;
+        std::cerr << "Usage: kv_test [bench|microbench|microbench-json|bench-json|bench-baseline-json|compare-microbench|compare-baseline|trend-baselines|trend-baselines-json|profile-json|soak|concurrency-stress|concurrency-stress-json|inspect-format|rewrite-format|verify-format|compat-matrix|fault-inject]" << std::endl;
         return 1;
     }
 
@@ -4122,6 +4289,8 @@ int main(int argc, char* argv[]) {
         {"microbench json reports cases", test_microbench_json_reports_cases},
         {"benchmark trend json reports recent window", test_benchmark_trend_json_reports_recent_window},
         {"stress summary json reports profile", test_stress_summary_json_reports_profile},
+        {"compare microbench passes within thresholds", test_compare_microbench_passes_within_thresholds},
+        {"compare microbench rejects regression", test_compare_microbench_rejects_regression},
         {"compare benchmark baseline passes within thresholds", test_compare_benchmark_baseline_passes_within_thresholds},
         {"compare benchmark baseline rejects regression", test_compare_benchmark_baseline_rejects_regression},
         {"benchmark trend summarizes history", test_benchmark_trend_summarizes_history},
