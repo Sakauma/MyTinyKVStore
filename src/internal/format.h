@@ -4,6 +4,7 @@
 #include "kvstore.h"
 
 #include <array>
+#include <cstring>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -64,6 +65,7 @@ struct SnapshotEntryHeaderV1 {
 };
 #pragma pack(pop)
 
+SnapshotHeader make_snapshot_header();
 std::string encode_int_key(int32_t key);
 std::string encode_string_key(const std::string& key);
 std::string encode_binary_key(const std::vector<uint8_t>& key);

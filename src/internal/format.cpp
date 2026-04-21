@@ -24,6 +24,14 @@ uint32_t fnv1a_append(uint32_t seed, const void* data, size_t size) {
 
 }  // namespace
 
+SnapshotHeader make_snapshot_header() {
+    SnapshotHeader header {};
+    std::memcpy(header.magic, kSnapshotMagic, sizeof(kSnapshotMagic));
+    header.version = kSnapshotVersion;
+    header.reserved = 0;
+    return header;
+}
+
 std::string encode_int_key(int32_t key) {
     std::string encoded(1, kIntKeyTag);
     encoded.push_back(static_cast<char>((static_cast<uint32_t>(key) >> 24) & 0xFF));
