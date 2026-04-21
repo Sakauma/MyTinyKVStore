@@ -3,6 +3,7 @@
 #include "tests/common/benchmark_entrypoints.h"
 #include "tests/common/test_support.h"
 
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>

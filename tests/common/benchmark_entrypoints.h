@@ -4,6 +4,10 @@
 #include <cstddef>
 #include <string>
 
+std::string benchmark_result_json_fixture_entrypoint();
+std::string microbench_results_json_fixture_entrypoint();
+std::string stress_summary_json_fixture_entrypoint();
+
 int run_compare_benchmark_baseline_entrypoint(
     const std::string& baseline_path,
     const std::string& candidate_path,
@@ -26,5 +30,7 @@ int run_compare_microbench_entrypoint(
 int run_benchmark_trend_entrypoint(const std::string& directory_path, size_t recent_window);
 int run_benchmark_trend_json_entrypoint(const std::string& directory_path, size_t recent_window);
 int run_microbench_trend_json_entrypoint(const std::string& directory_path, size_t recent_window);
+int run_benchmark_json_entrypoint();
+int run_profile_json_entrypoint(const std::string& name);
 
 #endif  // KVSTORE_TESTS_COMMON_BENCHMARK_ENTRYPOINTS_H

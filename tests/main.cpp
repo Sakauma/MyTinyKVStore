@@ -1753,64 +1753,6 @@ int run_profile_json(const std::string& name) {
     return 0;
 }
 
-void test_benchmark_result_json_reports_summary_and_metrics() {
-    const BenchmarkResult result = run_benchmark_capture(
-        make_benchmark_config("test-baseline", 2, 1, 50, 128));
-    const std::string json = BenchmarkResultToJson(result);
-    require(json.find("\"label\":\"test-baseline\"") != std::string::npos,
-            "benchmark baseline json should include the benchmark label");
-    require(json.find("\"workload\":{") != std::string::npos,
-            "benchmark baseline json should include workload metadata");
-    require(json.find("\"summary\":{") != std::string::npos,
-            "benchmark baseline json should include summary metrics");
-    require(json.find("\"options\":{") != std::string::npos,
-            "benchmark baseline json should include option metadata");
-    require(json.find("\"metrics\":{") != std::string::npos,
-            "benchmark baseline json should include kv metrics");
-}
-
-void test_microbench_json_reports_cases() {
-    std::vector<MicrobenchCaseResult> results;
-    results.push_back({"wal_append", 0.1, 1000.0, 100, 4096});
-    results.push_back({"scan", 0.2, 500.0, 100, 0});
-    results.push_back({"compaction", 0.3, 10.0, 3, 8192});
-    results.push_back({"rewrite", 0.4, 5.0, 2, 4096});
-
-    const std::string json = MicrobenchResultsToJson(results);
-    require(json.find("\"cases\":[") != std::string::npos,
-            "microbench json should include a cases array");
-    require(json.find("\"name\":\"wal_append\"") != std::string::npos,
-            "microbench json should include the wal_append case");
-    require(json.find("\"name\":\"scan\"") != std::string::npos,
-            "microbench json should include the scan case");
-    require(json.find("\"name\":\"compaction\"") != std::string::npos,
-            "microbench json should include the compaction case");
-    require(json.find("\"name\":\"rewrite\"") != std::string::npos,
-            "microbench json should include the rewrite case");
-}
-
-void test_stress_summary_json_reports_profile() {
-    StressSummary summary;
-    summary.profile = "balanced";
-    summary.duration_seconds = 1;
-    summary.writer_count = 8;
-    summary.reader_count = 4;
-    summary.compactor_count = 1;
-    summary.recovery_reopen_cycles = 6;
-    summary.committed_write_requests = 123;
-    summary.max_pending_queue_depth = 7;
-
-    const std::string json = StressSummaryToJson(summary);
-    require(json.find("\"profile\":\"balanced\"") != std::string::npos,
-            "stress summary json should include the profile name");
-    require(json.find("\"committed_write_requests\":123") != std::string::npos,
-            "stress summary json should include committed write counts");
-    require(json.find("\"max_pending_queue_depth\":7") != std::string::npos,
-            "stress summary json should include queue metrics");
-    require(json.find("\"recovery_reopen_cycles\":6") != std::string::npos,
-            "stress summary json should include recovery reopen counts");
-}
-
 void test_internal_format_helpers_round_trip_keys() {
     const std::string int_key = kvstore::internal::encode_int_key(42);
     const std::string string_key = kvstore::internal::encode_string_key("alpha");
@@ -2155,35 +2097,6 @@ void test_concurrency_stress_profiles_are_distinct() {
             "recovery-heavy stress profile should trade reader threads for reopen checks");
     require(recovery_heavy.options.max_batch_delay_us < balanced.options.max_batch_delay_us,
             "recovery-heavy stress profile should prefer shorter delays around recovery checks");
-}
-
-void test_options_to_json_reports_profile_fields() {
-    const std::string json = OptionsToJson(RecommendedOptions(KVStoreProfile::kBalanced));
-    require(!json.empty() && json.front() == '{' && json.back() == '}', "options json should be a JSON object");
-    require(json.find("\"max_batch_size\":") != std::string::npos,
-            "options json should include batching fields");
-    require(json.find("\"adaptive_objective_enabled\":true") != std::string::npos,
-            "options json should include boolean profile settings");
-    require(json.find("\"auto_compact_wal_bytes_threshold\":") != std::string::npos,
-            "options json should include compaction thresholds");
-}
-
-void test_metrics_to_json_reports_core_fields() {
-    TestDir dir("metrics_json");
-    const std::string db_path = dir.file("store.dat");
-    KVStore store(db_path);
-
-    store.Put(1, text("json"));
-    store.Delete(1);
-
-    const std::string json = MetricsToJson(store.GetMetrics());
-    require(!json.empty() && json.front() == '{' && json.back() == '}', "metrics json should be a JSON object");
-    require(json.find("\"committed_write_requests\":2") != std::string::npos,
-            "metrics json should include committed write counts");
-    require(json.find("\"write_latency_histogram\":[") != std::string::npos,
-            "metrics json should include the latency histogram array");
-    require(json.find("\"wal_fsync_calls\":") != std::string::npos,
-            "metrics json should include fsync metrics");
 }
 
 StressSummary run_concurrency_stress_capture(int duration_seconds, ConcurrencyStressProfile profile) {
@@ -2743,6 +2656,43 @@ int run_compatibility_matrix() {
     return run_compatibility_matrix_impl();
 }
 
+std::string benchmark_result_json_fixture_entrypoint() {
+    BenchmarkResult result;
+    result.config = make_benchmark_config("default-baseline", 8, 4, 3000, 50000);
+    result.options = benchmark_options();
+    result.duration_s = 1.0;
+    result.writes = 1000;
+    result.reads = 2000;
+    result.write_ops_per_s = 1000.0;
+    result.read_ops_per_s = 2000.0;
+    result.avg_write_latency_us = 100.0;
+    result.metrics.committed_write_requests = 1000;
+    result.metrics.wal_fsync_calls = 50;
+    return BenchmarkResultToJson(result);
+}
+
+std::string microbench_results_json_fixture_entrypoint() {
+    return MicrobenchResultsToJson({
+        {"wal_append", 0.1, 1000.0, 100, 4096},
+        {"scan", 0.2, 500.0, 100, 0},
+        {"compaction", 0.3, 10.0, 3, 8192},
+        {"rewrite", 0.4, 5.0, 2, 4096},
+    });
+}
+
+std::string stress_summary_json_fixture_entrypoint() {
+    StressSummary summary;
+    summary.profile = "balanced";
+    summary.duration_seconds = 1;
+    summary.writer_count = 8;
+    summary.reader_count = 4;
+    summary.compactor_count = 1;
+    summary.recovery_reopen_cycles = 6;
+    summary.committed_write_requests = 123;
+    summary.max_pending_queue_depth = 7;
+    return StressSummaryToJson(summary);
+}
+
 int run_compare_benchmark_baseline_entrypoint(
     const std::string& baseline_path,
     const std::string& candidate_path,
@@ -2791,6 +2741,15 @@ int run_benchmark_trend_json_entrypoint(const std::string& directory_path, size_
 
 int run_microbench_trend_json_entrypoint(const std::string& directory_path, size_t recent_window) {
     return run_microbench_trend_json(directory_path, recent_window);
+}
+
+int run_benchmark_json_entrypoint() {
+    run_benchmark_json();
+    return 0;
+}
+
+int run_profile_json_entrypoint(const std::string& name) {
+    return run_profile_json(name);
 }
 
 int main(int argc, char* argv[]) {
@@ -2955,12 +2914,10 @@ int main(int argc, char* argv[]) {
     kvstore::tests::integration::TestCases tests;
     kvstore::tests::integration::register_basic_kv_tests(tests);
     kvstore::tests::integration::register_benchmark_trend_tests(tests);
+    kvstore::tests::integration::register_json_cli_tests(tests);
     kvstore::tests::integration::register_metrics_controller_tests(tests);
     kvstore::tests::integration::register_recovery_format_tests(tests);
     const std::vector<test_support::NamedTest> remaining_tests = {
-        {"benchmark result json reports summary and metrics", test_benchmark_result_json_reports_summary_and_metrics},
-        {"microbench json reports cases", test_microbench_json_reports_cases},
-        {"stress summary json reports profile", test_stress_summary_json_reports_profile},
         {"internal format helpers round trip keys", test_internal_format_helpers_round_trip_keys},
         {"internal format helpers checksum distinguishes payloads", test_internal_format_helpers_checksum_distinguishes_payloads},
         {"internal metrics helpers compute percentiles and ratios", test_internal_metrics_helpers_compute_percentiles_and_ratios},
@@ -2978,8 +2935,6 @@ int main(int argc, char* argv[]) {
         {"concurrent compaction with writes", test_concurrent_compaction_with_writes},
         {"recommended profiles are distinct", test_recommended_profiles_are_distinct},
         {"concurrency stress profiles are distinct", test_concurrency_stress_profiles_are_distinct},
-        {"options to json reports profile fields", test_options_to_json_reports_profile_fields},
-        {"metrics to json reports core fields", test_metrics_to_json_reports_core_fields},
     };
     tests.insert(tests.end(), remaining_tests.begin(), remaining_tests.end());
 
