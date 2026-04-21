@@ -253,6 +253,18 @@ int run_fault_injection_scenario(const std::string& scenario, const std::string&
         return 2;
     }
 
+    if (scenario == "wal_after_fsync_batch") {
+        KVStore store(db_path);
+        store.Put(1, text("stable"));
+        ::setenv("KVSTORE_FAILPOINT", "after_wal_fsync_before_apply", 1);
+        store.WriteBatch({
+            BatchWriteOperation::PutInt(2, text("latest")),
+            BatchWriteOperation::Put("alpha", text("batch-value")),
+            BatchWriteOperation::DeleteInt(1),
+        });
+        return 6;
+    }
+
     if (scenario == "snapshot_after_rename") {
         KVStore store(db_path);
         store.Put(1, text("one"));
@@ -421,6 +433,79 @@ void test_string_scan_returns_sorted_range() {
     require(results[0].first == "banana" && as_string(results[0].second) == "b", "scan should start at banana");
     require(results[1].first == "carrot" && as_string(results[1].second) == "c", "scan should keep lexical order");
     require(results[2].first == "date" && as_string(results[2].second) == "d", "scan should include the upper bound");
+}
+
+void test_write_batch_persists_mixed_key_types() {
+    TestDir dir("batch_mixed_keys");
+    const std::string db_path = dir.file("store.dat");
+
+    {
+        KVStore store(db_path);
+        store.WriteBatch({
+            BatchWriteOperation::PutInt(42, text("int-key")),
+            BatchWriteOperation::Put("42", text("string-key")),
+            BatchWriteOperation::Put("alpha", text("word")),
+        });
+    }
+
+    KVStore reopened(db_path);
+    const auto int_value = reopened.Get(42);
+    const auto string_value = reopened.Get(std::string("42"));
+    const auto alpha_value = reopened.Get(std::string("alpha"));
+    require(int_value.has_value(), "batch int key should persist");
+    require(string_value.has_value(), "batch string key should persist");
+    require(alpha_value.has_value(), "batch string key should persist");
+    require(as_string(*int_value) == "int-key", "batch int key should keep its namespace");
+    require(as_string(*string_value) == "string-key", "batch string key should not collide with int namespace");
+    require(as_string(*alpha_value) == "word", "batch string key should round-trip");
+}
+
+void test_write_batch_mixes_put_and_delete() {
+    TestDir dir("batch_put_delete");
+    const std::string db_path = dir.file("store.dat");
+    KVStore store(db_path);
+
+    store.Put(1, text("old"));
+    store.Put(9, text("remove-me"));
+    store.Put(std::string("alpha"), text("old-alpha"));
+
+    store.WriteBatch({
+        BatchWriteOperation::PutInt(1, text("new")),
+        BatchWriteOperation::Delete("alpha"),
+        BatchWriteOperation::Put("beta", text("beta-value")),
+        BatchWriteOperation::DeleteInt(9),
+    });
+
+    const auto one = store.Get(1);
+    const auto nine = store.Get(9);
+    const auto alpha = store.Get(std::string("alpha"));
+    const auto beta = store.Get(std::string("beta"));
+    require(one.has_value() && as_string(*one) == "new", "batch put should replace existing int values");
+    require(!nine.has_value(), "batch delete should remove int keys");
+    require(!alpha.has_value(), "batch delete should remove string keys");
+    require(beta.has_value() && as_string(*beta) == "beta-value", "batch put should insert new string keys");
+}
+
+void test_write_batch_preserves_operation_order() {
+    TestDir dir("batch_order");
+    const std::string db_path = dir.file("store.dat");
+
+    {
+        KVStore store(db_path);
+        store.WriteBatch({
+            BatchWriteOperation::PutInt(7, text("first")),
+            BatchWriteOperation::DeleteInt(7),
+            BatchWriteOperation::PutInt(7, text("second")),
+            BatchWriteOperation::Put("gamma", text("a")),
+            BatchWriteOperation::Put("gamma", text("b")),
+        });
+    }
+
+    KVStore reopened(db_path);
+    const auto seven = reopened.Get(7);
+    const auto gamma = reopened.Get(std::string("gamma"));
+    require(seven.has_value() && as_string(*seven) == "second", "batch operations should apply in-order for int keys");
+    require(gamma.has_value() && as_string(*gamma) == "b", "batch operations should apply in-order for string keys");
 }
 
 void test_put_copies_input_value() {
@@ -648,6 +733,22 @@ void test_crash_after_wal_fsync_recovers_latest_write() {
     require(latest.has_value(), "latest WAL-synced key should be recovered after crash");
     require(as_string(*stable) == "stable", "stable key should preserve its value");
     require(as_string(*latest) == "latest", "replayed WAL should restore the latest synced value");
+}
+
+void test_crash_after_wal_fsync_recovers_latest_batch() {
+    TestDir dir("crash_wal_batch");
+    const std::string db_path = dir.file("store.dat");
+
+    run_failpoint_child("wal_after_fsync_batch", db_path);
+
+    KVStore reopened(db_path);
+    const auto one = reopened.Get(1);
+    const auto two = reopened.Get(2);
+    const auto alpha = reopened.Get(std::string("alpha"));
+    require(!one.has_value(), "batch delete should recover from WAL after crash");
+    require(two.has_value() && as_string(*two) == "latest", "batch int put should recover from WAL after crash");
+    require(alpha.has_value() && as_string(*alpha) == "batch-value",
+            "batch string put should recover from WAL after crash");
 }
 
 void test_crash_after_snapshot_rename_recovers_consistent_state() {
@@ -1882,6 +1983,9 @@ int main(int argc, char* argv[]) {
         {"basic persistence", test_basic_persistence},
         {"string keys do not collide with int keys", test_string_keys_do_not_collide_with_int_keys},
         {"string scan returns sorted range", test_string_scan_returns_sorted_range},
+        {"batch write persists mixed key types", test_write_batch_persists_mixed_key_types},
+        {"batch write mixes put and delete", test_write_batch_mixes_put_and_delete},
+        {"batch write preserves operation order", test_write_batch_preserves_operation_order},
         {"put copies input value", test_put_copies_input_value},
         {"recovery from WAL without compaction", test_recovery_from_wal_without_compaction},
         {"legacy v1 snapshot and wal are readable", test_legacy_v1_snapshot_and_wal_are_readable},
@@ -1893,6 +1997,7 @@ int main(int argc, char* argv[]) {
         {"corrupted snapshot throws", test_corrupted_snapshot_throws},
         {"unsupported snapshot version throws", test_unsupported_snapshot_version_throws},
         {"crash after wal fsync recovers latest write", test_crash_after_wal_fsync_recovers_latest_write},
+        {"crash after wal fsync recovers latest batch", test_crash_after_wal_fsync_recovers_latest_batch},
         {"crash after snapshot rename recovers consistent state",
          test_crash_after_snapshot_rename_recovers_consistent_state},
         {"crash before snapshot rename replays old wal", test_crash_before_snapshot_rename_replays_old_wal},

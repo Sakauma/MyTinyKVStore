@@ -137,6 +137,23 @@ struct KVStoreMetrics {
     std::array<uint64_t, kWriteLatencyBucketCount> write_latency_histogram {};
 };
 
+struct BatchWriteOperation {
+    enum class Type {
+        kPut,
+        kDelete,
+    };
+
+    Type type = Type::kPut;
+    std::string key;
+    Value value;
+    bool key_is_string = true;
+
+    static BatchWriteOperation Put(std::string key, Value value);
+    static BatchWriteOperation Delete(std::string key);
+    static BatchWriteOperation PutInt(int key, Value value);
+    static BatchWriteOperation DeleteInt(int key);
+};
+
 std::string MetricsToJson(const KVStoreMetrics& metrics);
 KVStoreOptions RecommendedOptions(KVStoreProfile profile);
 std::string OptionsToJson(const KVStoreOptions& options);
@@ -149,6 +166,7 @@ public:
 
     void Put(int key, Value value);
     void Put(const std::string& key, Value value);
+    void WriteBatch(const std::vector<BatchWriteOperation>& operations);
     std::optional<Value> Get(int key);
     std::optional<Value> Get(const std::string& key);
     void Delete(int key);

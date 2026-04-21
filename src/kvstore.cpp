@@ -351,6 +351,12 @@ void maybe_trigger_failpoint(const char* name) {
 
 class KVStore::Impl {
 public:
+    struct BatchMutation {
+        WalRecordType type;
+        std::string key;
+        Value value;
+    };
+
     struct BatchPolicy {
         size_t max_batch_size;
         uint64_t max_batch_wal_bytes;
@@ -405,6 +411,13 @@ public:
         request->type = RequestType::kPut;
         request->key = key;
         request->value = std::move(value);
+        enqueue_and_wait(std::move(request));
+    }
+
+    void WriteBatch(const std::vector<BatchMutation>& operations) {
+        auto request = std::make_shared<Request>();
+        request->type = RequestType::kBatch;
+        request->batch_operations = operations;
         enqueue_and_wait(std::move(request));
     }
 
@@ -535,6 +548,7 @@ private:
     enum class RequestType {
         kPut,
         kDelete,
+        kBatch,
         kCompact,
     };
 
@@ -542,6 +556,7 @@ private:
         RequestType type {};
         std::string key;
         Value value;
+        std::vector<BatchMutation> batch_operations;
         std::chrono::steady_clock::time_point enqueue_time = std::chrono::steady_clock::now();
         std::mutex done_mutex;
         std::condition_variable done_cv;
@@ -689,11 +704,11 @@ private:
             throw_if_fatal_locked();
             request_queue_.push_back(request);
             update_atomic_max(max_pending_queue_depth_, request_queue_.size());
-            if (request->type == RequestType::kCompact) {
-                compact_requests_.fetch_add(1, std::memory_order_relaxed);
-            } else {
-                enqueued_write_requests_.fetch_add(1, std::memory_order_relaxed);
-            }
+                if (request->type == RequestType::kCompact) {
+                    compact_requests_.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    enqueued_write_requests_.fetch_add(1, std::memory_order_relaxed);
+                }
         }
         queue_cv_.notify_one();
 
@@ -1105,6 +1120,11 @@ private:
                     batch_bytes_written += append_wal_record(WalRecordType::kDelete, request->key, empty);
                     break;
                 }
+                case RequestType::kBatch:
+                    for (const auto& operation : request->batch_operations) {
+                        batch_bytes_written += append_wal_record(operation.type, operation.key, operation.value);
+                    }
+                    break;
                 case RequestType::kCompact:
                     throw KVStoreError("Compact request should not be part of a write batch");
             }
@@ -1115,6 +1135,16 @@ private:
         {
             std::unique_lock<std::shared_mutex> lock(state_mutex_);
             for (const auto& request : batch) {
+                if (request->type == RequestType::kBatch) {
+                    for (const auto& operation : request->batch_operations) {
+                        if (operation.type == WalRecordType::kPut) {
+                            state_[operation.key] = operation.value;
+                        } else {
+                            state_.erase(operation.key);
+                        }
+                    }
+                    continue;
+                }
                 if (request->type == RequestType::kPut) {
                     state_[request->key] = request->value;
                 } else {
@@ -1129,6 +1159,12 @@ private:
         wal_bytes_written_.fetch_add(batch_bytes_written, std::memory_order_relaxed);
         wal_bytes_since_compaction_.fetch_add(batch_bytes_written, std::memory_order_relaxed);
         for (const auto& request : batch) {
+            if (request->type == RequestType::kBatch) {
+                for (const auto& operation : request->batch_operations) {
+                    note_latest_wal_record(operation.key, sizeof(WalRecordHeader) + operation.key.size() + operation.value.bytes.size());
+                }
+                continue;
+            }
             note_latest_wal_record(request->key, wal_record_size_for_request(*request));
         }
         last_committed_batch_size_.store(batch.size(), std::memory_order_relaxed);
@@ -1425,6 +1461,13 @@ private:
                 return sizeof(WalRecordHeader) + request.key.size();
             case RequestType::kCompact:
                 return 0;
+            case RequestType::kBatch: {
+                uint64_t total = 0;
+                for (const auto& operation : request.batch_operations) {
+                    total += sizeof(WalRecordHeader) + operation.key.size() + operation.value.bytes.size();
+                }
+                return total;
+            }
         }
         return 0;
     }
@@ -1672,12 +1715,72 @@ KVStore::KVStore(const std::string& db_path, KVStoreOptions options)
 
 KVStore::~KVStore() = default;
 
+BatchWriteOperation BatchWriteOperation::Put(std::string key, Value value) {
+    BatchWriteOperation operation;
+    operation.type = Type::kPut;
+    operation.key = std::move(key);
+    operation.value = std::move(value);
+    operation.key_is_string = true;
+    return operation;
+}
+
+BatchWriteOperation BatchWriteOperation::Delete(std::string key) {
+    BatchWriteOperation operation;
+    operation.type = Type::kDelete;
+    operation.key = std::move(key);
+    operation.key_is_string = true;
+    return operation;
+}
+
+BatchWriteOperation BatchWriteOperation::PutInt(int key, Value value) {
+    BatchWriteOperation operation;
+    operation.type = Type::kPut;
+    operation.key = std::to_string(key);
+    operation.value = std::move(value);
+    operation.key_is_string = false;
+    return operation;
+}
+
+BatchWriteOperation BatchWriteOperation::DeleteInt(int key) {
+    BatchWriteOperation operation;
+    operation.type = Type::kDelete;
+    operation.key = std::to_string(key);
+    operation.key_is_string = false;
+    return operation;
+}
+
 void KVStore::Put(int key, Value value) {
     pimpl_->Put(encode_int_key(key), std::move(value));
 }
 
 void KVStore::Put(const std::string& key, Value value) {
     pimpl_->Put(encode_string_key(key), std::move(value));
+}
+
+void KVStore::WriteBatch(const std::vector<BatchWriteOperation>& operations) {
+    if (operations.empty()) {
+        return;
+    }
+
+    std::vector<Impl::BatchMutation> encoded_operations;
+    encoded_operations.reserve(operations.size());
+    for (const auto& operation : operations) {
+        Impl::BatchMutation mutation;
+        mutation.type = operation.type == BatchWriteOperation::Type::kPut ? WalRecordType::kPut : WalRecordType::kDelete;
+        if (operation.key_is_string) {
+            mutation.key = encode_string_key(operation.key);
+        } else {
+            try {
+                mutation.key = encode_int_key(std::stoi(operation.key));
+            } catch (const std::exception&) {
+                throw KVStoreError("BatchWriteOperation integer key is invalid: " + operation.key);
+            }
+        }
+        mutation.value = operation.value;
+        encoded_operations.push_back(std::move(mutation));
+    }
+
+    pimpl_->WriteBatch(encoded_operations);
 }
 
 std::optional<Value> KVStore::Get(int key) {
