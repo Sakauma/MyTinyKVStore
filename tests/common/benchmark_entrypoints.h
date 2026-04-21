@@ -8,6 +8,11 @@ std::string benchmark_result_json_fixture_entrypoint();
 std::string microbench_results_json_fixture_entrypoint();
 std::string stress_summary_json_fixture_entrypoint();
 
+void run_benchmark_command();
+void run_microbench_command();
+void run_microbench_json_command();
+void run_benchmark_baseline_json_command();
+
 int run_compare_benchmark_baseline_entrypoint(
     const std::string& baseline_path,
     const std::string& candidate_path,
