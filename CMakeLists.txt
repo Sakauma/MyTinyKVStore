@@ -51,6 +51,7 @@ add_library(kvstore SHARED
     src/internal/metrics_helpers.cpp
     src/internal/metrics_snapshot.cpp
     src/internal/observability.cpp
+    src/internal/recent_metrics.cpp
     src/internal/recovery.cpp
     src/internal/wal_accounting.cpp
     src/internal/writer_policy.cpp

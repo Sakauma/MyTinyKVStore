@@ -5,6 +5,7 @@
 #include "internal/metrics_helpers.h"
 #include "internal/metrics_snapshot.h"
 #include "internal/observability.h"
+#include "internal/recent_metrics.h"
 #include "internal/recovery.h"
 #include "internal/wal_accounting.h"
 #include "internal/writer_policy.h"
@@ -629,88 +630,36 @@ private:
             }
             update_atomic_max(max_effective_batch_delay_us_, current_batch_delay_us_);
         }
-        update_observed_fsync_pressure(batch.size());
-        update_recent_batch_history(batch.size(), current_batch_queue_depth_);
+        update_observed_fsync_pressure_metric(observed_fsync_pressure_per_1000_writes_, batch.size());
+        update_recent_batch_history(RecentBatchHistoryContext {
+            options_,
+            read_requests_.load(std::memory_order_relaxed),
+            last_committed_batch_wal_bytes_.load(std::memory_order_relaxed),
+            batch.size(),
+            current_batch_queue_depth_,
+            last_total_read_requests_seen_,
+            recent_batch_sizes_,
+            recent_batch_queue_depths_,
+            recent_batch_wal_bytes_,
+            recent_batch_wal_bytes_sum_,
+            recent_read_deltas_,
+            recent_write_deltas_,
+            recent_read_sum_,
+            recent_write_sum_,
+            recent_batch_size_sum_,
+            recent_read_requests_,
+            recent_write_requests_,
+            recent_read_ratio_per_1000_ops_,
+            recent_peak_queue_depth_,
+            recent_avg_batch_size_,
+            recent_batch_fill_per_1000_,
+            recent_avg_batch_wal_bytes_,
+            recent_window_batch_count_,
+            observed_fsync_pressure_per_1000_writes_,
+        });
 
         for (const auto& request : batch) {
             complete_request(request, "");
-        }
-    }
-
-    void update_observed_fsync_pressure(size_t batch_size) {
-        if (batch_size == 0) {
-            return;
-        }
-        const uint64_t instantaneous_pressure = (1000 + batch_size - 1) / batch_size;
-        const uint64_t previous_pressure = observed_fsync_pressure_per_1000_writes_.load(std::memory_order_relaxed);
-        const uint64_t next_pressure =
-            previous_pressure == 0 ? instantaneous_pressure : ((previous_pressure * 3) + instantaneous_pressure) / 4;
-        observed_fsync_pressure_per_1000_writes_.store(next_pressure, std::memory_order_relaxed);
-    }
-
-    void update_recent_batch_history(size_t batch_size, uint64_t queue_depth) {
-        const uint64_t total_read_requests = read_requests_.load(std::memory_order_relaxed);
-        const uint64_t read_delta = total_read_requests >= last_total_read_requests_seen_
-                                        ? total_read_requests - last_total_read_requests_seen_
-                                        : 0;
-        last_total_read_requests_seen_ = total_read_requests;
-
-        recent_batch_sizes_.push_back(batch_size);
-        recent_batch_queue_depths_.push_back(queue_depth);
-        recent_batch_wal_bytes_.push_back(last_committed_batch_wal_bytes_.load(std::memory_order_relaxed));
-        recent_read_deltas_.push_back(read_delta);
-        recent_write_deltas_.push_back(batch_size);
-        recent_batch_size_sum_ += batch_size;
-        recent_batch_wal_bytes_sum_ += recent_batch_wal_bytes_.back();
-        recent_read_sum_ += read_delta;
-        recent_write_sum_ += batch_size;
-
-        while (recent_batch_sizes_.size() > options_.adaptive_recent_window_batches) {
-            recent_batch_size_sum_ -= recent_batch_sizes_.front();
-            recent_batch_sizes_.pop_front();
-            recent_batch_queue_depths_.pop_front();
-            recent_batch_wal_bytes_sum_ -= recent_batch_wal_bytes_.front();
-            recent_batch_wal_bytes_.pop_front();
-            recent_read_sum_ -= recent_read_deltas_.front();
-            recent_read_deltas_.pop_front();
-            recent_write_sum_ -= recent_write_deltas_.front();
-            recent_write_deltas_.pop_front();
-        }
-
-        recent_window_batch_count_.store(recent_batch_sizes_.size(), std::memory_order_relaxed);
-        if (!recent_batch_sizes_.empty()) {
-            recent_avg_batch_size_.store(
-                recent_batch_size_sum_ / recent_batch_sizes_.size(),
-                std::memory_order_relaxed);
-            const uint64_t avg_batch_size = recent_batch_size_sum_ / recent_batch_sizes_.size();
-            const uint64_t batch_fill_scale =
-                std::max<uint64_t>(1, options_.adaptive_objective_target_batch_size > 0
-                                          ? options_.adaptive_objective_target_batch_size
-                                          : options_.max_batch_size);
-            recent_batch_fill_per_1000_.store(
-                std::min<uint64_t>(1000, (avg_batch_size * 1000) / batch_fill_scale),
-                std::memory_order_relaxed);
-            recent_avg_batch_wal_bytes_.store(
-                recent_batch_wal_bytes_sum_ / recent_batch_sizes_.size(),
-                std::memory_order_relaxed);
-        }
-        recent_read_requests_.store(recent_read_sum_, std::memory_order_relaxed);
-        recent_write_requests_.store(recent_write_sum_, std::memory_order_relaxed);
-        const uint64_t total_recent_ops = recent_read_sum_ + recent_write_sum_;
-        const uint64_t read_ratio =
-            total_recent_ops == 0 ? 0 : (recent_read_sum_ * 1000) / total_recent_ops;
-        recent_read_ratio_per_1000_ops_.store(read_ratio, std::memory_order_relaxed);
-
-        uint64_t peak_queue_depth = 0;
-        for (uint64_t value : recent_batch_queue_depths_) {
-            peak_queue_depth = std::max(peak_queue_depth, value);
-        }
-        recent_peak_queue_depth_.store(peak_queue_depth, std::memory_order_relaxed);
-
-        if (!recent_batch_sizes_.empty() && recent_batch_size_sum_ > 0) {
-            const uint64_t recent_pressure =
-                (recent_batch_sizes_.size() * 1000 + recent_batch_size_sum_ - 1) / recent_batch_size_sum_;
-            observed_fsync_pressure_per_1000_writes_.store(recent_pressure, std::memory_order_relaxed);
         }
     }
 
