@@ -170,6 +170,7 @@ cd build && ctest --output-on-failure
 若需要可归档的 benchmark 基线，可调用 `kv_test bench-baseline-json` 或 `bash scripts/bench-baseline.sh`。
 若需要自动判断是否出现明显退化，可调用 `kv_test compare-baseline ...` 或 `bash scripts/bench-regression-check.sh ...`。
 若需要查看一段时间内的趋势，可调用 `kv_test trend-baselines ...` 或 `bash scripts/bench-trend.sh ...`。
+趋势摘要现在还会输出 `write_trend` / `read_trend` / `latency_trend`，方便直接归档“改善 / 持平 / 退化”结论。
 当前 regression gate 除了 `write/read throughput` 和平均写延迟外，也会检查 `p95/p99`、`fsync` 压力和 batch fill。
 若需要推荐配置模板，可调用 `kv_test profile-json <name>` 或 `RecommendedOptions(...)`。
 

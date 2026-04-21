@@ -26,6 +26,9 @@ Current status:
 Exit criteria:
 - `trend-baselines` 能输出机器可解析的趋势方向字段。
 
+Current status:
+- 已完成。
+
 ## Phase B: Long-Run Validation
 
 ### B1. Soak Profiles
