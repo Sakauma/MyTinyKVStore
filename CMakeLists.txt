@@ -67,6 +67,7 @@ kvstore_apply_sanitizers(kvstore)
 kvstore_apply_coverage(kvstore)
 
 add_executable(kv_test
+    tests/common/benchmark_cli.cpp
     tests/common/format_cli.cpp
     tests/common/test_support.cpp
     tests/integration/basic_kv_tests.cpp

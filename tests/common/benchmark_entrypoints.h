@@ -29,6 +29,7 @@ int run_compare_microbench_entrypoint(
 
 int run_benchmark_trend_entrypoint(const std::string& directory_path, size_t recent_window);
 int run_benchmark_trend_json_entrypoint(const std::string& directory_path, size_t recent_window);
+int run_microbench_trend_entrypoint(const std::string& directory_path, size_t recent_window);
 int run_microbench_trend_json_entrypoint(const std::string& directory_path, size_t recent_window);
 int run_benchmark_json_entrypoint();
 int run_profile_json_entrypoint(const std::string& name);
