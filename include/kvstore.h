@@ -26,6 +26,13 @@ public:
     explicit KVStoreError(const std::string& message) : std::runtime_error(message) {}
 };
 
+enum class KVStoreProfile {
+    kBalanced,
+    kWriteHeavy,
+    kReadHeavy,
+    kLowLatency,
+};
+
 struct KVStoreOptions {
     size_t max_batch_size = 64;
     uint64_t max_batch_wal_bytes = 0;
@@ -131,6 +138,8 @@ struct KVStoreMetrics {
 };
 
 std::string MetricsToJson(const KVStoreMetrics& metrics);
+KVStoreOptions RecommendedOptions(KVStoreProfile profile);
+std::string OptionsToJson(const KVStoreOptions& options);
 
 class KVStore {
 public:

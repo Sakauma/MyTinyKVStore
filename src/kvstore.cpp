@@ -1775,3 +1775,139 @@ std::string MetricsToJson(const KVStoreMetrics& metrics) {
     out << "]}";
     return out.str();
 }
+
+KVStoreOptions RecommendedOptions(KVStoreProfile profile) {
+    KVStoreOptions options;
+    options.max_batch_size = 32;
+    options.max_batch_wal_bytes = 1 << 20;
+    options.max_batch_delay_us = 2000;
+    options.adaptive_recent_window_batches = 64;
+    options.adaptive_recent_write_sample_limit = 512;
+    options.auto_compact_wal_bytes_threshold = 1 << 20;
+    options.auto_compact_invalid_wal_ratio_percent = 60;
+    options.adaptive_batching_enabled = true;
+    options.adaptive_queue_depth_threshold = 8;
+    options.adaptive_batch_size_multiplier = 4;
+    options.adaptive_batch_wal_bytes_multiplier = 4;
+    options.adaptive_flush_enabled = true;
+    options.adaptive_flush_queue_depth_threshold = 8;
+    options.adaptive_flush_delay_divisor = 4;
+    options.adaptive_flush_min_batch_delay_us = 100;
+    options.adaptive_latency_target_p95_us = 12000;
+    options.adaptive_fsync_pressure_per_1000_writes_threshold = 350;
+    options.adaptive_fsync_pressure_delay_multiplier = 2;
+    options.adaptive_fsync_pressure_max_batch_delay_us = 8000;
+    options.adaptive_compaction_pressure_obsolete_ratio_percent_threshold = 50;
+    options.adaptive_compaction_pressure_delay_multiplier = 2;
+    options.adaptive_wal_growth_bytes_per_batch_threshold = 200;
+    options.adaptive_wal_growth_delay_multiplier = 2;
+    options.adaptive_wal_growth_max_batch_delay_us = 6000;
+    options.adaptive_objective_enabled = true;
+    options.adaptive_objective_queue_weight = 1;
+    options.adaptive_objective_latency_weight = 3;
+    options.adaptive_objective_read_weight = 2;
+    options.adaptive_objective_throughput_weight = 2;
+    options.adaptive_objective_target_batch_size = 16;
+    options.adaptive_objective_fsync_weight = 2;
+    options.adaptive_objective_compaction_weight = 1;
+    options.adaptive_objective_wal_growth_weight = 1;
+    options.adaptive_objective_short_delay_score_threshold = 500;
+    options.adaptive_objective_long_delay_score_threshold = 500;
+    options.adaptive_objective_short_delay_divisor = 2;
+    options.adaptive_objective_long_delay_multiplier = 2;
+    options.adaptive_objective_max_batch_delay_us = 8000;
+    options.adaptive_read_heavy_read_per_1000_ops_threshold = 700;
+    options.adaptive_read_heavy_delay_divisor = 4;
+    options.adaptive_read_heavy_batch_size_divisor = 2;
+
+    switch (profile) {
+        case KVStoreProfile::kBalanced:
+            return options;
+        case KVStoreProfile::kWriteHeavy:
+            options.max_batch_size = 64;
+            options.max_batch_wal_bytes = 2 << 20;
+            options.max_batch_delay_us = 4000;
+            options.adaptive_objective_target_batch_size = 32;
+            options.adaptive_objective_throughput_weight = 4;
+            options.adaptive_objective_fsync_weight = 3;
+            options.adaptive_flush_queue_depth_threshold = 16;
+            options.auto_compact_wal_bytes_threshold = 4 << 20;
+            options.auto_compact_invalid_wal_ratio_percent = 70;
+            return options;
+        case KVStoreProfile::kReadHeavy:
+            options.max_batch_size = 16;
+            options.max_batch_delay_us = 1000;
+            options.adaptive_objective_read_weight = 4;
+            options.adaptive_objective_latency_weight = 4;
+            options.adaptive_objective_throughput_weight = 1;
+            options.adaptive_read_heavy_read_per_1000_ops_threshold = 600;
+            options.adaptive_read_heavy_delay_divisor = 8;
+            options.adaptive_read_heavy_batch_size_divisor = 4;
+            options.adaptive_flush_queue_depth_threshold = 4;
+            return options;
+        case KVStoreProfile::kLowLatency:
+            options.max_batch_size = 8;
+            options.max_batch_wal_bytes = 64 << 10;
+            options.max_batch_delay_us = 500;
+            options.adaptive_objective_latency_weight = 5;
+            options.adaptive_objective_short_delay_divisor = 4;
+            options.adaptive_objective_long_delay_score_threshold = 1500;
+            options.adaptive_objective_target_batch_size = 8;
+            options.adaptive_objective_throughput_weight = 1;
+            options.adaptive_flush_queue_depth_threshold = 2;
+            options.adaptive_flush_delay_divisor = 8;
+            options.adaptive_flush_min_batch_delay_us = 50;
+            options.adaptive_latency_target_p95_us = 4000;
+            return options;
+    }
+
+    return options;
+}
+
+std::string OptionsToJson(const KVStoreOptions& options) {
+    std::ostringstream out;
+    out << '{'
+        << "\"max_batch_size\":" << options.max_batch_size
+        << ",\"max_batch_wal_bytes\":" << options.max_batch_wal_bytes
+        << ",\"max_batch_delay_us\":" << options.max_batch_delay_us
+        << ",\"adaptive_recent_window_batches\":" << options.adaptive_recent_window_batches
+        << ",\"adaptive_recent_write_sample_limit\":" << options.adaptive_recent_write_sample_limit
+        << ",\"adaptive_objective_enabled\":" << (options.adaptive_objective_enabled ? "true" : "false")
+        << ",\"adaptive_objective_queue_weight\":" << options.adaptive_objective_queue_weight
+        << ",\"adaptive_objective_latency_weight\":" << options.adaptive_objective_latency_weight
+        << ",\"adaptive_objective_read_weight\":" << options.adaptive_objective_read_weight
+        << ",\"adaptive_objective_throughput_weight\":" << options.adaptive_objective_throughput_weight
+        << ",\"adaptive_objective_target_batch_size\":" << options.adaptive_objective_target_batch_size
+        << ",\"adaptive_objective_fsync_weight\":" << options.adaptive_objective_fsync_weight
+        << ",\"adaptive_objective_compaction_weight\":" << options.adaptive_objective_compaction_weight
+        << ",\"adaptive_objective_wal_growth_weight\":" << options.adaptive_objective_wal_growth_weight
+        << ",\"adaptive_objective_short_delay_score_threshold\":" << options.adaptive_objective_short_delay_score_threshold
+        << ",\"adaptive_objective_long_delay_score_threshold\":" << options.adaptive_objective_long_delay_score_threshold
+        << ",\"adaptive_objective_short_delay_divisor\":" << options.adaptive_objective_short_delay_divisor
+        << ",\"adaptive_objective_long_delay_multiplier\":" << options.adaptive_objective_long_delay_multiplier
+        << ",\"adaptive_objective_max_batch_delay_us\":" << options.adaptive_objective_max_batch_delay_us
+        << ",\"adaptive_read_heavy_read_per_1000_ops_threshold\":" << options.adaptive_read_heavy_read_per_1000_ops_threshold
+        << ",\"adaptive_read_heavy_delay_divisor\":" << options.adaptive_read_heavy_delay_divisor
+        << ",\"adaptive_read_heavy_batch_size_divisor\":" << options.adaptive_read_heavy_batch_size_divisor
+        << ",\"adaptive_flush_enabled\":" << (options.adaptive_flush_enabled ? "true" : "false")
+        << ",\"adaptive_flush_queue_depth_threshold\":" << options.adaptive_flush_queue_depth_threshold
+        << ",\"adaptive_flush_delay_divisor\":" << options.adaptive_flush_delay_divisor
+        << ",\"adaptive_flush_min_batch_delay_us\":" << options.adaptive_flush_min_batch_delay_us
+        << ",\"adaptive_latency_target_p95_us\":" << options.adaptive_latency_target_p95_us
+        << ",\"adaptive_fsync_pressure_per_1000_writes_threshold\":" << options.adaptive_fsync_pressure_per_1000_writes_threshold
+        << ",\"adaptive_fsync_pressure_delay_multiplier\":" << options.adaptive_fsync_pressure_delay_multiplier
+        << ",\"adaptive_fsync_pressure_max_batch_delay_us\":" << options.adaptive_fsync_pressure_max_batch_delay_us
+        << ",\"adaptive_compaction_pressure_obsolete_ratio_percent_threshold\":" << options.adaptive_compaction_pressure_obsolete_ratio_percent_threshold
+        << ",\"adaptive_compaction_pressure_delay_multiplier\":" << options.adaptive_compaction_pressure_delay_multiplier
+        << ",\"adaptive_wal_growth_bytes_per_batch_threshold\":" << options.adaptive_wal_growth_bytes_per_batch_threshold
+        << ",\"adaptive_wal_growth_delay_multiplier\":" << options.adaptive_wal_growth_delay_multiplier
+        << ",\"adaptive_wal_growth_max_batch_delay_us\":" << options.adaptive_wal_growth_max_batch_delay_us
+        << ",\"auto_compact_wal_bytes_threshold\":" << options.auto_compact_wal_bytes_threshold
+        << ",\"auto_compact_invalid_wal_ratio_percent\":" << options.auto_compact_invalid_wal_ratio_percent
+        << ",\"adaptive_batching_enabled\":" << (options.adaptive_batching_enabled ? "true" : "false")
+        << ",\"adaptive_queue_depth_threshold\":" << options.adaptive_queue_depth_threshold
+        << ",\"adaptive_batch_size_multiplier\":" << options.adaptive_batch_size_multiplier
+        << ",\"adaptive_batch_wal_bytes_multiplier\":" << options.adaptive_batch_wal_bytes_multiplier
+        << '}';
+    return out.str();
+}

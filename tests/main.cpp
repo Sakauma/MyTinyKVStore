@@ -337,6 +337,32 @@ int run_rewrite_format(const std::string& db_path) {
     return 0;
 }
 
+std::optional<KVStoreProfile> parse_profile_name(const std::string& name) {
+    if (name == "balanced") {
+        return KVStoreProfile::kBalanced;
+    }
+    if (name == "write-heavy") {
+        return KVStoreProfile::kWriteHeavy;
+    }
+    if (name == "read-heavy") {
+        return KVStoreProfile::kReadHeavy;
+    }
+    if (name == "low-latency") {
+        return KVStoreProfile::kLowLatency;
+    }
+    return std::nullopt;
+}
+
+int run_profile_json(const std::string& name) {
+    const auto profile = parse_profile_name(name);
+    if (!profile.has_value()) {
+        std::cerr << "Unknown profile: " << name << '\n';
+        return 1;
+    }
+    std::cout << OptionsToJson(RecommendedOptions(*profile)) << std::endl;
+    return 0;
+}
+
 void test_basic_persistence() {
     TestDir dir("basic");
     const std::string db_path = dir.file("store.dat");
@@ -821,6 +847,33 @@ void test_batching_metrics_are_reported() {
     require(metrics.pending_queue_depth == 0, "queue should drain after all writers finish");
     require(histogram_total(metrics.write_latency_histogram) == metrics.committed_write_requests,
             "latency histogram should account for every committed write");
+}
+
+void test_recommended_profiles_are_distinct() {
+    const KVStoreOptions balanced = RecommendedOptions(KVStoreProfile::kBalanced);
+    const KVStoreOptions write_heavy = RecommendedOptions(KVStoreProfile::kWriteHeavy);
+    const KVStoreOptions read_heavy = RecommendedOptions(KVStoreProfile::kReadHeavy);
+    const KVStoreOptions low_latency = RecommendedOptions(KVStoreProfile::kLowLatency);
+
+    require(write_heavy.max_batch_size > balanced.max_batch_size,
+            "write-heavy profile should favor larger batches than balanced");
+    require(read_heavy.max_batch_size < balanced.max_batch_size,
+            "read-heavy profile should favor smaller batches than balanced");
+    require(low_latency.max_batch_delay_us < balanced.max_batch_delay_us,
+            "low-latency profile should shorten batch delay");
+    require(write_heavy.auto_compact_wal_bytes_threshold > balanced.auto_compact_wal_bytes_threshold,
+            "write-heavy profile should tolerate a larger WAL before compaction");
+}
+
+void test_options_to_json_reports_profile_fields() {
+    const std::string json = OptionsToJson(RecommendedOptions(KVStoreProfile::kBalanced));
+    require(!json.empty() && json.front() == '{' && json.back() == '}', "options json should be a JSON object");
+    require(json.find("\"max_batch_size\":") != std::string::npos,
+            "options json should include batching fields");
+    require(json.find("\"adaptive_objective_enabled\":true") != std::string::npos,
+            "options json should include boolean profile settings");
+    require(json.find("\"auto_compact_wal_bytes_threshold\":") != std::string::npos,
+            "options json should include compaction thresholds");
 }
 
 void test_metrics_to_json_reports_core_fields() {
@@ -1787,6 +1840,13 @@ int main(int argc, char* argv[]) {
             run_benchmark_json();
             return 0;
         }
+        if (command == "profile-json") {
+            if (argc != 3) {
+                std::cerr << "Usage: kv_test profile-json <balanced|write-heavy|read-heavy|low-latency>" << std::endl;
+                return 1;
+            }
+            return run_profile_json(argv[2]);
+        }
         if (command == "soak") {
             const int duration_seconds = argc > 2 ? std::stoi(argv[2]) : 10;
             run_soak_test(duration_seconds);
@@ -1814,7 +1874,7 @@ int main(int argc, char* argv[]) {
             return run_fault_injection_scenario(argv[2], argv[3]);
         }
         std::cerr << "Unknown command: " << command << '\n';
-        std::cerr << "Usage: kv_test [bench|bench-json|soak|inspect-format|rewrite-format|fault-inject]" << std::endl;
+        std::cerr << "Usage: kv_test [bench|bench-json|profile-json|soak|inspect-format|rewrite-format|fault-inject]" << std::endl;
         return 1;
     }
 
@@ -1841,6 +1901,8 @@ int main(int argc, char* argv[]) {
         {"many concurrent writers", test_many_concurrent_writers},
         {"concurrent compaction with writes", test_concurrent_compaction_with_writes},
         {"batching metrics are reported", test_batching_metrics_are_reported},
+        {"recommended profiles are distinct", test_recommended_profiles_are_distinct},
+        {"options to json reports profile fields", test_options_to_json_reports_profile_fields},
         {"metrics to json reports core fields", test_metrics_to_json_reports_core_fields},
         {"auto compaction triggers and preserves state", test_auto_compaction_triggers_and_preserves_state},
         {"manual and auto compaction metrics coexist", test_manual_and_auto_compaction_metrics_coexist},
