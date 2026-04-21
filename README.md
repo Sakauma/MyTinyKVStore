@@ -153,7 +153,7 @@ cd build && ctest --output-on-failure
 - `bash scripts/coverage.sh`：执行 coverage 构建与测试；若本地安装了 `gcovr`，会直接打印 coverage 摘要。
 - `bash scripts/bench.sh`：构建并运行 benchmark。
 - `bash scripts/soak.sh 10`：运行带 compaction 的混合读写 soak test，并在结束后重启校验数据一致性。
-- `bash scripts/inspect-format.sh <db_path>`：检查快照和 WAL 的格式版本。
+- `bash scripts/inspect-format.sh <db_path>`：检查快照和 WAL 的格式版本、记录数量、键类型分布，以及是否建议重写迁移。
 - `bash scripts/rewrite-format.sh <db_path>`：加载数据库并执行一次 `Compact()`，把数据重写到当前格式。
 - `bash scripts/profile.sh <balanced|write-heavy|read-heavy|low-latency>`：打印推荐配置模板的 JSON。
 

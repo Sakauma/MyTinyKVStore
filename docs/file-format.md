@@ -72,5 +72,12 @@
 
 ## Operational Tools
 
-- `./build/target/bin/kv_test inspect-format <db_path>`：打印快照/WAL 的版本和基础信息。
+- `./build/target/bin/kv_test inspect-format <db_path>`：打印快照/WAL 的版本、记录数量、键类型分布，以及 `rewrite_recommended` 建议位。
 - `./build/target/bin/kv_test rewrite-format <db_path>`：加载数据库并执行一次 `Compact()`，将数据重写为当前格式。
+
+### `inspect-format` Output Highlights
+
+- `snapshot_entries` / `wal_records`：分别表示快照和 WAL 中可解析到的记录数量。
+- `snapshot_int_keys` / `snapshot_string_keys` / `snapshot_binary_keys`：快照中的键类型分布。
+- `wal_int_keys` / `wal_string_keys` / `wal_binary_keys`：WAL 中的键类型分布。
+- `rewrite_recommended=1`：通常表示检测到旧版本格式、截断 WAL 或其它不属于当前稳定格式的情况，建议执行一次 `rewrite-format`。

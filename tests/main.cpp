@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -34,6 +35,12 @@ struct SnapshotHeader {
 struct SnapshotEntryHeaderV1 {
     uint32_t magic;
     int32_t key;
+    uint32_t value_size;
+};
+
+struct SnapshotEntryHeader {
+    uint32_t magic;
+    uint32_t key_size;
     uint32_t value_size;
 };
 
@@ -61,6 +68,19 @@ struct WalRecordHeaderV1 {
 constexpr char kSnapshotMagic[8] = {'K', 'V', 'S', 'N', 'A', 'P', '0', '1'};
 constexpr uint32_t kWalMagic = 0x4B565741;
 constexpr uint32_t kSnapshotEntryMagic = 0x4B565345;
+constexpr char kIntKeyTag = '\x01';
+constexpr char kStringKeyTag = '\x02';
+constexpr char kBinaryKeyTag = '\x03';
+
+struct FormatKeyStats {
+    uint64_t total = 0;
+    uint64_t int_keys = 0;
+    uint64_t string_keys = 0;
+    uint64_t binary_keys = 0;
+    uint64_t unknown_keys = 0;
+};
+
+int run_inspect_format(const std::string& db_path);
 
 Value text(const std::string& input) {
     return Value(std::vector<uint8_t>(input.begin(), input.end()));
@@ -123,6 +143,50 @@ uintmax_t file_size_or_zero(const std::string& path) {
     std::error_code ec;
     const auto size = std::filesystem::file_size(path, ec);
     return ec ? 0 : size;
+}
+
+void classify_encoded_key(std::string_view encoded_key, FormatKeyStats& stats) {
+    stats.total += 1;
+    if (encoded_key.empty()) {
+        stats.unknown_keys += 1;
+        return;
+    }
+
+    switch (encoded_key.front()) {
+        case kIntKeyTag:
+            stats.int_keys += 1;
+            break;
+        case kStringKeyTag:
+            stats.string_keys += 1;
+            break;
+        case kBinaryKeyTag:
+            stats.binary_keys += 1;
+            break;
+        default:
+            stats.unknown_keys += 1;
+            break;
+    }
+}
+
+std::map<std::string, std::string> parse_kv_line(const std::string& line) {
+    std::map<std::string, std::string> values;
+    std::istringstream in(line);
+    std::string token;
+    while (in >> token) {
+        const size_t equals = token.find('=');
+        require(equals != std::string::npos, "Expected key=value token in inspect output");
+        values[token.substr(0, equals)] = token.substr(equals + 1);
+    }
+    return values;
+}
+
+std::map<std::string, std::string> capture_inspect_format(const std::string& db_path, int expected_status = 0) {
+    std::ostringstream out;
+    auto* original = std::cout.rdbuf(out.rdbuf());
+    const int status = run_inspect_format(db_path);
+    std::cout.rdbuf(original);
+    require(status == expected_status, "inspect-format should return the expected status");
+    return parse_kv_line(out.str());
 }
 
 uint64_t histogram_total(const std::array<uint64_t, kWriteLatencyBucketCount>& histogram) {
@@ -311,26 +375,194 @@ int run_inspect_format(const std::string& db_path) {
         return 2;
     }
 
+    FormatKeyStats snapshot_stats;
+    bool snapshot_truncated = false;
+    bool snapshot_entry_magic_ok = true;
+    if (snapshot_header.version == 1) {
+        while (true) {
+            SnapshotEntryHeaderV1 entry {};
+            snapshot.read(reinterpret_cast<char*>(&entry), sizeof(entry));
+            if (snapshot.gcount() == 0) {
+                break;
+            }
+            if (snapshot.gcount() != static_cast<std::streamsize>(sizeof(entry))) {
+                snapshot_truncated = true;
+                break;
+            }
+            if (entry.magic != kSnapshotEntryMagic) {
+                snapshot_entry_magic_ok = false;
+                break;
+            }
+            snapshot_stats.total += 1;
+            snapshot_stats.int_keys += 1;
+            snapshot.seekg(entry.value_size, std::ios::cur);
+            if (!snapshot.good()) {
+                snapshot_truncated = true;
+                break;
+            }
+        }
+    } else if (snapshot_header.version == 2) {
+        while (true) {
+            SnapshotEntryHeader entry {};
+            snapshot.read(reinterpret_cast<char*>(&entry), sizeof(entry));
+            if (snapshot.gcount() == 0) {
+                break;
+            }
+            if (snapshot.gcount() != static_cast<std::streamsize>(sizeof(entry))) {
+                snapshot_truncated = true;
+                break;
+            }
+            if (entry.magic != kSnapshotEntryMagic) {
+                snapshot_entry_magic_ok = false;
+                break;
+            }
+            std::string key(entry.key_size, '\0');
+            if (!key.empty()) {
+                snapshot.read(key.data(), static_cast<std::streamsize>(key.size()));
+                if (snapshot.gcount() != static_cast<std::streamsize>(key.size())) {
+                    snapshot_truncated = true;
+                    break;
+                }
+            }
+            classify_encoded_key(key, snapshot_stats);
+            snapshot.seekg(entry.value_size, std::ios::cur);
+            if (!snapshot.good()) {
+                snapshot_truncated = true;
+                break;
+            }
+        }
+    }
+
+    bool rewrite_recommended = snapshot_header.version != 2;
     std::cout << "snapshot_exists=1"
               << " snapshot_magic_ok=" << (std::memcmp(snapshot_header.magic, kSnapshotMagic, sizeof(kSnapshotMagic)) == 0 ? 1 : 0)
               << " snapshot_version=" << snapshot_header.version
+              << " snapshot_entries=" << snapshot_stats.total
+              << " snapshot_int_keys=" << snapshot_stats.int_keys
+              << " snapshot_string_keys=" << snapshot_stats.string_keys
+              << " snapshot_binary_keys=" << snapshot_stats.binary_keys
+              << " snapshot_unknown_key_types=" << snapshot_stats.unknown_keys
+              << " snapshot_entry_magic_ok=" << (snapshot_entry_magic_ok ? 1 : 0)
+              << " snapshot_truncated=" << (snapshot_truncated ? 1 : 0)
               << " snapshot_size=" << file_size_or_zero(db_path);
 
     std::ifstream wal(wal_path, std::ios::binary);
     if (!wal.is_open()) {
-        std::cout << " wal_exists=0" << std::endl;
+        std::cout << " wal_exists=0"
+                  << " wal_records=0"
+                  << " wal_put_records=0"
+                  << " wal_delete_records=0"
+                  << " wal_int_keys=0"
+                  << " wal_string_keys=0"
+                  << " wal_binary_keys=0"
+                  << " wal_unknown_key_types=0"
+                  << " wal_unknown_record_types=0"
+                  << " wal_truncated=0"
+                  << " rewrite_recommended=" << (rewrite_recommended ? 1 : 0)
+                  << std::endl;
         return 0;
     }
 
     WalRecordHeader wal_header {};
     wal.read(reinterpret_cast<char*>(&wal_header), sizeof(wal_header));
     if (wal.gcount() == 0) {
-        std::cout << " wal_exists=1 wal_empty=1 wal_size=" << file_size_or_zero(wal_path) << std::endl;
+        std::cout << " wal_exists=1 wal_empty=1 wal_size=" << file_size_or_zero(wal_path)
+                  << " wal_records=0"
+                  << " wal_put_records=0"
+                  << " wal_delete_records=0"
+                  << " wal_int_keys=0"
+                  << " wal_string_keys=0"
+                  << " wal_binary_keys=0"
+                  << " wal_unknown_key_types=0"
+                  << " wal_unknown_record_types=0"
+                  << " wal_truncated=0"
+                  << " rewrite_recommended=" << (rewrite_recommended ? 1 : 0)
+                  << std::endl;
         return 0;
     }
     if (wal.gcount() != static_cast<std::streamsize>(sizeof(wal_header))) {
-        std::cout << " wal_exists=1 wal_truncated=1 wal_size=" << file_size_or_zero(wal_path) << std::endl;
+        std::cout << " wal_exists=1 wal_truncated=1 wal_size=" << file_size_or_zero(wal_path)
+                  << " wal_records=0"
+                  << " wal_put_records=0"
+                  << " wal_delete_records=0"
+                  << " wal_int_keys=0"
+                  << " wal_string_keys=0"
+                  << " wal_binary_keys=0"
+                  << " wal_unknown_key_types=0"
+                  << " wal_unknown_record_types=0"
+                  << " rewrite_recommended=1"
+                  << std::endl;
         return 0;
+    }
+
+    FormatKeyStats wal_stats;
+    uint64_t wal_put_records = 0;
+    uint64_t wal_delete_records = 0;
+    uint64_t wal_unknown_record_types = 0;
+    bool wal_truncated = false;
+    const uint16_t wal_version = wal_header.version;
+    rewrite_recommended = rewrite_recommended || wal_version != 2;
+    wal.clear();
+    wal.seekg(0, std::ios::beg);
+    if (wal_version == 1) {
+        while (true) {
+            WalRecordHeaderV1 entry {};
+            wal.read(reinterpret_cast<char*>(&entry), sizeof(entry));
+            if (wal.gcount() == 0) {
+                break;
+            }
+            if (wal.gcount() != static_cast<std::streamsize>(sizeof(entry))) {
+                wal_truncated = true;
+                break;
+            }
+            if (entry.type == 1) {
+                wal_put_records += 1;
+            } else if (entry.type == 2) {
+                wal_delete_records += 1;
+            } else {
+                wal_unknown_record_types += 1;
+            }
+            wal_stats.total += 1;
+            wal_stats.int_keys += 1;
+            wal.seekg(entry.value_size, std::ios::cur);
+            if (!wal.good()) {
+                wal_truncated = true;
+                break;
+            }
+        }
+    } else {
+        while (true) {
+            WalRecordHeader entry {};
+            wal.read(reinterpret_cast<char*>(&entry), sizeof(entry));
+            if (wal.gcount() == 0) {
+                break;
+            }
+            if (wal.gcount() != static_cast<std::streamsize>(sizeof(entry))) {
+                wal_truncated = true;
+                break;
+            }
+            if (entry.type == 1) {
+                wal_put_records += 1;
+            } else if (entry.type == 2) {
+                wal_delete_records += 1;
+            } else {
+                wal_unknown_record_types += 1;
+            }
+            std::string key(entry.key_size, '\0');
+            if (!key.empty()) {
+                wal.read(key.data(), static_cast<std::streamsize>(key.size()));
+                if (wal.gcount() != static_cast<std::streamsize>(key.size())) {
+                    wal_truncated = true;
+                    break;
+                }
+            }
+            classify_encoded_key(key, wal_stats);
+            wal.seekg(entry.value_size, std::ios::cur);
+            if (!wal.good()) {
+                wal_truncated = true;
+                break;
+            }
+        }
     }
 
     std::cout << " wal_exists=1"
@@ -339,6 +571,16 @@ int run_inspect_format(const std::string& db_path) {
               << " wal_version=" << wal_header.version
               << " wal_first_type=" << static_cast<int>(wal_header.type)
               << " wal_size=" << file_size_or_zero(wal_path)
+              << " wal_records=" << wal_stats.total
+              << " wal_put_records=" << wal_put_records
+              << " wal_delete_records=" << wal_delete_records
+              << " wal_int_keys=" << wal_stats.int_keys
+              << " wal_string_keys=" << wal_stats.string_keys
+              << " wal_binary_keys=" << wal_stats.binary_keys
+              << " wal_unknown_key_types=" << wal_stats.unknown_keys
+              << " wal_unknown_record_types=" << wal_unknown_record_types
+              << " wal_truncated=" << (wal_truncated ? 1 : 0)
+              << " rewrite_recommended=" << (rewrite_recommended ? 1 : 0)
               << std::endl;
     return 0;
 }
@@ -620,6 +862,61 @@ void test_legacy_v1_rewrite_upgrades_snapshot_to_v2() {
     const auto nine = reopened.Get(9);
     require(seven.has_value() && as_string(*seven) == "seven", "rewritten data should preserve snapshot value");
     require(nine.has_value() && as_string(*nine) == "nine", "rewritten data should preserve WAL value");
+}
+
+void test_inspect_format_reports_key_type_counts() {
+    TestDir dir("inspect_counts");
+    const std::string db_path = dir.file("store.dat");
+    const std::vector<uint8_t> binary_snapshot_key = {0x10, 0x20, 0x30};
+    const std::vector<uint8_t> binary_wal_key = {0x00, 0x01};
+
+    {
+        KVStore store(db_path);
+        store.Put(1, text("int-snapshot"));
+        store.Put(std::string("alpha"), text("string-snapshot"));
+        store.Put(binary_snapshot_key, text("binary-snapshot"));
+        store.Compact();
+        store.Put(std::string("beta"), text("string-wal"));
+        store.Put(binary_wal_key, text("binary-wal"));
+        store.Delete(1);
+    }
+
+    const auto values = capture_inspect_format(db_path);
+    require(values.at("snapshot_version") == "2", "inspect-format should report v2 snapshot");
+    require(values.at("snapshot_entries") == "3", "inspect-format should count compacted snapshot entries");
+    require(values.at("snapshot_int_keys") == "1", "inspect-format should count int snapshot keys");
+    require(values.at("snapshot_string_keys") == "1", "inspect-format should count string snapshot keys");
+    require(values.at("snapshot_binary_keys") == "1", "inspect-format should count binary snapshot keys");
+    require(values.at("wal_version") == "2", "inspect-format should report v2 WAL");
+    require(values.at("wal_records") == "3", "inspect-format should count WAL records after compaction");
+    require(values.at("wal_put_records") == "2", "inspect-format should count WAL puts");
+    require(values.at("wal_delete_records") == "1", "inspect-format should count WAL deletes");
+    require(values.at("wal_int_keys") == "1", "inspect-format should count int WAL keys");
+    require(values.at("wal_string_keys") == "1", "inspect-format should count string WAL keys");
+    require(values.at("wal_binary_keys") == "1", "inspect-format should count binary WAL keys");
+    require(values.at("rewrite_recommended") == "0", "current-format data should not require rewrite");
+}
+
+void test_inspect_format_recommends_rewrite_for_legacy_v1() {
+    TestDir dir("inspect_legacy_v1");
+    const std::string db_path = dir.file("store.dat");
+    const std::string wal_path = db_path + ".wal";
+
+    write_legacy_snapshot_v1(db_path, {
+        {1, text("legacy-one")},
+        {2, text("legacy-two")},
+    });
+    append_legacy_wal_record_v1(wal_path, 1, 3, text("legacy-three"));
+    append_legacy_wal_record_v1(wal_path, 2, 2, Value {});
+
+    const auto values = capture_inspect_format(db_path);
+    require(values.at("snapshot_version") == "1", "inspect-format should report legacy snapshot version");
+    require(values.at("snapshot_entries") == "2", "inspect-format should count legacy snapshot entries");
+    require(values.at("snapshot_int_keys") == "2", "legacy snapshots should be recognized as int keys");
+    require(values.at("wal_version") == "1", "inspect-format should report legacy WAL version");
+    require(values.at("wal_records") == "2", "inspect-format should count legacy WAL records");
+    require(values.at("wal_int_keys") == "2", "legacy WAL records should be recognized as int keys");
+    require(values.at("rewrite_recommended") == "1", "legacy data should recommend rewrite");
 }
 
 void test_ordering_and_updates() {
@@ -2022,6 +2319,8 @@ int main(int argc, char* argv[]) {
         {"recovery from WAL without compaction", test_recovery_from_wal_without_compaction},
         {"legacy v1 snapshot and wal are readable", test_legacy_v1_snapshot_and_wal_are_readable},
         {"legacy v1 rewrite upgrades snapshot to v2", test_legacy_v1_rewrite_upgrades_snapshot_to_v2},
+        {"inspect format reports key type counts", test_inspect_format_reports_key_type_counts},
+        {"inspect format recommends rewrite for legacy v1", test_inspect_format_recommends_rewrite_for_legacy_v1},
         {"ordering and updates", test_ordering_and_updates},
         {"compaction persists snapshot and resets WAL", test_compaction_persists_snapshot_and_resets_wal},
         {"truncated WAL tail is ignored", test_truncated_wal_tail_is_ignored},

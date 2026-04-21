@@ -13,8 +13,8 @@
 
 ### 2. File Format and Compatibility
 
-- 缺少明确的磁盘格式规范。
-- 缺少版本升级、兼容检查和迁移工具。
+- 已有磁盘格式规范、版本检查、迁移工具和 richer `inspect-format` 输出。
+- 还缺少更完整的跨版本兼容策略和迁移矩阵。
 
 ### 3. Reliability Validation
 
