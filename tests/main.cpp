@@ -97,12 +97,6 @@ using test_support::require;
 using test_support::TestDir;
 using test_support::text;
 
-void write_text_file(const std::string& path, const std::string& contents) {
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    require(out.is_open(), "Expected text file to be writable");
-    out << contents;
-}
-
 std::string read_text_file(const std::string& path) {
     std::ifstream in(path, std::ios::binary);
     require(in.is_open(), "Expected text file to be readable");
@@ -159,26 +153,6 @@ std::pair<int, std::string> capture_verify_format(const std::string& db_path) {
     std::ostringstream out;
     auto* original = std::cout.rdbuf(out.rdbuf());
     const int status = run_verify_format_impl(db_path);
-    std::cout.rdbuf(original);
-    return {status, out.str()};
-}
-
-std::pair<int, std::map<std::string, std::string>> capture_benchmark_trend(
-    const std::string& directory_path,
-    size_t recent_window = 5) {
-    std::ostringstream out;
-    auto* original = std::cout.rdbuf(out.rdbuf());
-    const int status = run_benchmark_trend(directory_path, recent_window);
-    std::cout.rdbuf(original);
-    return {status, parse_kv_line(out.str())};
-}
-
-std::pair<int, std::string> capture_benchmark_trend_json(
-    const std::string& directory_path,
-    size_t recent_window = 5) {
-    std::ostringstream out;
-    auto* original = std::cout.rdbuf(out.rdbuf());
-    const int status = run_benchmark_trend_json(directory_path, recent_window);
     std::cout.rdbuf(original);
     return {status, out.str()};
 }
@@ -1815,37 +1789,6 @@ void test_microbench_json_reports_cases() {
             "microbench json should include the rewrite case");
 }
 
-void test_benchmark_trend_json_reports_recent_window() {
-    TestDir dir("benchmark_trend_json");
-    const std::string baseline_dir = dir.file("baselines");
-    std::filesystem::create_directories(baseline_dir);
-
-    BenchmarkResult early;
-    early.config = make_benchmark_config("early", 1, 1, 100, 64);
-    early.write_ops_per_s = 1000.0;
-    early.read_ops_per_s = 2000.0;
-    early.avg_write_latency_us = 100.0;
-
-    BenchmarkResult latest = early;
-    latest.config.label = "latest";
-    latest.write_ops_per_s = 1200.0;
-    latest.read_ops_per_s = 2100.0;
-    latest.avg_write_latency_us = 90.0;
-
-    write_text_file((std::filesystem::path(baseline_dir) / "20260101T000000.json").string(), BenchmarkResultToJson(early));
-    write_text_file((std::filesystem::path(baseline_dir) / "20260102T000000.json").string(), BenchmarkResultToJson(latest));
-
-    const auto [status, json] = capture_benchmark_trend_json(baseline_dir, 2);
-    require(status == 0, "trend-baselines-json should succeed for non-empty baseline directories");
-    require(json.find("\"recent_window_count\":2") != std::string::npos,
-            "trend json should include the recent window count");
-    require(extract_json_number(json, "latest_vs_recent_avg_write_ratio_pct") > 109.0 &&
-                extract_json_number(json, "latest_vs_recent_avg_write_ratio_pct") < 109.1,
-            "trend json should include recent-window write ratios");
-    require(json.find("\"recent_write_trend\":\"improving\"") != std::string::npos,
-            "trend json should include recent trend classification");
-}
-
 void test_stress_summary_json_reports_profile() {
     StressSummary summary;
     summary.profile = "balanced";
@@ -1866,232 +1809,6 @@ void test_stress_summary_json_reports_profile() {
             "stress summary json should include queue metrics");
     require(json.find("\"recovery_reopen_cycles\":6") != std::string::npos,
             "stress summary json should include recovery reopen counts");
-}
-
-void test_compare_benchmark_baseline_passes_within_thresholds() {
-    TestDir dir("compare_baseline_pass");
-    const std::string baseline_path = dir.file("baseline.json");
-    const std::string candidate_path = dir.file("candidate.json");
-
-    BenchmarkResult baseline;
-    baseline.config = make_benchmark_config("baseline", 1, 1, 100, 64);
-    baseline.duration_s = 1.0;
-    baseline.writes = 1000;
-    baseline.reads = 2000;
-    baseline.write_ops_per_s = 1000.0;
-    baseline.read_ops_per_s = 2000.0;
-    baseline.avg_write_latency_us = 100.0;
-    baseline.metrics.approx_write_latency_p95_us = 1000;
-    baseline.metrics.approx_write_latency_p99_us = 1200;
-    baseline.metrics.observed_fsync_pressure_per_1000_writes = 200;
-    baseline.metrics.recent_batch_fill_per_1000 = 500;
-
-    BenchmarkResult candidate = baseline;
-    candidate.config.label = "candidate";
-    candidate.write_ops_per_s = 900.0;
-    candidate.read_ops_per_s = 1800.0;
-    candidate.avg_write_latency_us = 115.0;
-    candidate.metrics.approx_write_latency_p95_us = 1300;
-    candidate.metrics.approx_write_latency_p99_us = 1800;
-    candidate.metrics.observed_fsync_pressure_per_1000_writes = 250;
-    candidate.metrics.recent_batch_fill_per_1000 = 450;
-
-    write_text_file(baseline_path, BenchmarkResultToJson(baseline));
-    write_text_file(candidate_path, BenchmarkResultToJson(candidate));
-
-    const int status = run_compare_benchmark_baseline(baseline_path, candidate_path);
-    require(status == 0, "compare-baseline should pass when throughput and latency stay within thresholds");
-}
-
-void test_compare_benchmark_baseline_rejects_regression() {
-    TestDir dir("compare_baseline_fail");
-    const std::string baseline_path = dir.file("baseline.json");
-    const std::string candidate_path = dir.file("candidate.json");
-
-    BenchmarkResult baseline;
-    baseline.config = make_benchmark_config("baseline", 1, 1, 100, 64);
-    baseline.duration_s = 1.0;
-    baseline.writes = 1000;
-    baseline.reads = 2000;
-    baseline.write_ops_per_s = 1000.0;
-    baseline.read_ops_per_s = 2000.0;
-    baseline.avg_write_latency_us = 100.0;
-    baseline.metrics.approx_write_latency_p95_us = 1000;
-    baseline.metrics.approx_write_latency_p99_us = 1200;
-    baseline.metrics.observed_fsync_pressure_per_1000_writes = 200;
-    baseline.metrics.recent_batch_fill_per_1000 = 500;
-
-    BenchmarkResult candidate = baseline;
-    candidate.config.label = "candidate";
-    candidate.write_ops_per_s = 700.0;
-    candidate.read_ops_per_s = 1500.0;
-    candidate.avg_write_latency_us = 140.0;
-    candidate.metrics.approx_write_latency_p95_us = 1700;
-    candidate.metrics.approx_write_latency_p99_us = 2300;
-    candidate.metrics.observed_fsync_pressure_per_1000_writes = 400;
-    candidate.metrics.recent_batch_fill_per_1000 = 300;
-
-    write_text_file(baseline_path, BenchmarkResultToJson(baseline));
-    write_text_file(candidate_path, BenchmarkResultToJson(candidate));
-
-    const int status = run_compare_benchmark_baseline(baseline_path, candidate_path);
-    require(status == 2, "compare-baseline should reject throughput/latency regressions beyond thresholds");
-}
-
-void test_compare_microbench_passes_within_thresholds() {
-    TestDir dir("compare_microbench_pass");
-    const std::string baseline_path = dir.file("baseline.json");
-    const std::string candidate_path = dir.file("candidate.json");
-
-    const std::vector<MicrobenchCaseResult> baseline = {
-        {"wal_append", 1.0, 200.0, 500, 1000},
-        {"scan", 1.0, 1000.0, 250, 2000},
-        {"recovery", 1.0, 120.0, 25, 0},
-        {"compaction", 1.0, 30.0, 5, 4000},
-        {"rewrite", 1.0, 25.0, 5, 3000},
-    };
-    const std::vector<MicrobenchCaseResult> candidate = {
-        {"wal_append", 1.0, 170.0, 500, 1000},
-        {"scan", 1.0, 900.0, 250, 2000},
-        {"recovery", 1.0, 100.0, 25, 0},
-        {"compaction", 1.0, 24.0, 5, 4000},
-        {"rewrite", 1.0, 20.0, 5, 3000},
-    };
-
-    write_text_file(baseline_path, MicrobenchResultsToJson(baseline));
-    write_text_file(candidate_path, MicrobenchResultsToJson(candidate));
-    const int status = run_compare_microbench(baseline_path, candidate_path);
-    require(status == 0, "compare-microbench should pass when case ratios remain within thresholds");
-}
-
-void test_compare_microbench_rejects_regression() {
-    TestDir dir("compare_microbench_fail");
-    const std::string baseline_path = dir.file("baseline.json");
-    const std::string candidate_path = dir.file("candidate.json");
-
-    const std::vector<MicrobenchCaseResult> baseline = {
-        {"wal_append", 1.0, 200.0, 500, 1000},
-        {"scan", 1.0, 1000.0, 250, 2000},
-        {"recovery", 1.0, 120.0, 25, 0},
-        {"compaction", 1.0, 30.0, 5, 4000},
-        {"rewrite", 1.0, 25.0, 5, 3000},
-    };
-    const std::vector<MicrobenchCaseResult> candidate = {
-        {"wal_append", 1.0, 120.0, 500, 1000},
-        {"scan", 1.0, 700.0, 250, 2000},
-        {"recovery", 1.0, 80.0, 25, 0},
-        {"compaction", 1.0, 18.0, 5, 4000},
-        {"rewrite", 1.0, 15.0, 5, 3000},
-    };
-
-    write_text_file(baseline_path, MicrobenchResultsToJson(baseline));
-    write_text_file(candidate_path, MicrobenchResultsToJson(candidate));
-    const int status = run_compare_microbench(baseline_path, candidate_path);
-    require(status == 2, "compare-microbench should reject regressions beyond per-case thresholds");
-}
-
-void test_benchmark_trend_summarizes_history() {
-    TestDir dir("benchmark_trend");
-    const std::string baseline_dir = dir.file("baselines");
-    std::filesystem::create_directories(baseline_dir);
-
-    BenchmarkResult early;
-    early.config = make_benchmark_config("early", 1, 1, 100, 64);
-    early.write_ops_per_s = 1000.0;
-    early.read_ops_per_s = 2000.0;
-    early.avg_write_latency_us = 100.0;
-
-    BenchmarkResult middle = early;
-    middle.config.label = "middle";
-    middle.write_ops_per_s = 1100.0;
-    middle.read_ops_per_s = 1900.0;
-    middle.avg_write_latency_us = 90.0;
-
-    BenchmarkResult latest = early;
-    latest.config.label = "latest";
-    latest.write_ops_per_s = 1200.0;
-    latest.read_ops_per_s = 2200.0;
-    latest.avg_write_latency_us = 80.0;
-
-    write_text_file((std::filesystem::path(baseline_dir) / "20260101T000000.json").string(), BenchmarkResultToJson(early));
-    write_text_file((std::filesystem::path(baseline_dir) / "20260102T000000.json").string(), BenchmarkResultToJson(middle));
-    write_text_file((std::filesystem::path(baseline_dir) / "20260103T000000.json").string(), BenchmarkResultToJson(latest));
-
-    const auto [status, values] = capture_benchmark_trend(baseline_dir, 2);
-    require(status == 0, "benchmark trend should succeed for non-empty baseline directory");
-    require(values.at("count") == "3", "benchmark trend should count all baseline files");
-    require(values.at("oldest_file") == "20260101T000000.json", "benchmark trend should report the oldest file");
-    require(values.at("latest_file") == "20260103T000000.json", "benchmark trend should report the latest file");
-    require(values.at("recent_window_count") == "2", "benchmark trend should report the applied recent window size");
-    require(std::stod(values.at("avg_write_ops_per_s")) > 1099.0 &&
-                std::stod(values.at("avg_write_ops_per_s")) < 1101.0,
-            "benchmark trend should report the average write throughput");
-    require(std::stod(values.at("recent_avg_write_ops_per_s")) > 1149.0 &&
-                std::stod(values.at("recent_avg_write_ops_per_s")) < 1151.0,
-            "benchmark trend should report the recent-window average write throughput");
-    require(std::stod(values.at("latest_vs_oldest_write_ratio_pct")) > 119.9 &&
-                std::stod(values.at("latest_vs_oldest_write_ratio_pct")) < 120.1,
-            "benchmark trend should report latest-vs-oldest write throughput ratio");
-    require(std::stod(values.at("latest_vs_recent_avg_write_ratio_pct")) > 104.2 &&
-                std::stod(values.at("latest_vs_recent_avg_write_ratio_pct")) < 104.4,
-            "benchmark trend should report latest-vs-recent-average write throughput ratio");
-    require(values.at("write_trend") == "improving",
-            "benchmark trend should classify higher write throughput as improving");
-    require(values.at("recent_write_trend") == "stable",
-            "benchmark trend should classify small recent throughput differences as stable");
-    require(values.at("read_trend") == "improving",
-            "benchmark trend should classify higher read throughput as improving");
-    require(values.at("recent_read_trend") == "improving",
-            "benchmark trend should classify recent read throughput against the recent window");
-    require(std::stod(values.at("latest_vs_oldest_latency_ratio_pct")) > 79.9 &&
-                std::stod(values.at("latest_vs_oldest_latency_ratio_pct")) < 80.1,
-            "benchmark trend should report latest-vs-oldest latency ratio");
-    require(std::stod(values.at("latest_vs_recent_avg_latency_ratio_pct")) > 94.0 &&
-                std::stod(values.at("latest_vs_recent_avg_latency_ratio_pct")) < 94.2,
-            "benchmark trend should report latest-vs-recent-average latency ratio");
-    require(values.at("latency_trend") == "improving",
-            "benchmark trend should classify lower latency as improving");
-    require(values.at("recent_latency_trend") == "improving",
-            "benchmark trend should classify lower recent latency as improving");
-}
-
-void test_microbench_trend_summarizes_history() {
-    TestDir dir("microbench_trend");
-    const std::string baseline_dir = dir.file("baselines");
-    std::filesystem::create_directories(baseline_dir);
-
-    write_text_file(
-        (std::filesystem::path(baseline_dir) / "microbench-20260101T000000.json").string(),
-        MicrobenchResultsToJson({
-            {"wal_append", 1.0, 100.0, 500, 1},
-            {"compaction", 1.0, 20.0, 5, 1},
-        }));
-    write_text_file(
-        (std::filesystem::path(baseline_dir) / "microbench-20260102T000000.json").string(),
-        MicrobenchResultsToJson({
-            {"wal_append", 1.0, 110.0, 500, 1},
-            {"compaction", 1.0, 18.0, 5, 1},
-        }));
-    write_text_file(
-        (std::filesystem::path(baseline_dir) / "microbench-20260103T000000.json").string(),
-        MicrobenchResultsToJson({
-            {"wal_append", 1.0, 120.0, 500, 1},
-            {"compaction", 1.0, 25.0, 5, 1},
-        }));
-
-    std::ostringstream out;
-    auto* original = std::cout.rdbuf(out.rdbuf());
-    const int status = run_microbench_trend_json(baseline_dir, 2);
-    std::cout.rdbuf(original);
-
-    require(status == 0, "microbench trend json should succeed for non-empty directories");
-    const std::string json = out.str();
-    require(json.find("\"name\":\"wal_append\"") != std::string::npos,
-            "microbench trend json should include the wal_append case");
-    require(json.find("\"name\":\"compaction\"") != std::string::npos,
-            "microbench trend json should include the compaction case");
-    require(json.find("\"trend\":\"improving\"") != std::string::npos,
-            "microbench trend json should classify improving throughput");
 }
 
 void test_internal_format_helpers_round_trip_keys() {
@@ -3026,6 +2743,56 @@ int run_compatibility_matrix() {
     return run_compatibility_matrix_impl();
 }
 
+int run_compare_benchmark_baseline_entrypoint(
+    const std::string& baseline_path,
+    const std::string& candidate_path,
+    double min_write_ratio_pct,
+    double min_read_ratio_pct,
+    double max_latency_ratio_pct,
+    double max_p95_latency_ratio_pct,
+    double max_p99_latency_ratio_pct,
+    double max_fsync_pressure_ratio_pct,
+    double min_batch_fill_ratio_pct) {
+    return run_compare_benchmark_baseline(
+        baseline_path,
+        candidate_path,
+        min_write_ratio_pct,
+        min_read_ratio_pct,
+        max_latency_ratio_pct,
+        max_p95_latency_ratio_pct,
+        max_p99_latency_ratio_pct,
+        max_fsync_pressure_ratio_pct,
+        min_batch_fill_ratio_pct);
+}
+
+int run_compare_microbench_entrypoint(
+    const std::string& baseline_path,
+    const std::string& candidate_path,
+    double min_ops_ratio_pct,
+    double min_compaction_ratio_pct,
+    double min_rewrite_ratio_pct,
+    double min_recovery_ratio_pct) {
+    return run_compare_microbench(
+        baseline_path,
+        candidate_path,
+        min_ops_ratio_pct,
+        min_compaction_ratio_pct,
+        min_rewrite_ratio_pct,
+        min_recovery_ratio_pct);
+}
+
+int run_benchmark_trend_entrypoint(const std::string& directory_path, size_t recent_window) {
+    return run_benchmark_trend(directory_path, recent_window);
+}
+
+int run_benchmark_trend_json_entrypoint(const std::string& directory_path, size_t recent_window) {
+    return run_benchmark_trend_json(directory_path, recent_window);
+}
+
+int run_microbench_trend_json_entrypoint(const std::string& directory_path, size_t recent_window) {
+    return run_microbench_trend_json(directory_path, recent_window);
+}
+
 int main(int argc, char* argv[]) {
     g_program_path = std::filesystem::absolute(argv[0]).string();
     if (argc > 1) {
@@ -3187,19 +2954,13 @@ int main(int argc, char* argv[]) {
 
     kvstore::tests::integration::TestCases tests;
     kvstore::tests::integration::register_basic_kv_tests(tests);
+    kvstore::tests::integration::register_benchmark_trend_tests(tests);
     kvstore::tests::integration::register_metrics_controller_tests(tests);
     kvstore::tests::integration::register_recovery_format_tests(tests);
     const std::vector<test_support::NamedTest> remaining_tests = {
         {"benchmark result json reports summary and metrics", test_benchmark_result_json_reports_summary_and_metrics},
         {"microbench json reports cases", test_microbench_json_reports_cases},
-        {"benchmark trend json reports recent window", test_benchmark_trend_json_reports_recent_window},
         {"stress summary json reports profile", test_stress_summary_json_reports_profile},
-        {"compare microbench passes within thresholds", test_compare_microbench_passes_within_thresholds},
-        {"compare microbench rejects regression", test_compare_microbench_rejects_regression},
-        {"compare benchmark baseline passes within thresholds", test_compare_benchmark_baseline_passes_within_thresholds},
-        {"compare benchmark baseline rejects regression", test_compare_benchmark_baseline_rejects_regression},
-        {"benchmark trend summarizes history", test_benchmark_trend_summarizes_history},
-        {"microbench trend summarizes history", test_microbench_trend_summarizes_history},
         {"internal format helpers round trip keys", test_internal_format_helpers_round_trip_keys},
         {"internal format helpers checksum distinguishes payloads", test_internal_format_helpers_checksum_distinguishes_payloads},
         {"internal metrics helpers compute percentiles and ratios", test_internal_metrics_helpers_compute_percentiles_and_ratios},

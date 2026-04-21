@@ -69,6 +69,7 @@ kvstore_apply_coverage(kvstore)
 add_executable(kv_test
     tests/common/test_support.cpp
     tests/integration/basic_kv_tests.cpp
+    tests/integration/benchmark_trend_tests.cpp
     tests/integration/metrics_controller_tests.cpp
     tests/integration/recovery_format_tests.cpp
     tests/main.cpp

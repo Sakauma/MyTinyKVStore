@@ -65,6 +65,7 @@ Current status:
 - 已补 request runtime、writer wait、writer execution、wal accounting 的 module-level tests。
 - 已引入 `tests/common/test_support.*`，开始把重复测试辅助从单体 `tests/main.cpp` 中抽出。
 - 已将第一批基础 integration tests 提炼到 `tests/integration/basic_kv_tests.cpp`，`kv_test` 现在开始由 registry 聚合分散的 integration slices，而不是只依赖单个 `tests/main.cpp`。
+- 已将 benchmark trend / baseline regression integration tests 提炼到 `tests/integration/benchmark_trend_tests.cpp`，并补上可复用的 benchmark entrypoint 头来复用 compare/trend CLI 逻辑。
 - 已将第二批 metrics/controller integration tests 提炼到 `tests/integration/metrics_controller_tests.cpp`，`tests/main.cpp` 进一步收缩为 CLI 入口与未拆分 integration glue。
 - 已将第三批 recovery/format migration integration tests 提炼到 `tests/integration/recovery_format_tests.cpp`，并补上可复用的 CLI entrypoint 头以支撑跨文件复用格式检查命令。
 

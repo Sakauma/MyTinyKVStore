@@ -10,6 +10,7 @@ namespace kvstore::tests::integration {
 using TestCases = std::vector<test_support::NamedTest>;
 
 void register_basic_kv_tests(TestCases& tests);
+void register_benchmark_trend_tests(TestCases& tests);
 void register_metrics_controller_tests(TestCases& tests);
 void register_recovery_format_tests(TestCases& tests);
 
