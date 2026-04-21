@@ -19,9 +19,11 @@
 - `bash scripts/bench-baseline.sh`：运行 baseline benchmark，并把 JSON 落到 `benchmarks/baselines/<timestamp>.json`。
 - `./build/target/bin/kv_test compare-baseline <baseline_json> <candidate_json> [min_write_ratio_pct min_read_ratio_pct max_latency_ratio_pct]`：比较两份 baseline。
 - `./build/target/bin/kv_test trend-baselines <baseline_dir> [recent_window]`：汇总一组 baseline 的长期趋势，并额外计算最近 N 次均值。
+- `./build/target/bin/kv_test trend-baselines-json <baseline_dir> [recent_window]`：输出结构化趋势 JSON。
 - `bash scripts/bench-regression-check.sh <baseline_json>`：生成 candidate baseline，并按默认阈值执行回归检查。
 - `bash scripts/ci-bench-regression.sh`：使用仓库提交的 `benchmarks/reference/ci-floor.json` 作为 CI floor。
 - `bash scripts/bench-trend.sh [baseline_dir] [recent_window]`：对一组历史 baseline 输出趋势摘要。
+- `bash scripts/collect-artifacts.sh [output_dir] [baseline_dir] [recent_window]`：把 `microbench`、`stressbench baseline`、趋势摘要和兼容矩阵统一落成 artifact 文件。
 
 ## JSON Shape
 

@@ -86,6 +86,7 @@ int run_inspect_format(const std::string& db_path);
 int run_verify_format(const std::string& db_path);
 double extract_json_number(const std::string& json, const std::string& key);
 int run_benchmark_trend(const std::string& directory_path, size_t recent_window);
+int run_benchmark_trend_json(const std::string& directory_path, size_t recent_window);
 
 Value text(const std::string& input) {
     return Value(std::vector<uint8_t>(input.begin(), input.end()));
@@ -233,6 +234,16 @@ std::pair<int, std::map<std::string, std::string>> capture_benchmark_trend(
     return {status, parse_kv_line(out.str())};
 }
 
+std::pair<int, std::string> capture_benchmark_trend_json(
+    const std::string& directory_path,
+    size_t recent_window = 5) {
+    std::ostringstream out;
+    auto* original = std::cout.rdbuf(out.rdbuf());
+    const int status = run_benchmark_trend_json(directory_path, recent_window);
+    std::cout.rdbuf(original);
+    return {status, out.str()};
+}
+
 struct BenchmarkConfig {
     std::string label;
     int writer_count = 8;
@@ -267,6 +278,39 @@ struct BaselineSummary {
     double read_ops_per_s = 0.0;
     double avg_write_latency_us = 0.0;
 };
+
+struct TrendSummary {
+    size_t count = 0;
+    std::string oldest_file;
+    std::string latest_file;
+    size_t recent_window_count = 0;
+    double avg_write_ops_per_s = 0.0;
+    double min_write_ops_per_s = 0.0;
+    double max_write_ops_per_s = 0.0;
+    double recent_avg_write_ops_per_s = 0.0;
+    double avg_read_ops_per_s = 0.0;
+    double min_read_ops_per_s = 0.0;
+    double max_read_ops_per_s = 0.0;
+    double recent_avg_read_ops_per_s = 0.0;
+    double avg_write_latency_us = 0.0;
+    double min_write_latency_us = 0.0;
+    double max_write_latency_us = 0.0;
+    double recent_avg_write_latency_us = 0.0;
+    double latest_vs_oldest_write_ratio_pct = 0.0;
+    std::string write_trend;
+    double latest_vs_recent_avg_write_ratio_pct = 0.0;
+    std::string recent_write_trend;
+    double latest_vs_oldest_read_ratio_pct = 0.0;
+    std::string read_trend;
+    double latest_vs_recent_avg_read_ratio_pct = 0.0;
+    std::string recent_read_trend;
+    double latest_vs_oldest_latency_ratio_pct = 0.0;
+    std::string latency_trend;
+    double latest_vs_recent_avg_latency_ratio_pct = 0.0;
+    std::string recent_latency_trend;
+};
+
+std::string TrendSummaryToJson(const TrendSummary& summary);
 
 BenchmarkConfig make_benchmark_config(
     std::string label,
@@ -1002,7 +1046,7 @@ std::string classify_latency_trend(double ratio_pct) {
     return "stable";
 }
 
-int run_benchmark_trend(const std::string& directory_path, size_t recent_window = 5) {
+TrendSummary collect_benchmark_trend_summary(const std::string& directory_path, size_t recent_window) {
     std::vector<std::filesystem::path> files;
     for (const auto& entry : std::filesystem::directory_iterator(directory_path)) {
         if (!entry.is_regular_file()) {
@@ -1016,13 +1060,13 @@ int run_benchmark_trend(const std::string& directory_path, size_t recent_window 
 
     std::sort(files.begin(), files.end());
     require(!files.empty(), "benchmark trend requires at least one baseline json file");
+    require(recent_window > 0, "benchmark trend recent window must be positive");
 
     std::vector<BaselineSummary> summaries;
     summaries.reserve(files.size());
     for (const auto& path : files) {
         summaries.push_back(load_baseline_summary(path));
     }
-    require(recent_window > 0, "benchmark trend recent window must be positive");
 
     const BaselineSummary& first = summaries.front();
     const BaselineSummary& latest = summaries.back();
@@ -1083,35 +1127,74 @@ int run_benchmark_trend(const std::string& directory_path, size_t recent_window 
     const std::string recent_read_trend = classify_throughput_trend(latest_vs_recent_avg_read_ratio_pct);
     const std::string recent_latency_trend = classify_latency_trend(latest_vs_recent_avg_latency_ratio_pct);
 
-    std::cout << "count=" << summaries.size()
-              << " oldest_file=" << first.file_name
-              << " latest_file=" << latest.file_name
-              << " recent_window_count=" << recent_count
-              << " avg_write_ops_per_s=" << avg_write_ops_per_s
-              << " min_write_ops_per_s=" << min_write_ops_per_s
-              << " max_write_ops_per_s=" << max_write_ops_per_s
-              << " recent_avg_write_ops_per_s=" << recent_avg_write_ops_per_s
-              << " avg_read_ops_per_s=" << avg_read_ops_per_s
-              << " min_read_ops_per_s=" << min_read_ops_per_s
-              << " max_read_ops_per_s=" << max_read_ops_per_s
-              << " recent_avg_read_ops_per_s=" << recent_avg_read_ops_per_s
-              << " avg_write_latency_us=" << avg_avg_write_latency_us
-              << " min_write_latency_us=" << min_avg_write_latency_us
-              << " max_write_latency_us=" << max_avg_write_latency_us
-              << " recent_avg_write_latency_us=" << recent_avg_write_latency_us
-              << " latest_vs_oldest_write_ratio_pct=" << latest_vs_first_write_ratio_pct
-              << " write_trend=" << write_trend
-              << " latest_vs_recent_avg_write_ratio_pct=" << latest_vs_recent_avg_write_ratio_pct
-              << " recent_write_trend=" << recent_write_trend
-              << " latest_vs_oldest_read_ratio_pct=" << latest_vs_first_read_ratio_pct
-              << " read_trend=" << read_trend
-              << " latest_vs_recent_avg_read_ratio_pct=" << latest_vs_recent_avg_read_ratio_pct
-              << " recent_read_trend=" << recent_read_trend
-              << " latest_vs_oldest_latency_ratio_pct=" << latest_vs_first_latency_ratio_pct
-              << " latency_trend=" << latency_trend
-              << " latest_vs_recent_avg_latency_ratio_pct=" << latest_vs_recent_avg_latency_ratio_pct
-              << " recent_latency_trend=" << recent_latency_trend
+    TrendSummary trend;
+    trend.count = summaries.size();
+    trend.oldest_file = first.file_name;
+    trend.latest_file = latest.file_name;
+    trend.recent_window_count = recent_count;
+    trend.avg_write_ops_per_s = avg_write_ops_per_s;
+    trend.min_write_ops_per_s = min_write_ops_per_s;
+    trend.max_write_ops_per_s = max_write_ops_per_s;
+    trend.recent_avg_write_ops_per_s = recent_avg_write_ops_per_s;
+    trend.avg_read_ops_per_s = avg_read_ops_per_s;
+    trend.min_read_ops_per_s = min_read_ops_per_s;
+    trend.max_read_ops_per_s = max_read_ops_per_s;
+    trend.recent_avg_read_ops_per_s = recent_avg_read_ops_per_s;
+    trend.avg_write_latency_us = avg_avg_write_latency_us;
+    trend.min_write_latency_us = min_avg_write_latency_us;
+    trend.max_write_latency_us = max_avg_write_latency_us;
+    trend.recent_avg_write_latency_us = recent_avg_write_latency_us;
+    trend.latest_vs_oldest_write_ratio_pct = latest_vs_first_write_ratio_pct;
+    trend.write_trend = write_trend;
+    trend.latest_vs_recent_avg_write_ratio_pct = latest_vs_recent_avg_write_ratio_pct;
+    trend.recent_write_trend = recent_write_trend;
+    trend.latest_vs_oldest_read_ratio_pct = latest_vs_first_read_ratio_pct;
+    trend.read_trend = read_trend;
+    trend.latest_vs_recent_avg_read_ratio_pct = latest_vs_recent_avg_read_ratio_pct;
+    trend.recent_read_trend = recent_read_trend;
+    trend.latest_vs_oldest_latency_ratio_pct = latest_vs_first_latency_ratio_pct;
+    trend.latency_trend = latency_trend;
+    trend.latest_vs_recent_avg_latency_ratio_pct = latest_vs_recent_avg_latency_ratio_pct;
+    trend.recent_latency_trend = recent_latency_trend;
+    return trend;
+}
+
+int run_benchmark_trend(const std::string& directory_path, size_t recent_window) {
+    const TrendSummary trend = collect_benchmark_trend_summary(directory_path, recent_window);
+    std::cout << "count=" << trend.count
+              << " oldest_file=" << trend.oldest_file
+              << " latest_file=" << trend.latest_file
+              << " recent_window_count=" << trend.recent_window_count
+              << " avg_write_ops_per_s=" << trend.avg_write_ops_per_s
+              << " min_write_ops_per_s=" << trend.min_write_ops_per_s
+              << " max_write_ops_per_s=" << trend.max_write_ops_per_s
+              << " recent_avg_write_ops_per_s=" << trend.recent_avg_write_ops_per_s
+              << " avg_read_ops_per_s=" << trend.avg_read_ops_per_s
+              << " min_read_ops_per_s=" << trend.min_read_ops_per_s
+              << " max_read_ops_per_s=" << trend.max_read_ops_per_s
+              << " recent_avg_read_ops_per_s=" << trend.recent_avg_read_ops_per_s
+              << " avg_write_latency_us=" << trend.avg_write_latency_us
+              << " min_write_latency_us=" << trend.min_write_latency_us
+              << " max_write_latency_us=" << trend.max_write_latency_us
+              << " recent_avg_write_latency_us=" << trend.recent_avg_write_latency_us
+              << " latest_vs_oldest_write_ratio_pct=" << trend.latest_vs_oldest_write_ratio_pct
+              << " write_trend=" << trend.write_trend
+              << " latest_vs_recent_avg_write_ratio_pct=" << trend.latest_vs_recent_avg_write_ratio_pct
+              << " recent_write_trend=" << trend.recent_write_trend
+              << " latest_vs_oldest_read_ratio_pct=" << trend.latest_vs_oldest_read_ratio_pct
+              << " read_trend=" << trend.read_trend
+              << " latest_vs_recent_avg_read_ratio_pct=" << trend.latest_vs_recent_avg_read_ratio_pct
+              << " recent_read_trend=" << trend.recent_read_trend
+              << " latest_vs_oldest_latency_ratio_pct=" << trend.latest_vs_oldest_latency_ratio_pct
+              << " latency_trend=" << trend.latency_trend
+              << " latest_vs_recent_avg_latency_ratio_pct=" << trend.latest_vs_recent_avg_latency_ratio_pct
+              << " recent_latency_trend=" << trend.recent_latency_trend
               << std::endl;
+    return 0;
+}
+
+int run_benchmark_trend_json(const std::string& directory_path, size_t recent_window) {
+    std::cout << TrendSummaryToJson(collect_benchmark_trend_summary(directory_path, recent_window)) << std::endl;
     return 0;
 }
 
@@ -1262,6 +1345,41 @@ std::string MicrobenchResultsToJson(const std::vector<MicrobenchCaseResult>& res
             << '}';
     }
     out << "]}";
+    return out.str();
+}
+
+std::string TrendSummaryToJson(const TrendSummary& summary) {
+    std::ostringstream out;
+    out << '{'
+        << "\"count\":" << summary.count
+        << ",\"oldest_file\":\"" << summary.oldest_file << "\""
+        << ",\"latest_file\":\"" << summary.latest_file << "\""
+        << ",\"recent_window_count\":" << summary.recent_window_count
+        << ",\"avg_write_ops_per_s\":" << summary.avg_write_ops_per_s
+        << ",\"min_write_ops_per_s\":" << summary.min_write_ops_per_s
+        << ",\"max_write_ops_per_s\":" << summary.max_write_ops_per_s
+        << ",\"recent_avg_write_ops_per_s\":" << summary.recent_avg_write_ops_per_s
+        << ",\"avg_read_ops_per_s\":" << summary.avg_read_ops_per_s
+        << ",\"min_read_ops_per_s\":" << summary.min_read_ops_per_s
+        << ",\"max_read_ops_per_s\":" << summary.max_read_ops_per_s
+        << ",\"recent_avg_read_ops_per_s\":" << summary.recent_avg_read_ops_per_s
+        << ",\"avg_write_latency_us\":" << summary.avg_write_latency_us
+        << ",\"min_write_latency_us\":" << summary.min_write_latency_us
+        << ",\"max_write_latency_us\":" << summary.max_write_latency_us
+        << ",\"recent_avg_write_latency_us\":" << summary.recent_avg_write_latency_us
+        << ",\"latest_vs_oldest_write_ratio_pct\":" << summary.latest_vs_oldest_write_ratio_pct
+        << ",\"write_trend\":\"" << summary.write_trend << "\""
+        << ",\"latest_vs_recent_avg_write_ratio_pct\":" << summary.latest_vs_recent_avg_write_ratio_pct
+        << ",\"recent_write_trend\":\"" << summary.recent_write_trend << "\""
+        << ",\"latest_vs_oldest_read_ratio_pct\":" << summary.latest_vs_oldest_read_ratio_pct
+        << ",\"read_trend\":\"" << summary.read_trend << "\""
+        << ",\"latest_vs_recent_avg_read_ratio_pct\":" << summary.latest_vs_recent_avg_read_ratio_pct
+        << ",\"recent_read_trend\":\"" << summary.recent_read_trend << "\""
+        << ",\"latest_vs_oldest_latency_ratio_pct\":" << summary.latest_vs_oldest_latency_ratio_pct
+        << ",\"latency_trend\":\"" << summary.latency_trend << "\""
+        << ",\"latest_vs_recent_avg_latency_ratio_pct\":" << summary.latest_vs_recent_avg_latency_ratio_pct
+        << ",\"recent_latency_trend\":\"" << summary.recent_latency_trend << "\""
+        << '}';
     return out.str();
 }
 
@@ -1884,6 +2002,37 @@ void test_microbench_json_reports_cases() {
             "microbench json should include the wal_append case");
     require(json.find("\"name\":\"scan\"") != std::string::npos,
             "microbench json should include the scan case");
+}
+
+void test_benchmark_trend_json_reports_recent_window() {
+    TestDir dir("benchmark_trend_json");
+    const std::string baseline_dir = dir.file("baselines");
+    std::filesystem::create_directories(baseline_dir);
+
+    BenchmarkResult early;
+    early.config = make_benchmark_config("early", 1, 1, 100, 64);
+    early.write_ops_per_s = 1000.0;
+    early.read_ops_per_s = 2000.0;
+    early.avg_write_latency_us = 100.0;
+
+    BenchmarkResult latest = early;
+    latest.config.label = "latest";
+    latest.write_ops_per_s = 1200.0;
+    latest.read_ops_per_s = 2100.0;
+    latest.avg_write_latency_us = 90.0;
+
+    write_text_file((std::filesystem::path(baseline_dir) / "20260101T000000.json").string(), BenchmarkResultToJson(early));
+    write_text_file((std::filesystem::path(baseline_dir) / "20260102T000000.json").string(), BenchmarkResultToJson(latest));
+
+    const auto [status, json] = capture_benchmark_trend_json(baseline_dir, 2);
+    require(status == 0, "trend-baselines-json should succeed for non-empty baseline directories");
+    require(json.find("\"recent_window_count\":2") != std::string::npos,
+            "trend json should include the recent window count");
+    require(extract_json_number(json, "latest_vs_recent_avg_write_ratio_pct") > 109.0 &&
+                extract_json_number(json, "latest_vs_recent_avg_write_ratio_pct") < 109.1,
+            "trend json should include recent-window write ratios");
+    require(json.find("\"recent_write_trend\":\"improving\"") != std::string::npos,
+            "trend json should include recent trend classification");
 }
 
 void test_compare_benchmark_baseline_passes_within_thresholds() {
@@ -3667,6 +3816,14 @@ int main(int argc, char* argv[]) {
             const size_t recent_window = argc == 4 ? static_cast<size_t>(std::stoul(argv[3])) : 5;
             return run_benchmark_trend(argv[2], recent_window);
         }
+        if (command == "trend-baselines-json") {
+            if (argc != 3 && argc != 4) {
+                std::cerr << "Usage: kv_test trend-baselines-json <baseline_dir> [recent_window_count]" << std::endl;
+                return 1;
+            }
+            const size_t recent_window = argc == 4 ? static_cast<size_t>(std::stoul(argv[3])) : 5;
+            return run_benchmark_trend_json(argv[2], recent_window);
+        }
         if (command == "profile-json") {
             if (argc != 3) {
                 std::cerr << "Usage: kv_test profile-json <balanced|write-heavy|read-heavy|low-latency>" << std::endl;
@@ -3728,7 +3885,7 @@ int main(int argc, char* argv[]) {
             return run_fault_injection_scenario(argv[2], argv[3]);
         }
         std::cerr << "Unknown command: " << command << '\n';
-        std::cerr << "Usage: kv_test [bench|microbench|microbench-json|bench-json|bench-baseline-json|compare-baseline|trend-baselines|profile-json|soak|concurrency-stress|inspect-format|rewrite-format|verify-format|compat-matrix|fault-inject]" << std::endl;
+        std::cerr << "Usage: kv_test [bench|microbench|microbench-json|bench-json|bench-baseline-json|compare-baseline|trend-baselines|trend-baselines-json|profile-json|soak|concurrency-stress|inspect-format|rewrite-format|verify-format|compat-matrix|fault-inject]" << std::endl;
         return 1;
     }
 
@@ -3753,6 +3910,7 @@ int main(int argc, char* argv[]) {
         {"compatibility matrix command succeeds", test_compatibility_matrix_command_succeeds},
         {"benchmark result json reports summary and metrics", test_benchmark_result_json_reports_summary_and_metrics},
         {"microbench json reports cases", test_microbench_json_reports_cases},
+        {"benchmark trend json reports recent window", test_benchmark_trend_json_reports_recent_window},
         {"compare benchmark baseline passes within thresholds", test_compare_benchmark_baseline_passes_within_thresholds},
         {"compare benchmark baseline rejects regression", test_compare_benchmark_baseline_rejects_regression},
         {"benchmark trend summarizes history", test_benchmark_trend_summarizes_history},

@@ -157,6 +157,7 @@ cd build && ctest --output-on-failure
 - `bash scripts/bench-regression-check.sh <baseline_json>`：生成新的 candidate baseline，并按默认阈值与参考基线比较。
 - `bash scripts/ci-bench-regression.sh`：使用仓库内的 CI 参考 baseline 执行回归门槛检查。
 - `bash scripts/bench-trend.sh [baseline_dir] [recent_window]`：汇总一组历史 baseline，输出 oldest/latest 和 recent-window 两种视角的趋势摘要。
+- `bash scripts/collect-artifacts.sh [output_dir] [baseline_dir] [recent_window]`：统一落盘 `microbench`、`stressbench baseline`、`trend summary` 和 `compatibility matrix` artifact。
 - `bash scripts/soak.sh 10 [balanced|write-heavy|read-heavy]`：运行带 compaction 的 soak test，并在结束后重启校验数据一致性。
 - `bash scripts/concurrency-stress.sh 10 [balanced|write-heavy|compaction-heavy]`：运行更激进的并发 stress，混合 `Put`、`Delete`、`WriteBatch`、并发 `Get`、metrics 观测和多轮 compaction，并在结束后重启校验。
 - `bash scripts/inspect-format.sh <db_path>`：检查快照和 WAL 的格式版本、记录数量、键类型分布，以及是否建议重写迁移。
@@ -172,6 +173,7 @@ cd build && ctest --output-on-failure
 若需要可归档的 benchmark 基线，可调用 `kv_test bench-baseline-json` 或 `bash scripts/bench-baseline.sh`。
 若需要自动判断是否出现明显退化，可调用 `kv_test compare-baseline ...` 或 `bash scripts/bench-regression-check.sh ...`。
 若需要查看一段时间内的趋势，可调用 `kv_test trend-baselines <dir> [recent_window]` 或 `bash scripts/bench-trend.sh ...`。
+若需要结构化趋势 artifact，可调用 `kv_test trend-baselines-json <dir> [recent_window]`。
 趋势摘要现在会同时输出 oldest/latest 和 recent-window 两种视角，并带上 `write_trend` / `read_trend` / `latency_trend` 与对应的 `recent_*_trend`，方便直接归档“改善 / 持平 / 退化”结论。
 当前 regression gate 除了 `write/read throughput` 和平均写延迟外，也会检查 `p95/p99`、`fsync` 压力和 batch fill。
 若需要推荐配置模板，可调用 `kv_test profile-json <name>` 或 `RecommendedOptions(...)`。

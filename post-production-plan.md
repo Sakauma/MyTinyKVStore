@@ -107,6 +107,9 @@ Exit criteria:
 - 将 stress、compatibility、baseline、trend 结果收敛成稳定 artifact 文件。
 - 为后续 CI 历史归档或外部可视化留接口。
 
+Current status:
+- 进行中。趋势摘要已具备 JSON 输出，artifact 收集脚本会把 `microbench`、`stressbench baseline`、`trend summary` 和 `compatibility matrix` 统一落盘。
+
 Exit criteria:
 - 长期运行结果不是只出现在终端，而是能被后续流程消费。
 
