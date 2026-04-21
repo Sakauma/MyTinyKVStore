@@ -139,6 +139,7 @@ cmake --build build
 ### 运行测试
 
 ```bash
+./build/target/bin/kv_unit_test
 ./build/target/bin/kv_test
 cd build && ctest --output-on-failure
 ./target/bin/kv_test bench
@@ -148,6 +149,8 @@ cd build && ctest --output-on-failure
 
 仓库内还提供了几个标准化脚本：
 
+- `build/target/bin/kv_unit_test`：运行 internal/module 级 unit tests。
+- `build/target/bin/kv_test`：运行 integration suite，或使用下方 CLI 子命令。
 - `bash scripts/ci-build.sh`：执行常规构建、测试和 `ctest`。
 - `bash scripts/ci-sanitizers.sh`：分别执行 ASan 和 UBSan 构建与测试。
 - `bash scripts/coverage.sh`：执行 coverage 构建与测试；若本地安装了 `gcovr`，会直接打印 coverage 摘要。

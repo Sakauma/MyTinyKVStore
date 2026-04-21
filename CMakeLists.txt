@@ -54,8 +54,11 @@ add_library(kvstore SHARED
     src/internal/observability.cpp
     src/internal/recent_metrics.cpp
     src/internal/recovery.cpp
+    src/internal/request_runtime.cpp
     src/internal/wal_accounting.cpp
+    src/internal/writer_execution.cpp
     src/internal/writer_policy.cpp
+    src/internal/writer_wait.cpp
 )
 target_include_directories(kvstore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(kvstore PRIVATE Threads::Threads)
@@ -63,14 +66,32 @@ target_compile_options(kvstore PRIVATE -g -Wall -Wextra -Wpedantic)
 kvstore_apply_sanitizers(kvstore)
 kvstore_apply_coverage(kvstore)
 
-add_executable(kv_test tests/main.cpp)
-target_include_directories(kv_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_executable(kv_test
+    tests/common/test_support.cpp
+    tests/main.cpp
+)
+target_include_directories(kv_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(kv_test PRIVATE kvstore Threads::Threads)
 target_compile_options(kv_test PRIVATE -g -Wall -Wextra -Wpedantic)
 kvstore_apply_sanitizers(kv_test)
 kvstore_apply_coverage(kv_test)
 
+add_executable(kv_unit_test
+    tests/common/test_support.cpp
+    tests/unit/request_runtime_test.cpp
+    tests/unit/unit_main.cpp
+    tests/unit/wal_accounting_test.cpp
+    tests/unit/writer_execution_test.cpp
+    tests/unit/writer_wait_test.cpp
+)
+target_include_directories(kv_unit_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(kv_unit_test PRIVATE kvstore Threads::Threads)
+target_compile_options(kv_unit_test PRIVATE -g -Wall -Wextra -Wpedantic)
+kvstore_apply_sanitizers(kv_unit_test)
+kvstore_apply_coverage(kv_unit_test)
+
 enable_testing()
+add_test(NAME kv_unit_test COMMAND kv_unit_test)
 add_test(NAME kv_test COMMAND kv_test)
 
 install(TARGETS kv_test DESTINATION target/bin)

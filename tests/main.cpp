@@ -1,6 +1,7 @@
 #include "kvstore.h"
 #include "internal/format.h"
 #include "internal/metrics_helpers.h"
+#include "tests/common/test_support.h"
 
 #include <algorithm>
 #include <atomic>
@@ -87,54 +88,12 @@ int run_verify_format(const std::string& db_path);
 double extract_json_number(const std::string& json, const std::string& key);
 int run_benchmark_trend(const std::string& directory_path, size_t recent_window);
 int run_benchmark_trend_json(const std::string& directory_path, size_t recent_window);
-
-Value text(const std::string& input) {
-    return Value(std::vector<uint8_t>(input.begin(), input.end()));
-}
-
-std::string as_string(const Value& value) {
-    return std::string(value.bytes.begin(), value.bytes.end());
-}
-
-void require(bool condition, const std::string& message) {
-    if (!condition) {
-        throw std::runtime_error(message);
-    }
-}
-
-class TestDir {
-public:
-    explicit TestDir(const std::string& name) {
-        static std::atomic<uint64_t> counter {0};
-        const uint64_t suffix = counter.fetch_add(1, std::memory_order_relaxed);
-        const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
-        path_ = std::filesystem::temp_directory_path() /
-                ("kvstore_" + name + "_" + std::to_string(::getpid()) + "_" +
-                 std::to_string(now_ns) + "_" + std::to_string(suffix));
-        std::filesystem::remove_all(path_);
-        std::filesystem::create_directories(path_);
-    }
-
-    ~TestDir() {
-        std::error_code ec;
-        std::filesystem::remove_all(path_, ec);
-    }
-
-    std::string file(const std::string& name) const {
-        return (path_ / name).string();
-    }
-
-private:
-    std::filesystem::path path_;
-};
-
-void append_bytes(const std::string& path, std::initializer_list<uint8_t> data) {
-    std::ofstream out(path, std::ios::binary | std::ios::app);
-    for (uint8_t byte : data) {
-        out.put(static_cast<char>(byte));
-    }
-}
+using test_support::append_bytes;
+using test_support::as_string;
+using test_support::file_size_or_zero;
+using test_support::require;
+using test_support::TestDir;
+using test_support::text;
 
 void flip_byte(const std::string& path, std::streamoff offset) {
     std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
@@ -164,12 +123,6 @@ std::string read_text_file(const std::string& path) {
     std::ostringstream out;
     out << in.rdbuf();
     return out.str();
-}
-
-uintmax_t file_size_or_zero(const std::string& path) {
-    std::error_code ec;
-    const auto size = std::filesystem::file_size(path, ec);
-    return ec ? 0 : size;
 }
 
 void classify_encoded_key(std::string_view encoded_key, FormatKeyStats& stats) {
@@ -435,29 +388,8 @@ void append_legacy_wal_record_v1(
     }
 }
 
-void wait_for_start(std::atomic<int>& ready, std::atomic<bool>& start_signal, int target_count) {
-    ready.fetch_add(1, std::memory_order_relaxed);
-    while (ready.load(std::memory_order_acquire) < target_count) {
-        std::this_thread::yield();
-    }
-    while (!start_signal.load(std::memory_order_acquire)) {
-        std::this_thread::yield();
-    }
-}
-
-template <typename Predicate>
-void wait_until(Predicate predicate, const std::string& failure_message, int timeout_ms = 2000) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    while (std::chrono::steady_clock::now() < deadline) {
-        if (predicate()) {
-            return;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    if (!predicate()) {
-        throw std::runtime_error(failure_message);
-    }
-}
+using test_support::wait_for_start;
+using test_support::wait_until;
 
 std::string g_program_path;
 

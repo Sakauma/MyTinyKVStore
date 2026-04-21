@@ -43,6 +43,7 @@ Current status:
 - 已将 WAL live/obsolete 字节计算与 auto-compaction 判定提炼到内部 wal-accounting 模块，主文件中的相关逻辑进一步收缩为状态读取。
 - 已将 recent-window 批次统计与 fsync 压力更新提炼到内部 recent-metrics 模块，写入后路径中的纯聚合逻辑继续从主文件剥离。
 - 已将写延迟直方图和近期 `p95` 更新提炼到内部 latency-metrics 模块，主文件中的写后统计路径继续简化。
+- 已新增 `request-runtime`、`writer-wait`、`writer-execution` 三个内部模块，`src/kvstore.cpp` 中的请求生命周期、queue wait 记账、batch 执行/compaction 主体已拆出到独立 helper。
 
 ## Phase 2: Refactor-Safe Test Harness
 
@@ -58,6 +59,11 @@ Current status:
 
 Exit criteria:
 - 端到端测试继续保留，但模块级测试能更快定位失败点。
+
+Current status:
+- 已完成第一轮分层。新增 `kv_unit_test`，当前 `ctest` 同时覆盖 `kv_unit_test` 与 `kv_test`。
+- 已补 request runtime、writer wait、writer execution、wal accounting 的 module-level tests。
+- 已引入 `tests/common/test_support.*`，开始把重复测试辅助从单体 `tests/main.cpp` 中抽出。
 
 ## Phase 3: Continuous Performance Governance
 

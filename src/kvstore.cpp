@@ -8,8 +8,11 @@
 #include "internal/observability.h"
 #include "internal/recent_metrics.h"
 #include "internal/recovery.h"
+#include "internal/request_runtime.h"
 #include "internal/wal_accounting.h"
+#include "internal/writer_execution.h"
 #include "internal/writer_policy.h"
+#include "internal/writer_wait.h"
 
 #include <algorithm>
 #include <atomic>
@@ -39,12 +42,6 @@ using namespace kvstore::internal;
 
 class KVStore::Impl {
 public:
-    struct BatchMutation {
-        WalRecordType type;
-        std::string key;
-        Value value;
-    };
-
     Impl(std::string db_path, KVStoreOptions options)
         : db_file_path_(std::move(db_path)),
           wal_file_path_(db_file_path_ + ".wal"),
@@ -62,8 +59,8 @@ public:
                 state_,
                 [this](const std::string& key, uint64_t record_size) { note_latest_wal_record(key, record_size); });
         }
-        wal_bytes_since_compaction_.store(current_wal_file_size(), std::memory_order_relaxed);
-        open_wal_for_append();
+        wal_bytes_since_compaction_.store(kvstore::internal::current_wal_file_size(wal_file_path_), std::memory_order_relaxed);
+        kvstore::internal::open_wal_for_append(wal_fd_, wal_file_path_);
         writer_thread_ = std::thread(&Impl::writer_loop, this);
     }
 
@@ -84,18 +81,18 @@ public:
         request->type = RequestType::kPut;
         request->key = key;
         request->value = std::move(value);
-        enqueue_and_wait(std::move(request));
+        kvstore::internal::enqueue_and_wait(request_runtime_state(), request);
     }
 
     void WriteBatch(const std::vector<BatchMutation>& operations) {
         auto request = std::make_shared<Request>();
         request->type = RequestType::kBatch;
         request->batch_operations = operations;
-        enqueue_and_wait(std::move(request));
+        kvstore::internal::enqueue_and_wait(request_runtime_state(), request);
     }
 
     std::optional<Value> Get(const std::string& key) {
-        throw_if_fatal();
+        kvstore::internal::throw_if_fatal(request_runtime_state());
         read_requests_.fetch_add(1, std::memory_order_relaxed);
         std::shared_lock<std::shared_mutex> lock(state_mutex_);
         auto it = state_.find(key);
@@ -109,7 +106,7 @@ public:
         auto request = std::make_shared<Request>();
         request->type = RequestType::kDelete;
         request->key = key;
-        enqueue_and_wait(std::move(request));
+        kvstore::internal::enqueue_and_wait(request_runtime_state(), request);
     }
 
     std::vector<std::pair<std::string, Value>> Scan(const std::string& start_key, const std::string& end_key) {
@@ -129,7 +126,7 @@ public:
     void Compact() {
         auto request = std::make_shared<Request>();
         request->type = RequestType::kCompact;
-        enqueue_and_wait(std::move(request));
+        kvstore::internal::enqueue_and_wait(request_runtime_state(), request);
     }
 
     KVStoreMetrics GetMetrics() {
@@ -195,25 +192,6 @@ public:
     }
 
 private:
-    enum class RequestType {
-        kPut,
-        kDelete,
-        kBatch,
-        kCompact,
-    };
-
-    struct Request {
-        RequestType type {};
-        std::string key;
-        Value value;
-        std::vector<BatchMutation> batch_operations;
-        std::chrono::steady_clock::time_point enqueue_time = std::chrono::steady_clock::now();
-        std::mutex done_mutex;
-        std::condition_variable done_cv;
-        bool done = false;
-        std::string error;
-    };
-
     static KVStoreOptions sanitize_options(KVStoreOptions options) {
         if (options.max_batch_size == 0) {
             options.max_batch_size = 1;
@@ -275,7 +253,7 @@ private:
 
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
-    std::deque<std::shared_ptr<Request>> request_queue_;
+    RequestQueue request_queue_;
     std::thread writer_thread_;
     int wal_fd_;
     std::atomic<uint64_t> wal_bytes_since_compaction_;
@@ -347,32 +325,29 @@ private:
     std::array<uint64_t, kWriteLatencyBucketCount> recent_latency_bucket_counts_ {};
     std::array<std::atomic<uint64_t>, kWriteLatencyBucketCount> write_latency_histogram_ {};
 
-    void enqueue_and_wait(std::shared_ptr<Request> request) {
-        throw_if_fatal();
-        {
-            std::lock_guard<std::mutex> lock(queue_mutex_);
-            throw_if_fatal_locked();
-            request_queue_.push_back(request);
-            update_atomic_max(max_pending_queue_depth_, request_queue_.size());
-                if (request->type == RequestType::kCompact) {
-                    compact_requests_.fetch_add(1, std::memory_order_relaxed);
-                } else {
-                    enqueued_write_requests_.fetch_add(1, std::memory_order_relaxed);
-                }
-        }
-        queue_cv_.notify_one();
+    RequestRuntimeState request_runtime_state() {
+        return RequestRuntimeState {
+            queue_mutex_,
+            queue_cv_,
+            request_queue_,
+            has_fatal_error_,
+            fatal_error_message_,
+            max_pending_queue_depth_,
+            compact_requests_,
+            enqueued_write_requests_,
+        };
+    }
 
-        std::unique_lock<std::mutex> done_lock(request->done_mutex);
-        request->done_cv.wait(done_lock, [&request] { return request->done; });
-        if (!request->error.empty()) {
-            throw KVStoreError(request->error);
-        }
+    RequestCompletionCallbacks request_completion_callbacks() {
+        return RequestCompletionCallbacks {
+            [this](const Request& request) { record_write_latency(request); },
+        };
     }
 
     void writer_loop() {
         while (true) {
-            std::vector<std::shared_ptr<Request>> write_batch;
-            std::shared_ptr<Request> compact_request;
+            std::vector<RequestPtr> write_batch;
+            RequestPtr compact_request;
             BatchPolicy batch_policy {
                 options_.max_batch_size,
                 options_.max_batch_wal_bytes,
@@ -397,7 +372,12 @@ private:
             {
                 std::unique_lock<std::mutex> lock(queue_mutex_);
                 if (request_queue_.empty() && !stop_) {
-                    wait_for_queue_activity(lock);
+                    kvstore::internal::wait_for_queue_activity(
+                        queue_cv_,
+                        writer_wait_events_,
+                        writer_wait_time_us_,
+                        lock,
+                        [this] { return stop_ || !request_queue_.empty(); });
                 }
                 if (stop_ && request_queue_.empty()) {
                     return;
@@ -407,7 +387,23 @@ private:
                     batch_policy = current_batch_policy_locked();
                     const auto deadline =
                         std::chrono::steady_clock::now() + std::chrono::microseconds(batch_policy.batch_delay_us);
-                    collect_write_batch(lock, batch_policy, write_batch, deadline);
+                    kvstore::internal::collect_write_batch(
+                        lock,
+                        request_queue_,
+                        stop_,
+                        batch_policy,
+                        deadline,
+                        [this](std::unique_lock<std::mutex>& wait_lock,
+                               const std::chrono::steady_clock::time_point& wait_deadline) {
+                            return kvstore::internal::wait_for_queue_activity_until(
+                                queue_cv_,
+                                writer_wait_events_,
+                                writer_wait_time_us_,
+                                wait_lock,
+                                wait_deadline,
+                                [this] { return stop_ || !request_queue_.empty(); });
+                        },
+                        write_batch);
                 }
 
                 if (write_batch.empty() && !request_queue_.empty() && request_queue_.front()->type == RequestType::kCompact) {
@@ -425,7 +421,50 @@ private:
                     last_objective_throughput_score_.store(batch_policy.objective_throughput_score, std::memory_order_relaxed);
                     last_objective_balance_score_.store(batch_policy.objective_balance_score, std::memory_order_relaxed);
                     last_objective_mode_.store(batch_policy.objective_mode, std::memory_order_relaxed);
-                    process_write_batch(write_batch);
+                    auto completion_callbacks = request_completion_callbacks();
+                    kvstore::internal::process_write_batch(write_batch, WriteBatchExecutionContext {
+                        wal_fd_,
+                        wal_file_path_,
+                        state_,
+                        state_mutex_,
+                        committed_write_requests_,
+                        committed_write_batches_,
+                        wal_fsync_calls_,
+                        wal_bytes_written_,
+                        wal_bytes_since_compaction_,
+                        last_committed_batch_size_,
+                        max_committed_batch_size_,
+                        last_committed_batch_wal_bytes_,
+                        max_committed_batch_wal_bytes_,
+                        last_effective_batch_delay_us_,
+                        min_effective_batch_delay_us_,
+                        max_effective_batch_delay_us_,
+                        observed_fsync_pressure_per_1000_writes_,
+                        current_batch_delay_us_,
+                        current_batch_queue_depth_,
+                        options_,
+                        read_requests_.load(std::memory_order_relaxed),
+                        last_total_read_requests_seen_,
+                        recent_batch_sizes_,
+                        recent_batch_queue_depths_,
+                        recent_batch_wal_bytes_,
+                        recent_batch_wal_bytes_sum_,
+                        recent_read_deltas_,
+                        recent_write_deltas_,
+                        recent_read_sum_,
+                        recent_write_sum_,
+                        recent_batch_size_sum_,
+                        recent_read_requests_,
+                        recent_write_requests_,
+                        recent_read_ratio_per_1000_ops_,
+                        recent_peak_queue_depth_,
+                        recent_avg_batch_size_,
+                        recent_batch_fill_per_1000_,
+                        recent_avg_batch_wal_bytes_,
+                        recent_window_batch_count_,
+                        completion_callbacks,
+                        [this](const std::string& key, uint64_t record_size) { note_latest_wal_record(key, record_size); },
+                    });
                     if (batch_policy.adaptive_batching) {
                         adaptive_batches_completed_.fetch_add(1, std::memory_order_relaxed);
                     }
@@ -456,28 +495,67 @@ private:
                     if (batch_policy.objective_throughput_score > 0) {
                         adaptive_objective_throughput_batches_completed_.fetch_add(1, std::memory_order_relaxed);
                     }
-                    maybe_auto_compact();
+                    kvstore::internal::maybe_auto_compact(AutoCompactionExecutionContext {
+                        options_,
+                        wal_bytes_since_compaction_,
+                        live_wal_bytes_since_compaction_,
+                        [this](const RequestPtr& request, bool is_auto_compaction) {
+                            auto completion_callbacks = request_completion_callbacks();
+                            kvstore::internal::process_compaction_request(request, is_auto_compaction, CompactionExecutionContext {
+                                wal_fd_,
+                                db_file_path_,
+                                wal_file_path_,
+                                state_,
+                                state_mutex_,
+                                wal_bytes_since_compaction_,
+                                live_wal_bytes_since_compaction_,
+                                latest_wal_record_bytes_,
+                                total_snapshot_bytes_written_,
+                                total_wal_bytes_reclaimed_by_compaction_,
+                                manual_compactions_completed_,
+                                auto_compactions_completed_,
+                                completion_callbacks,
+                            });
+                        },
+                    });
                     continue;
                 }
                 if (compact_request) {
-                    process_compaction_request(compact_request, false);
+                    auto completion_callbacks = request_completion_callbacks();
+                    kvstore::internal::process_compaction_request(compact_request, false, CompactionExecutionContext {
+                        wal_fd_,
+                        db_file_path_,
+                        wal_file_path_,
+                        state_,
+                        state_mutex_,
+                        wal_bytes_since_compaction_,
+                        live_wal_bytes_since_compaction_,
+                        latest_wal_record_bytes_,
+                        total_snapshot_bytes_written_,
+                        total_wal_bytes_reclaimed_by_compaction_,
+                        manual_compactions_completed_,
+                        auto_compactions_completed_,
+                        completion_callbacks,
+                    });
                 }
             } catch (const KVStoreError& error) {
+                auto completion_callbacks = request_completion_callbacks();
                 if (!write_batch.empty()) {
-                    fail_requests(write_batch, error.what());
+                    kvstore::internal::fail_requests(write_batch, error.what(), completion_callbacks);
                 } else if (compact_request) {
-                    complete_request(compact_request, error.what());
+                    kvstore::internal::complete_request(compact_request, error.what(), completion_callbacks);
                 }
-                enter_fatal_state(error.what());
+                kvstore::internal::enter_fatal_state(request_runtime_state(), error.what(), completion_callbacks);
                 return;
             } catch (const std::exception& error) {
                 const std::string message = std::string("Unexpected writer failure: ") + error.what();
+                auto completion_callbacks = request_completion_callbacks();
                 if (!write_batch.empty()) {
-                    fail_requests(write_batch, message);
+                    kvstore::internal::fail_requests(write_batch, message, completion_callbacks);
                 } else if (compact_request) {
-                    complete_request(compact_request, message);
+                    kvstore::internal::complete_request(compact_request, message, completion_callbacks);
                 }
-                enter_fatal_state(message);
+                kvstore::internal::enter_fatal_state(request_runtime_state(), message, completion_callbacks);
                 return;
             }
         }
@@ -497,173 +575,6 @@ private:
         return compute_batch_policy(options_, signals);
     }
 
-    void collect_write_batch(
-        std::unique_lock<std::mutex>& lock,
-        const BatchPolicy& batch_policy,
-        std::vector<std::shared_ptr<Request>>& write_batch,
-        const std::chrono::steady_clock::time_point& deadline) {
-        uint64_t batch_wal_bytes = 0;
-        while (write_batch.size() < batch_policy.max_batch_size) {
-            while (!request_queue_.empty() &&
-                   request_queue_.front()->type != RequestType::kCompact &&
-                   write_batch.size() < batch_policy.max_batch_size) {
-                const uint64_t next_request_bytes = wal_record_size_for_request(*request_queue_.front());
-                if (batch_policy.max_batch_wal_bytes > 0 &&
-                    !write_batch.empty() &&
-                    batch_wal_bytes + next_request_bytes > batch_policy.max_batch_wal_bytes) {
-                    break;
-                }
-                batch_wal_bytes += next_request_bytes;
-                write_batch.push_back(request_queue_.front());
-                request_queue_.pop_front();
-            }
-
-            if (write_batch.size() >= batch_policy.max_batch_size ||
-                (batch_policy.max_batch_wal_bytes > 0 && batch_wal_bytes >= batch_policy.max_batch_wal_bytes) ||
-                !request_queue_.empty() ||
-                batch_policy.batch_delay_us == 0) {
-                break;
-            }
-
-            if (wait_for_queue_activity_until(lock, deadline)) {
-                if (stop_ && request_queue_.empty()) {
-                    break;
-                }
-                continue;
-            }
-            break;
-        }
-    }
-
-    void wait_for_queue_activity(std::unique_lock<std::mutex>& lock) {
-        const auto wait_begin = std::chrono::steady_clock::now();
-        writer_wait_events_.fetch_add(1, std::memory_order_relaxed);
-        queue_cv_.wait(lock, [this] { return stop_ || !request_queue_.empty(); });
-        record_writer_wait(std::chrono::steady_clock::now() - wait_begin);
-    }
-
-    bool wait_for_queue_activity_until(
-        std::unique_lock<std::mutex>& lock,
-        const std::chrono::steady_clock::time_point& deadline) {
-        const auto wait_begin = std::chrono::steady_clock::now();
-        writer_wait_events_.fetch_add(1, std::memory_order_relaxed);
-        const bool awakened = queue_cv_.wait_until(lock, deadline, [this] { return stop_ || !request_queue_.empty(); });
-        record_writer_wait(std::chrono::steady_clock::now() - wait_begin);
-        return awakened;
-    }
-
-    void record_writer_wait(std::chrono::steady_clock::duration wait_duration) {
-        const auto waited_us = std::chrono::duration_cast<std::chrono::microseconds>(wait_duration).count();
-        if (waited_us > 0) {
-            writer_wait_time_us_.fetch_add(static_cast<uint64_t>(waited_us), std::memory_order_relaxed);
-        }
-    }
-
-    void process_write_batch(const std::vector<std::shared_ptr<Request>>& batch) {
-        open_wal_for_append_if_needed();
-        uint64_t batch_bytes_written = 0;
-        for (const auto& request : batch) {
-            switch (request->type) {
-                case RequestType::kPut:
-                    batch_bytes_written += append_wal_record(WalRecordType::kPut, request->key, request->value);
-                    break;
-                case RequestType::kDelete: {
-                    const Value empty;
-                    batch_bytes_written += append_wal_record(WalRecordType::kDelete, request->key, empty);
-                    break;
-                }
-                case RequestType::kBatch:
-                    for (const auto& operation : request->batch_operations) {
-                        batch_bytes_written += append_wal_record(operation.type, operation.key, operation.value);
-                    }
-                    break;
-                case RequestType::kCompact:
-                    throw KVStoreError("Compact request should not be part of a write batch");
-            }
-        }
-        fsync_file(wal_fd_, wal_file_path_);
-        maybe_trigger_failpoint("after_wal_fsync_before_apply");
-
-        {
-            std::unique_lock<std::shared_mutex> lock(state_mutex_);
-            for (const auto& request : batch) {
-                if (request->type == RequestType::kBatch) {
-                    for (const auto& operation : request->batch_operations) {
-                        if (operation.type == WalRecordType::kPut) {
-                            state_[operation.key] = operation.value;
-                        } else {
-                            state_.erase(operation.key);
-                        }
-                    }
-                    continue;
-                }
-                if (request->type == RequestType::kPut) {
-                    state_[request->key] = request->value;
-                } else {
-                    state_.erase(request->key);
-                }
-            }
-        }
-
-        committed_write_requests_.fetch_add(batch.size(), std::memory_order_relaxed);
-        committed_write_batches_.fetch_add(1, std::memory_order_relaxed);
-        wal_fsync_calls_.fetch_add(1, std::memory_order_relaxed);
-        wal_bytes_written_.fetch_add(batch_bytes_written, std::memory_order_relaxed);
-        wal_bytes_since_compaction_.fetch_add(batch_bytes_written, std::memory_order_relaxed);
-        for (const auto& request : batch) {
-            if (request->type == RequestType::kBatch) {
-                for (const auto& operation : request->batch_operations) {
-                    note_latest_wal_record(operation.key, sizeof(WalRecordHeader) + operation.key.size() + operation.value.bytes.size());
-                }
-                continue;
-            }
-            note_latest_wal_record(request->key, wal_record_size_for_request(*request));
-        }
-        last_committed_batch_size_.store(batch.size(), std::memory_order_relaxed);
-        update_atomic_max(max_committed_batch_size_, batch.size());
-        last_committed_batch_wal_bytes_.store(batch_bytes_written, std::memory_order_relaxed);
-        update_atomic_max(max_committed_batch_wal_bytes_, batch_bytes_written);
-        last_effective_batch_delay_us_.store(current_batch_delay_us_, std::memory_order_relaxed);
-        if (current_batch_delay_us_ > 0) {
-            const uint64_t current_min_delay = min_effective_batch_delay_us_.load(std::memory_order_relaxed);
-            if (current_min_delay == 0 || current_batch_delay_us_ < current_min_delay) {
-                min_effective_batch_delay_us_.store(current_batch_delay_us_, std::memory_order_relaxed);
-            }
-            update_atomic_max(max_effective_batch_delay_us_, current_batch_delay_us_);
-        }
-        update_observed_fsync_pressure_metric(observed_fsync_pressure_per_1000_writes_, batch.size());
-        update_recent_batch_history(RecentBatchHistoryContext {
-            options_,
-            read_requests_.load(std::memory_order_relaxed),
-            last_committed_batch_wal_bytes_.load(std::memory_order_relaxed),
-            batch.size(),
-            current_batch_queue_depth_,
-            last_total_read_requests_seen_,
-            recent_batch_sizes_,
-            recent_batch_queue_depths_,
-            recent_batch_wal_bytes_,
-            recent_batch_wal_bytes_sum_,
-            recent_read_deltas_,
-            recent_write_deltas_,
-            recent_read_sum_,
-            recent_write_sum_,
-            recent_batch_size_sum_,
-            recent_read_requests_,
-            recent_write_requests_,
-            recent_read_ratio_per_1000_ops_,
-            recent_peak_queue_depth_,
-            recent_avg_batch_size_,
-            recent_batch_fill_per_1000_,
-            recent_avg_batch_wal_bytes_,
-            recent_window_batch_count_,
-            observed_fsync_pressure_per_1000_writes_,
-        });
-
-        for (const auto& request : batch) {
-            complete_request(request, "");
-        }
-    }
-
     uint64_t effective_recent_read_ratio_per_1000_ops() const {
         const uint64_t current_total_reads = read_requests_.load(std::memory_order_relaxed);
         const uint64_t pending_reads = current_total_reads >= last_total_read_requests_seen_
@@ -681,98 +592,6 @@ private:
         return obsolete_wal_ratio_percent(total_wal_bytes, live_wal_bytes);
     }
 
-    void process_compaction_request(const std::shared_ptr<Request>& request, bool is_auto_compaction) {
-        std::map<std::string, Value> snapshot_state;
-        {
-            std::shared_lock<std::shared_mutex> lock(state_mutex_);
-            snapshot_state = state_;
-        }
-
-        const uint64_t reclaimed_wal_bytes = wal_bytes_since_compaction_.load(std::memory_order_relaxed);
-
-        try {
-            close_if_open(wal_fd_);
-            wal_fd_ = -1;
-            const uint64_t snapshot_bytes_written =
-                rewrite_snapshot_and_reset_wal(db_file_path_, wal_file_path_, snapshot_state);
-            open_wal_for_append();
-            wal_bytes_since_compaction_.store(0, std::memory_order_relaxed);
-            live_wal_bytes_since_compaction_.store(0, std::memory_order_relaxed);
-            latest_wal_record_bytes_.clear();
-            total_snapshot_bytes_written_.fetch_add(snapshot_bytes_written, std::memory_order_relaxed);
-            total_wal_bytes_reclaimed_by_compaction_.fetch_add(reclaimed_wal_bytes, std::memory_order_relaxed);
-        } catch (...) {
-            open_wal_for_append_if_needed();
-            throw;
-        }
-
-        if (is_auto_compaction) {
-            auto_compactions_completed_.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            manual_compactions_completed_.fetch_add(1, std::memory_order_relaxed);
-        }
-        complete_request(request, "");
-    }
-
-    void maybe_auto_compact() {
-        if (!should_auto_compact()) {
-            return;
-        }
-
-        auto request = std::make_shared<Request>();
-        request->type = RequestType::kCompact;
-        process_compaction_request(request, true);
-    }
-
-    void complete_request(const std::shared_ptr<Request>& request, const std::string& error) {
-        if (request->type != RequestType::kCompact && error.empty()) {
-            record_write_latency(*request);
-        }
-        {
-            std::lock_guard<std::mutex> lock(request->done_mutex);
-            request->done = true;
-            request->error = error;
-        }
-        request->done_cv.notify_one();
-    }
-
-    void fail_requests(const std::vector<std::shared_ptr<Request>>& requests, const std::string& error) {
-        for (const auto& request : requests) {
-            complete_request(request, error);
-        }
-    }
-
-    void enter_fatal_state(const std::string& error) {
-        std::deque<std::shared_ptr<Request>> pending_requests;
-        {
-            std::lock_guard<std::mutex> lock(queue_mutex_);
-            if (has_fatal_error_.load(std::memory_order_relaxed)) {
-                return;
-            }
-            fatal_error_message_ = error;
-            has_fatal_error_.store(true, std::memory_order_release);
-            pending_requests.swap(request_queue_);
-        }
-
-        for (const auto& request : pending_requests) {
-            complete_request(request, error);
-        }
-    }
-
-    void throw_if_fatal() {
-        if (!has_fatal_error_.load(std::memory_order_acquire)) {
-            return;
-        }
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        throw KVStoreError(fatal_error_message_);
-    }
-
-    void throw_if_fatal_locked() {
-        if (has_fatal_error_.load(std::memory_order_relaxed)) {
-            throw KVStoreError(fatal_error_message_);
-        }
-    }
-
     void note_latest_wal_record(const std::string& key, uint64_t record_size) {
         track_latest_wal_record(
             latest_wal_record_bytes_,
@@ -787,25 +606,6 @@ private:
         return kvstore::internal::should_auto_compact(options_, total_wal_bytes, live_wal_bytes);
     }
 
-    uint64_t wal_record_size_for_request(const Request& request) const {
-        switch (request.type) {
-            case RequestType::kPut:
-                return sizeof(WalRecordHeader) + request.key.size() + request.value.bytes.size();
-            case RequestType::kDelete:
-                return sizeof(WalRecordHeader) + request.key.size();
-            case RequestType::kCompact:
-                return 0;
-            case RequestType::kBatch: {
-                uint64_t total = 0;
-                for (const auto& operation : request.batch_operations) {
-                    total += sizeof(WalRecordHeader) + operation.key.size() + operation.value.bytes.size();
-                }
-                return total;
-            }
-        }
-        return 0;
-    }
-
     void record_write_latency(const Request& request) {
         const auto elapsed = std::chrono::steady_clock::now() - request.enqueue_time;
         const uint64_t elapsed_us =
@@ -818,42 +618,6 @@ private:
             write_latency_histogram_,
             recent_observed_write_latency_p95_us_,
         });
-    }
-
-    void open_wal_for_append() {
-        wal_fd_ = open_or_throw(wal_file_path_, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    }
-
-    void open_wal_for_append_if_needed() {
-        if (wal_fd_ < 0) {
-            open_wal_for_append();
-        }
-    }
-
-    uint64_t current_wal_file_size() const {
-        std::error_code ec;
-        const auto size = std::filesystem::file_size(wal_file_path_, ec);
-        return ec ? 0 : static_cast<uint64_t>(size);
-    }
-
-    uint64_t append_wal_record(WalRecordType type, const std::string& key, const Value& value) {
-        const WalRecordHeader header = {
-            kWalMagic,
-            kWalVersion,
-            static_cast<uint8_t>(type),
-            0,
-            static_cast<uint32_t>(key.size()),
-            static_cast<uint32_t>(value.bytes.size()),
-            checksum_record(type, key, value),
-        };
-        write_all(wal_fd_, &header, sizeof(header));
-        if (!key.empty()) {
-            write_all(wal_fd_, key.data(), key.size());
-        }
-        if (!value.bytes.empty()) {
-            write_all(wal_fd_, value.bytes.data(), value.bytes.size());
-        }
-        return sizeof(header) + key.size() + value.bytes.size();
     }
 };
 
@@ -933,10 +697,10 @@ void KVStore::WriteBatch(const std::vector<BatchWriteOperation>& operations) {
         return;
     }
 
-    std::vector<Impl::BatchMutation> encoded_operations;
+    std::vector<BatchMutation> encoded_operations;
     encoded_operations.reserve(operations.size());
     for (const auto& operation : operations) {
-        Impl::BatchMutation mutation;
+        BatchMutation mutation;
         mutation.type = operation.type == BatchWriteOperation::Type::kPut ? WalRecordType::kPut : WalRecordType::kDelete;
         switch (operation.key_kind) {
             case BatchWriteOperation::KeyKind::kString:
