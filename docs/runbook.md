@@ -19,7 +19,9 @@
 
 ### 2. Reliability Validation
 
-- `bash scripts/soak.sh 10`
+- `bash scripts/soak.sh 10 balanced`
+- `bash scripts/soak.sh 10 write-heavy`
+- `bash scripts/soak.sh 10 read-heavy`
 - `./build/target/bin/kv_test fault-inject <scenario> <db_path>`
 
 ### 3. Format Inspection and Rewrite

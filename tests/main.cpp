@@ -101,7 +101,14 @@ void require(bool condition, const std::string& message) {
 
 class TestDir {
 public:
-    explicit TestDir(const std::string& name) : path_(std::filesystem::temp_directory_path() / ("kvstore_" + name + "_" + std::to_string(::getpid()))) {
+    explicit TestDir(const std::string& name) {
+        static std::atomic<uint64_t> counter {0};
+        const uint64_t suffix = counter.fetch_add(1, std::memory_order_relaxed);
+        const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        path_ = std::filesystem::temp_directory_path() /
+                ("kvstore_" + name + "_" + std::to_string(::getpid()) + "_" +
+                 std::to_string(now_ns) + "_" + std::to_string(suffix));
         std::filesystem::remove_all(path_);
         std::filesystem::create_directories(path_);
     }
@@ -1088,6 +1095,72 @@ std::optional<KVStoreProfile> parse_profile_name(const std::string& name) {
     return std::nullopt;
 }
 
+enum class SoakProfile {
+    kBalanced,
+    kWriteHeavy,
+    kReadHeavy,
+};
+
+std::optional<SoakProfile> parse_soak_profile_name(const std::string& name) {
+    if (name == "balanced") {
+        return SoakProfile::kBalanced;
+    }
+    if (name == "write-heavy") {
+        return SoakProfile::kWriteHeavy;
+    }
+    if (name == "read-heavy") {
+        return SoakProfile::kReadHeavy;
+    }
+    return std::nullopt;
+}
+
+struct SoakProfileConfig {
+    KVStoreOptions options;
+    int writer_count = 4;
+    int reader_count = 2;
+    int key_space = 256;
+    int compaction_interval_ms = 50;
+};
+
+SoakProfileConfig make_soak_profile_config(SoakProfile profile) {
+    SoakProfileConfig config;
+    config.options.max_batch_size = 32;
+    config.options.max_batch_wal_bytes = 1 << 20;
+    config.options.max_batch_delay_us = 2000;
+    config.options.auto_compact_wal_bytes_threshold = 4096;
+    config.options.auto_compact_invalid_wal_ratio_percent = 60;
+    config.options.adaptive_flush_enabled = true;
+    config.options.adaptive_flush_queue_depth_threshold = 8;
+    config.options.adaptive_flush_delay_divisor = 4;
+    config.options.adaptive_flush_min_batch_delay_us = 100;
+
+    switch (profile) {
+        case SoakProfile::kBalanced:
+            return config;
+        case SoakProfile::kWriteHeavy:
+            config.writer_count = 6;
+            config.reader_count = 1;
+            config.key_space = 512;
+            config.compaction_interval_ms = 80;
+            config.options.max_batch_size = 64;
+            config.options.max_batch_delay_us = 4000;
+            config.options.auto_compact_wal_bytes_threshold = 8192;
+            config.options.auto_compact_invalid_wal_ratio_percent = 70;
+            return config;
+        case SoakProfile::kReadHeavy:
+            config.writer_count = 2;
+            config.reader_count = 6;
+            config.key_space = 256;
+            config.compaction_interval_ms = 30;
+            config.options.max_batch_size = 16;
+            config.options.max_batch_delay_us = 1000;
+            config.options.adaptive_flush_queue_depth_threshold = 4;
+            config.options.adaptive_flush_min_batch_delay_us = 50;
+            return config;
+    }
+    return config;
+}
+
 int run_profile_json(const std::string& name) {
     const auto profile = parse_profile_name(name);
     if (!profile.has_value()) {
@@ -1565,6 +1638,21 @@ void test_benchmark_trend_summarizes_history() {
     require(std::stod(values.at("latest_vs_oldest_latency_ratio_pct")) > 79.9 &&
                 std::stod(values.at("latest_vs_oldest_latency_ratio_pct")) < 80.1,
             "benchmark trend should report latest-vs-oldest latency ratio");
+}
+
+void test_soak_profiles_are_distinct() {
+    const SoakProfileConfig balanced = make_soak_profile_config(SoakProfile::kBalanced);
+    const SoakProfileConfig write_heavy = make_soak_profile_config(SoakProfile::kWriteHeavy);
+    const SoakProfileConfig read_heavy = make_soak_profile_config(SoakProfile::kReadHeavy);
+
+    require(write_heavy.writer_count > balanced.writer_count,
+            "write-heavy soak profile should use more writers than balanced");
+    require(read_heavy.reader_count > balanced.reader_count,
+            "read-heavy soak profile should use more readers than balanced");
+    require(write_heavy.options.max_batch_size > balanced.options.max_batch_size,
+            "write-heavy soak profile should allow larger batches");
+    require(read_heavy.options.max_batch_delay_us < balanced.options.max_batch_delay_us,
+            "read-heavy soak profile should use shorter batch delays");
 }
 
 void test_ordering_and_updates() {
@@ -2636,59 +2724,54 @@ void test_objective_throughput_score_can_dominate_latency_pressure() {
             "throughput-dominated objective control should expand the effective batch delay");
 }
 
-void run_soak_test(int duration_seconds) {
+void run_soak_test(int duration_seconds, SoakProfile profile) {
     TestDir dir("soak");
     const std::string db_path = dir.file("store.dat");
 
-    KVStoreOptions options;
-    options.max_batch_size = 32;
-    options.max_batch_wal_bytes = 1 << 20;
-    options.max_batch_delay_us = 2000;
-    options.auto_compact_wal_bytes_threshold = 4096;
-    options.auto_compact_invalid_wal_ratio_percent = 60;
-    options.adaptive_flush_enabled = true;
-    options.adaptive_flush_queue_depth_threshold = 8;
-    options.adaptive_flush_delay_divisor = 4;
-    options.adaptive_flush_min_batch_delay_us = 100;
-    KVStore store(db_path, options);
-
-    constexpr int kWriterCount = 4;
-    constexpr int kReaderCount = 2;
-    constexpr int kKeySpace = 256;
+    const SoakProfileConfig config = make_soak_profile_config(profile);
+    KVStore store(db_path, config.options);
 
     std::atomic<bool> stop {false};
-    std::map<int, std::optional<std::string>> oracle;
+    std::atomic<uint64_t> operation_sequence {0};
+    std::map<int, std::pair<uint64_t, std::optional<std::string>>> oracle;
     std::mutex oracle_mutex;
     std::vector<std::thread> threads;
 
-    for (int writer_id = 0; writer_id < kWriterCount; ++writer_id) {
-        threads.emplace_back([&store, &stop, &oracle, &oracle_mutex, writer_id]() {
+    for (int writer_id = 0; writer_id < config.writer_count; ++writer_id) {
+        threads.emplace_back([&store, &stop, &oracle, &oracle_mutex, &config, &operation_sequence, writer_id]() {
             std::mt19937 gen(9000 + writer_id);
-            std::uniform_int_distribution<int> key_dist(0, kKeySpace - 1);
+            std::uniform_int_distribution<int> key_dist(0, config.key_space - 1);
             std::uniform_int_distribution<int> op_dist(0, 9);
             uint64_t version = 0;
             while (!stop.load(std::memory_order_acquire)) {
                 const int key = key_dist(gen);
                 const bool do_delete = op_dist(gen) < 3;
+                const uint64_t seq = operation_sequence.fetch_add(1, std::memory_order_relaxed);
                 if (do_delete) {
                     store.Delete(key);
                     std::lock_guard<std::mutex> lock(oracle_mutex);
-                    oracle[key] = std::nullopt;
+                    auto& slot = oracle[key];
+                    if (seq >= slot.first) {
+                        slot = {seq, std::nullopt};
+                    }
                 } else {
                     const std::string payload =
                         "value_" + std::to_string(writer_id) + "_" + std::to_string(key) + "_" + std::to_string(version++);
                     store.Put(key, text(payload));
                     std::lock_guard<std::mutex> lock(oracle_mutex);
-                    oracle[key] = payload;
+                    auto& slot = oracle[key];
+                    if (seq >= slot.first) {
+                        slot = {seq, payload};
+                    }
                 }
             }
         });
     }
 
-    for (int reader_id = 0; reader_id < kReaderCount; ++reader_id) {
-        threads.emplace_back([&store, &stop, reader_id]() {
+    for (int reader_id = 0; reader_id < config.reader_count; ++reader_id) {
+        threads.emplace_back([&store, &stop, &config, reader_id]() {
             std::mt19937 gen(12000 + reader_id);
-            std::uniform_int_distribution<int> key_dist(0, kKeySpace - 1);
+            std::uniform_int_distribution<int> key_dist(0, config.key_space - 1);
             while (!stop.load(std::memory_order_acquire)) {
                 const auto value = store.Get(key_dist(gen));
                 if (value.has_value()) {
@@ -2698,10 +2781,10 @@ void run_soak_test(int duration_seconds) {
         });
     }
 
-    threads.emplace_back([&store, &stop]() {
+    threads.emplace_back([&store, &stop, &config]() {
         while (!stop.load(std::memory_order_acquire)) {
             store.Compact();
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            std::this_thread::sleep_for(std::chrono::milliseconds(config.compaction_interval_ms));
         }
     });
 
@@ -2717,7 +2800,9 @@ void run_soak_test(int duration_seconds) {
     std::map<int, std::optional<std::string>> expected;
     {
         std::lock_guard<std::mutex> lock(oracle_mutex);
-        expected = oracle;
+        for (const auto& [key, value] : oracle) {
+            expected[key] = value.second;
+        }
     }
 
     KVStore reopened(db_path);
@@ -2866,7 +2951,13 @@ int main(int argc, char* argv[]) {
         }
         if (command == "soak") {
             const int duration_seconds = argc > 2 ? std::stoi(argv[2]) : 10;
-            run_soak_test(duration_seconds);
+            const std::string profile_name = argc > 3 ? argv[3] : "balanced";
+            const auto profile = parse_soak_profile_name(profile_name);
+            if (!profile.has_value()) {
+                std::cerr << "Unknown soak profile: " << profile_name << std::endl;
+                return 1;
+            }
+            run_soak_test(duration_seconds, *profile);
             return 0;
         }
         if (command == "inspect-format") {
@@ -2926,6 +3017,7 @@ int main(int argc, char* argv[]) {
         {"compare benchmark baseline passes within thresholds", test_compare_benchmark_baseline_passes_within_thresholds},
         {"compare benchmark baseline rejects regression", test_compare_benchmark_baseline_rejects_regression},
         {"benchmark trend summarizes history", test_benchmark_trend_summarizes_history},
+        {"soak profiles are distinct", test_soak_profiles_are_distinct},
         {"ordering and updates", test_ordering_and_updates},
         {"compaction persists snapshot and resets WAL", test_compaction_persists_snapshot_and_resets_wal},
         {"truncated WAL tail is ignored", test_truncated_wal_tail_is_ignored},

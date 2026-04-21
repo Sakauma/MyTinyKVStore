@@ -33,6 +33,9 @@ Exit criteria:
 - 把 soak test 扩展成多个负载 profile，而不只是一种默认混合负载。
 - 固化至少一组 write-heavy 和一组 read-heavy 长时验证。
 
+Current status:
+- 已完成。
+
 ### B2. Concurrency Stress
 
 - 补更强的并发稳定性回归，重点覆盖 writer 控制器和 compaction 交错场景。
