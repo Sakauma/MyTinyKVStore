@@ -1,4 +1,5 @@
 #include "kvstore.h"
+#include "internal/compaction.h"
 #include "internal/format.h"
 #include "internal/io.h"
 #include "internal/metrics_helpers.h"
@@ -979,58 +980,13 @@ private:
             snapshot_state = state_;
         }
 
-        const std::string temp_snapshot_path = db_file_path_ + ".compact.tmp";
-        const std::string temp_wal_path = wal_file_path_ + ".tmp";
-        uint64_t snapshot_bytes_written = sizeof(SnapshotHeader);
-        for (const auto& [key, value] : snapshot_state) {
-            snapshot_bytes_written += sizeof(SnapshotEntryHeader) + key.size() + value.bytes.size();
-        }
         const uint64_t reclaimed_wal_bytes = wal_bytes_since_compaction_.load(std::memory_order_relaxed);
 
-        int snapshot_fd = -1;
-        int empty_wal_fd = -1;
         try {
-            snapshot_fd = open_or_throw(temp_snapshot_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            const SnapshotHeader snapshot_header = make_snapshot_header();
-            write_all(snapshot_fd, &snapshot_header, sizeof(snapshot_header));
-            for (const auto& [key, value] : snapshot_state) {
-                const SnapshotEntryHeader entry = {
-                    kSnapshotEntryMagic,
-                    static_cast<uint32_t>(key.size()),
-                    static_cast<uint32_t>(value.bytes.size()),
-                };
-                write_all(snapshot_fd, &entry, sizeof(entry));
-                if (!key.empty()) {
-                    write_all(snapshot_fd, key.data(), key.size());
-                }
-                if (!value.bytes.empty()) {
-                    write_all(snapshot_fd, value.bytes.data(), value.bytes.size());
-                }
-            }
-            fsync_file(snapshot_fd, temp_snapshot_path);
-            maybe_trigger_failpoint("after_snapshot_fsync_before_rename");
-            ::close(snapshot_fd);
-            snapshot_fd = -1;
-
-            if (::rename(temp_snapshot_path.c_str(), db_file_path_.c_str()) != 0) {
-                throw io_error("rename", temp_snapshot_path);
-            }
-            fsync_directory(db_file_path_);
-            maybe_trigger_failpoint("after_snapshot_rename_before_wal_reset");
-
             close_if_open(wal_fd_);
             wal_fd_ = -1;
-
-            empty_wal_fd = open_or_throw(temp_wal_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            fsync_file(empty_wal_fd, temp_wal_path);
-            ::close(empty_wal_fd);
-            empty_wal_fd = -1;
-
-            if (::rename(temp_wal_path.c_str(), wal_file_path_.c_str()) != 0) {
-                throw io_error("rename", temp_wal_path);
-            }
-            fsync_directory(wal_file_path_);
-            maybe_trigger_failpoint("after_wal_rotation_before_reopen");
+            const uint64_t snapshot_bytes_written =
+                rewrite_snapshot_and_reset_wal(db_file_path_, wal_file_path_, snapshot_state);
             open_wal_for_append();
             wal_bytes_since_compaction_.store(0, std::memory_order_relaxed);
             live_wal_bytes_since_compaction_.store(0, std::memory_order_relaxed);
@@ -1038,8 +994,6 @@ private:
             total_snapshot_bytes_written_.fetch_add(snapshot_bytes_written, std::memory_order_relaxed);
             total_wal_bytes_reclaimed_by_compaction_.fetch_add(reclaimed_wal_bytes, std::memory_order_relaxed);
         } catch (...) {
-            close_if_open(snapshot_fd);
-            close_if_open(empty_wal_fd);
             open_wal_for_append_if_needed();
             throw;
         }

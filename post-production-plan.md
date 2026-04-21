@@ -37,6 +37,7 @@ Current status:
 - 进行中。已补 writer / format / recovery 三份设计说明，后续继续随拆分同步更新。
 - 已继续拆出 observability/profile 辅助模块，`MetricsToJson`、`OptionsToJson` 与 `RecommendedOptions` 不再直接堆在 `src/kvstore.cpp` 中。
 - 已将启动恢复中的“建空快照 / 读快照 / 重放 WAL”提炼到内部 recovery 模块，`src/kvstore.cpp` 继续缩小为状态编排层。
+- 已将 compaction 的快照重写与 WAL 轮转步骤提炼到内部 compaction 模块，主文件中对应流程继续收敛为编排逻辑。
 
 ## Phase 2: Refactor-Safe Test Harness
 

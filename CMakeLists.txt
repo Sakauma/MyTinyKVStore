@@ -45,6 +45,7 @@ endfunction()
 
 add_library(kvstore SHARED
     src/kvstore.cpp
+    src/internal/compaction.cpp
     src/internal/format.cpp
     src/internal/io.cpp
     src/internal/metrics_helpers.cpp
