@@ -183,6 +183,7 @@ cd build && ctest --output-on-failure
 事务与快照读的设计边界见 [docs/transaction-boundary.md](/home/sakauma/code/lpue/docs/transaction-boundary.md)。
 当前对事务 / 快照读的正式结论见 [docs/advanced-semantics-decision.md](/home/sakauma/code/lpue/docs/advanced-semantics-decision.md)。
 后续以结构重构和持续性能治理为主的新路线图见 [post-production-plan.md](/home/sakauma/code/lpue/post-production-plan.md)。
+内部模块设计说明见 [docs/internal/format-design.md](/home/sakauma/code/lpue/docs/internal/format-design.md)、[docs/internal/recovery-design.md](/home/sakauma/code/lpue/docs/internal/recovery-design.md)、[docs/internal/writer-design.md](/home/sakauma/code/lpue/docs/internal/writer-design.md)。
 
 ### 可选 Sanitizer
 

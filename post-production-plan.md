@@ -33,6 +33,9 @@ Exit criteria:
 Exit criteria:
 - 关键模块都有对应设计说明，后续改动不再只能靠读实现猜语义。
 
+Current status:
+- 进行中。已补 writer / format / recovery 三份设计说明，后续继续随拆分同步更新。
+
 ## Phase 2: Refactor-Safe Test Harness
 
 ### 2.1 Stabilize Non-Deterministic Tests
