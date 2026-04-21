@@ -47,6 +47,7 @@ add_library(kvstore SHARED
     src/kvstore.cpp
     src/internal/format.cpp
     src/internal/io.cpp
+    src/internal/metrics_helpers.cpp
 )
 target_include_directories(kvstore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(kvstore PRIVATE Threads::Threads)
