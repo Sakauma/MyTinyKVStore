@@ -31,8 +31,8 @@
 
 - 缺少稳定 CI 流程来持续执行构建、测试和 sanitizer。
 - 已有 coverage 入口、baseline JSON 产出链路，以及基于默认阈值的 baseline 比较入口。
-- 已有 CI 中的保守 benchmark regression gate。
-- 还缺少长期历史趋势对比和更细粒度的性能门槛。
+- 已有 CI 中的保守 benchmark regression gate，以及 baseline 趋势汇总入口。
+- 还缺少更细粒度的性能门槛和长期可视化趋势对比。
 
 ### 6. Operations and Observability
 

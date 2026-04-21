@@ -155,6 +155,7 @@ cd build && ctest --output-on-failure
 - `bash scripts/bench-baseline.sh`：运行 benchmark，并把结构化 baseline JSON 落到 `benchmarks/baselines/`。
 - `bash scripts/bench-regression-check.sh <baseline_json>`：生成新的 candidate baseline，并按默认阈值与参考基线比较。
 - `bash scripts/ci-bench-regression.sh`：使用仓库内的 CI 参考 baseline 执行回归门槛检查。
+- `bash scripts/bench-trend.sh [baseline_dir]`：汇总一组历史 baseline，输出吞吐/延迟趋势摘要。
 - `bash scripts/soak.sh 10`：运行带 compaction 的混合读写 soak test，并在结束后重启校验数据一致性。
 - `bash scripts/inspect-format.sh <db_path>`：检查快照和 WAL 的格式版本、记录数量、键类型分布，以及是否建议重写迁移。
 - `bash scripts/rewrite-format.sh <db_path>`：加载数据库并执行一次 `Compact()`，把数据重写到当前格式。
@@ -166,6 +167,7 @@ cd build && ctest --output-on-failure
 若需要结构化指标，可调用 `kv_test bench-json` 或直接使用库函数 `MetricsToJson(store.GetMetrics())`。
 若需要可归档的 benchmark 基线，可调用 `kv_test bench-baseline-json` 或 `bash scripts/bench-baseline.sh`。
 若需要自动判断是否出现明显退化，可调用 `kv_test compare-baseline ...` 或 `bash scripts/bench-regression-check.sh ...`。
+若需要查看一段时间内的趋势，可调用 `kv_test trend-baselines ...` 或 `bash scripts/bench-trend.sh ...`。
 若需要推荐配置模板，可调用 `kv_test profile-json <name>` 或 `RecommendedOptions(...)`。
 
 磁盘格式说明见 [docs/file-format.md](/home/sakauma/code/lpue/docs/file-format.md)。当前程序会写入版本 `2` 的 snapshot / WAL，同时保留对版本 `1` 整型键格式的读取兼容。

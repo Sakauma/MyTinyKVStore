@@ -83,6 +83,7 @@ struct FormatKeyStats {
 int run_inspect_format(const std::string& db_path);
 int run_verify_format(const std::string& db_path);
 double extract_json_number(const std::string& json, const std::string& key);
+int run_benchmark_trend(const std::string& directory_path);
 
 Value text(const std::string& input) {
     return Value(std::vector<uint8_t>(input.begin(), input.end()));
@@ -213,6 +214,14 @@ std::pair<int, std::string> capture_verify_format(const std::string& db_path) {
     return {status, out.str()};
 }
 
+std::pair<int, std::map<std::string, std::string>> capture_benchmark_trend(const std::string& directory_path) {
+    std::ostringstream out;
+    auto* original = std::cout.rdbuf(out.rdbuf());
+    const int status = run_benchmark_trend(directory_path);
+    std::cout.rdbuf(original);
+    return {status, parse_kv_line(out.str())};
+}
+
 struct BenchmarkConfig {
     std::string label;
     int writer_count = 8;
@@ -228,6 +237,13 @@ struct BenchmarkResult {
     double duration_s = 0.0;
     uint64_t writes = 0;
     uint64_t reads = 0;
+    double write_ops_per_s = 0.0;
+    double read_ops_per_s = 0.0;
+    double avg_write_latency_us = 0.0;
+};
+
+struct BaselineSummary {
+    std::string file_name;
     double write_ops_per_s = 0.0;
     double read_ops_per_s = 0.0;
     double avg_write_latency_us = 0.0;
@@ -785,6 +801,90 @@ int run_compare_benchmark_baseline(
               << " status=" << (pass ? "pass" : "fail")
               << std::endl;
     return pass ? 0 : 2;
+}
+
+BaselineSummary load_baseline_summary(const std::filesystem::path& path) {
+    const std::string json = read_text_file(path.string());
+    BaselineSummary summary;
+    summary.file_name = path.filename().string();
+    summary.write_ops_per_s = extract_json_number(json, "write_ops_per_s");
+    summary.read_ops_per_s = extract_json_number(json, "read_ops_per_s");
+    summary.avg_write_latency_us = extract_json_number(json, "avg_write_latency_us");
+    return summary;
+}
+
+int run_benchmark_trend(const std::string& directory_path) {
+    std::vector<std::filesystem::path> files;
+    for (const auto& entry : std::filesystem::directory_iterator(directory_path)) {
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        if (entry.path().extension() != ".json") {
+            continue;
+        }
+        files.push_back(entry.path());
+    }
+
+    std::sort(files.begin(), files.end());
+    require(!files.empty(), "benchmark trend requires at least one baseline json file");
+
+    std::vector<BaselineSummary> summaries;
+    summaries.reserve(files.size());
+    for (const auto& path : files) {
+        summaries.push_back(load_baseline_summary(path));
+    }
+
+    const BaselineSummary& first = summaries.front();
+    const BaselineSummary& latest = summaries.back();
+    double min_write_ops_per_s = first.write_ops_per_s;
+    double max_write_ops_per_s = first.write_ops_per_s;
+    double min_read_ops_per_s = first.read_ops_per_s;
+    double max_read_ops_per_s = first.read_ops_per_s;
+    double min_avg_write_latency_us = first.avg_write_latency_us;
+    double max_avg_write_latency_us = first.avg_write_latency_us;
+    double sum_write_ops_per_s = 0.0;
+    double sum_read_ops_per_s = 0.0;
+    double sum_avg_write_latency_us = 0.0;
+
+    for (const auto& summary : summaries) {
+        min_write_ops_per_s = std::min(min_write_ops_per_s, summary.write_ops_per_s);
+        max_write_ops_per_s = std::max(max_write_ops_per_s, summary.write_ops_per_s);
+        min_read_ops_per_s = std::min(min_read_ops_per_s, summary.read_ops_per_s);
+        max_read_ops_per_s = std::max(max_read_ops_per_s, summary.read_ops_per_s);
+        min_avg_write_latency_us = std::min(min_avg_write_latency_us, summary.avg_write_latency_us);
+        max_avg_write_latency_us = std::max(max_avg_write_latency_us, summary.avg_write_latency_us);
+        sum_write_ops_per_s += summary.write_ops_per_s;
+        sum_read_ops_per_s += summary.read_ops_per_s;
+        sum_avg_write_latency_us += summary.avg_write_latency_us;
+    }
+
+    const double avg_write_ops_per_s = sum_write_ops_per_s / summaries.size();
+    const double avg_read_ops_per_s = sum_read_ops_per_s / summaries.size();
+    const double avg_avg_write_latency_us = sum_avg_write_latency_us / summaries.size();
+    const double latest_vs_first_write_ratio_pct =
+        first.write_ops_per_s == 0.0 ? 0.0 : (latest.write_ops_per_s / first.write_ops_per_s) * 100.0;
+    const double latest_vs_first_read_ratio_pct =
+        first.read_ops_per_s == 0.0 ? 0.0 : (latest.read_ops_per_s / first.read_ops_per_s) * 100.0;
+    const double latest_vs_first_latency_ratio_pct =
+        first.avg_write_latency_us == 0.0 ? 0.0 : (latest.avg_write_latency_us / first.avg_write_latency_us) * 100.0;
+
+    std::cout << "count=" << summaries.size()
+              << " oldest_file=" << first.file_name
+              << " latest_file=" << latest.file_name
+              << " avg_write_ops_per_s=" << avg_write_ops_per_s
+              << " min_write_ops_per_s=" << min_write_ops_per_s
+              << " max_write_ops_per_s=" << max_write_ops_per_s
+              << " avg_read_ops_per_s=" << avg_read_ops_per_s
+              << " min_read_ops_per_s=" << min_read_ops_per_s
+              << " max_read_ops_per_s=" << max_read_ops_per_s
+              << " avg_write_latency_us=" << avg_avg_write_latency_us
+              << " min_write_latency_us=" << min_avg_write_latency_us
+              << " max_write_latency_us=" << max_avg_write_latency_us
+              << " latest_vs_oldest_write_ratio_pct=" << latest_vs_first_write_ratio_pct
+              << " latest_vs_oldest_read_ratio_pct=" << latest_vs_first_read_ratio_pct
+              << " latest_vs_oldest_latency_ratio_pct=" << latest_vs_first_latency_ratio_pct
+              << std::endl;
+    return 0;
 }
 
 KVStoreOptions benchmark_options() {
@@ -1373,6 +1473,49 @@ void test_compare_benchmark_baseline_rejects_regression() {
 
     const int status = run_compare_benchmark_baseline(baseline_path, candidate_path);
     require(status == 2, "compare-baseline should reject throughput/latency regressions beyond thresholds");
+}
+
+void test_benchmark_trend_summarizes_history() {
+    TestDir dir("benchmark_trend");
+    const std::string baseline_dir = dir.file("baselines");
+    std::filesystem::create_directories(baseline_dir);
+
+    BenchmarkResult early;
+    early.config = make_benchmark_config("early", 1, 1, 100, 64);
+    early.write_ops_per_s = 1000.0;
+    early.read_ops_per_s = 2000.0;
+    early.avg_write_latency_us = 100.0;
+
+    BenchmarkResult middle = early;
+    middle.config.label = "middle";
+    middle.write_ops_per_s = 1100.0;
+    middle.read_ops_per_s = 1900.0;
+    middle.avg_write_latency_us = 90.0;
+
+    BenchmarkResult latest = early;
+    latest.config.label = "latest";
+    latest.write_ops_per_s = 1200.0;
+    latest.read_ops_per_s = 2200.0;
+    latest.avg_write_latency_us = 80.0;
+
+    write_text_file((std::filesystem::path(baseline_dir) / "20260101T000000.json").string(), BenchmarkResultToJson(early));
+    write_text_file((std::filesystem::path(baseline_dir) / "20260102T000000.json").string(), BenchmarkResultToJson(middle));
+    write_text_file((std::filesystem::path(baseline_dir) / "20260103T000000.json").string(), BenchmarkResultToJson(latest));
+
+    const auto [status, values] = capture_benchmark_trend(baseline_dir);
+    require(status == 0, "benchmark trend should succeed for non-empty baseline directory");
+    require(values.at("count") == "3", "benchmark trend should count all baseline files");
+    require(values.at("oldest_file") == "20260101T000000.json", "benchmark trend should report the oldest file");
+    require(values.at("latest_file") == "20260103T000000.json", "benchmark trend should report the latest file");
+    require(std::stod(values.at("avg_write_ops_per_s")) > 1099.0 &&
+                std::stod(values.at("avg_write_ops_per_s")) < 1101.0,
+            "benchmark trend should report the average write throughput");
+    require(std::stod(values.at("latest_vs_oldest_write_ratio_pct")) > 119.9 &&
+                std::stod(values.at("latest_vs_oldest_write_ratio_pct")) < 120.1,
+            "benchmark trend should report latest-vs-oldest write throughput ratio");
+    require(std::stod(values.at("latest_vs_oldest_latency_ratio_pct")) > 79.9 &&
+                std::stod(values.at("latest_vs_oldest_latency_ratio_pct")) < 80.1,
+            "benchmark trend should report latest-vs-oldest latency ratio");
 }
 
 void test_ordering_and_updates() {
@@ -2658,6 +2801,13 @@ int main(int argc, char* argv[]) {
             const double max_latency_ratio_pct = argc > 6 ? std::stod(argv[6]) : 125.0;
             return run_compare_benchmark_baseline(argv[2], argv[3], min_write_ratio_pct, min_read_ratio_pct, max_latency_ratio_pct);
         }
+        if (command == "trend-baselines") {
+            if (argc != 3) {
+                std::cerr << "Usage: kv_test trend-baselines <baseline_dir>" << std::endl;
+                return 1;
+            }
+            return run_benchmark_trend(argv[2]);
+        }
         if (command == "profile-json") {
             if (argc != 3) {
                 std::cerr << "Usage: kv_test profile-json <balanced|write-heavy|read-heavy|low-latency>" << std::endl;
@@ -2702,7 +2852,7 @@ int main(int argc, char* argv[]) {
             return run_fault_injection_scenario(argv[2], argv[3]);
         }
         std::cerr << "Unknown command: " << command << '\n';
-        std::cerr << "Usage: kv_test [bench|bench-json|bench-baseline-json|compare-baseline|profile-json|soak|inspect-format|rewrite-format|verify-format|compat-matrix|fault-inject]" << std::endl;
+        std::cerr << "Usage: kv_test [bench|bench-json|bench-baseline-json|compare-baseline|trend-baselines|profile-json|soak|inspect-format|rewrite-format|verify-format|compat-matrix|fault-inject]" << std::endl;
         return 1;
     }
 
@@ -2726,6 +2876,7 @@ int main(int argc, char* argv[]) {
         {"benchmark result json reports summary and metrics", test_benchmark_result_json_reports_summary_and_metrics},
         {"compare benchmark baseline passes within thresholds", test_compare_benchmark_baseline_passes_within_thresholds},
         {"compare benchmark baseline rejects regression", test_compare_benchmark_baseline_rejects_regression},
+        {"benchmark trend summarizes history", test_benchmark_trend_summarizes_history},
         {"ordering and updates", test_ordering_and_updates},
         {"compaction persists snapshot and resets WAL", test_compaction_persists_snapshot_and_resets_wal},
         {"truncated WAL tail is ignored", test_truncated_wal_tail_is_ignored},
