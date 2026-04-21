@@ -102,6 +102,9 @@ Exit criteria:
 - 固化一组标准 profile：`balanced`、`write-heavy`、`compaction-heavy`、`recovery-heavy`。
 - 每个 profile 都能输出统一结果摘要。
 
+Current status:
+- 进行中。`balanced`、`write-heavy`、`compaction-heavy` 已支持统一的 JSON stress 摘要与批量脚本；`recovery-heavy` 仍待补齐。
+
 ### 5.2 Artifact-Oriented Reporting
 
 - 将 stress、compatibility、baseline、trend 结果收敛成稳定 artifact 文件。

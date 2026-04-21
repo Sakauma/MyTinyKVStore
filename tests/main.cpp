@@ -312,6 +312,20 @@ struct TrendSummary {
 
 std::string TrendSummaryToJson(const TrendSummary& summary);
 
+struct StressSummary {
+    std::string profile;
+    int duration_seconds = 0;
+    int writer_count = 0;
+    int reader_count = 0;
+    int compactor_count = 0;
+    uint64_t committed_write_requests = 0;
+    uint64_t max_pending_queue_depth = 0;
+    uint64_t manual_compactions_completed = 0;
+    uint64_t auto_compactions_completed = 0;
+    uint64_t observed_fsync_pressure_per_1000_writes = 0;
+    uint64_t last_effective_batch_delay_us = 0;
+};
+
 BenchmarkConfig make_benchmark_config(
     std::string label,
     int writer_count,
@@ -1383,6 +1397,24 @@ std::string TrendSummaryToJson(const TrendSummary& summary) {
     return out.str();
 }
 
+std::string StressSummaryToJson(const StressSummary& summary) {
+    std::ostringstream out;
+    out << '{'
+        << "\"profile\":\"" << summary.profile << "\""
+        << ",\"duration_seconds\":" << summary.duration_seconds
+        << ",\"writer_count\":" << summary.writer_count
+        << ",\"reader_count\":" << summary.reader_count
+        << ",\"compactor_count\":" << summary.compactor_count
+        << ",\"committed_write_requests\":" << summary.committed_write_requests
+        << ",\"max_pending_queue_depth\":" << summary.max_pending_queue_depth
+        << ",\"manual_compactions_completed\":" << summary.manual_compactions_completed
+        << ",\"auto_compactions_completed\":" << summary.auto_compactions_completed
+        << ",\"observed_fsync_pressure_per_1000_writes\":" << summary.observed_fsync_pressure_per_1000_writes
+        << ",\"last_effective_batch_delay_us\":" << summary.last_effective_batch_delay_us
+        << '}';
+    return out.str();
+}
+
 double extract_json_number(const std::string& json, const std::string& key) {
     const std::string needle = "\"" + key + "\":";
     const size_t pos = json.find(needle);
@@ -1456,6 +1488,18 @@ std::optional<ConcurrencyStressProfile> parse_concurrency_stress_profile_name(co
         return ConcurrencyStressProfile::kCompactionHeavy;
     }
     return std::nullopt;
+}
+
+std::string concurrency_stress_profile_name(ConcurrencyStressProfile profile) {
+    switch (profile) {
+        case ConcurrencyStressProfile::kBalanced:
+            return "balanced";
+        case ConcurrencyStressProfile::kWriteHeavy:
+            return "write-heavy";
+        case ConcurrencyStressProfile::kCompactionHeavy:
+            return "compaction-heavy";
+    }
+    return "unknown";
 }
 
 struct SoakProfileConfig {
@@ -2033,6 +2077,25 @@ void test_benchmark_trend_json_reports_recent_window() {
             "trend json should include recent-window write ratios");
     require(json.find("\"recent_write_trend\":\"improving\"") != std::string::npos,
             "trend json should include recent trend classification");
+}
+
+void test_stress_summary_json_reports_profile() {
+    StressSummary summary;
+    summary.profile = "balanced";
+    summary.duration_seconds = 1;
+    summary.writer_count = 8;
+    summary.reader_count = 4;
+    summary.compactor_count = 1;
+    summary.committed_write_requests = 123;
+    summary.max_pending_queue_depth = 7;
+
+    const std::string json = StressSummaryToJson(summary);
+    require(json.find("\"profile\":\"balanced\"") != std::string::npos,
+            "stress summary json should include the profile name");
+    require(json.find("\"committed_write_requests\":123") != std::string::npos,
+            "stress summary json should include committed write counts");
+    require(json.find("\"max_pending_queue_depth\":7") != std::string::npos,
+            "stress summary json should include queue metrics");
 }
 
 void test_compare_benchmark_baseline_passes_within_thresholds() {
@@ -3330,7 +3393,7 @@ void test_objective_throughput_score_can_dominate_latency_pressure() {
             "throughput-dominated objective control should expand the effective batch delay");
 }
 
-void run_concurrency_stress_test(int duration_seconds, ConcurrencyStressProfile profile) {
+StressSummary run_concurrency_stress_capture(int duration_seconds, ConcurrencyStressProfile profile) {
     TestDir dir("concurrency_stress");
     const std::string db_path = dir.file("store.dat");
 
@@ -3482,6 +3545,38 @@ void run_concurrency_stress_test(int duration_seconds, ConcurrencyStressProfile 
                     "reopened state should match the stress oracle for writer-owned keys");
         }
     }
+
+    StressSummary summary;
+    summary.profile = concurrency_stress_profile_name(profile);
+    summary.duration_seconds = duration_seconds;
+    summary.writer_count = config.writer_count;
+    summary.reader_count = config.reader_count;
+    summary.compactor_count = config.compactor_count;
+    summary.committed_write_requests = final_metrics.committed_write_requests;
+    summary.max_pending_queue_depth = final_metrics.max_pending_queue_depth;
+    summary.manual_compactions_completed = final_metrics.manual_compactions_completed;
+    summary.auto_compactions_completed = final_metrics.auto_compactions_completed;
+    summary.observed_fsync_pressure_per_1000_writes = final_metrics.observed_fsync_pressure_per_1000_writes;
+    summary.last_effective_batch_delay_us = final_metrics.last_effective_batch_delay_us;
+    return summary;
+}
+
+void run_concurrency_stress_test(int duration_seconds, ConcurrencyStressProfile profile) {
+    const StressSummary summary = run_concurrency_stress_capture(duration_seconds, profile);
+    std::cout << "[STRESS]"
+              << " profile=" << summary.profile
+              << " duration_seconds=" << summary.duration_seconds
+              << " committed_write_requests=" << summary.committed_write_requests
+              << " max_pending_queue_depth=" << summary.max_pending_queue_depth
+              << " manual_compactions_completed=" << summary.manual_compactions_completed
+              << " auto_compactions_completed=" << summary.auto_compactions_completed
+              << " observed_fsync_pressure_per_1000_writes=" << summary.observed_fsync_pressure_per_1000_writes
+              << " last_effective_batch_delay_us=" << summary.last_effective_batch_delay_us
+              << std::endl;
+}
+
+void run_concurrency_stress_json(int duration_seconds, ConcurrencyStressProfile profile) {
+    std::cout << StressSummaryToJson(run_concurrency_stress_capture(duration_seconds, profile)) << std::endl;
 }
 
 void run_soak_test(int duration_seconds, SoakProfile profile) {
@@ -3853,6 +3948,17 @@ int main(int argc, char* argv[]) {
             run_concurrency_stress_test(duration_seconds, *profile);
             return 0;
         }
+        if (command == "concurrency-stress-json") {
+            const int duration_seconds = argc > 2 ? std::stoi(argv[2]) : 10;
+            const std::string profile_name = argc > 3 ? argv[3] : "balanced";
+            const auto profile = parse_concurrency_stress_profile_name(profile_name);
+            if (!profile.has_value()) {
+                std::cerr << "Unknown concurrency stress profile: " << profile_name << std::endl;
+                return 1;
+            }
+            run_concurrency_stress_json(duration_seconds, *profile);
+            return 0;
+        }
         if (command == "inspect-format") {
             if (argc != 3) {
                 std::cerr << "Usage: kv_test inspect-format <db_path>" << std::endl;
@@ -3885,7 +3991,7 @@ int main(int argc, char* argv[]) {
             return run_fault_injection_scenario(argv[2], argv[3]);
         }
         std::cerr << "Unknown command: " << command << '\n';
-        std::cerr << "Usage: kv_test [bench|microbench|microbench-json|bench-json|bench-baseline-json|compare-baseline|trend-baselines|trend-baselines-json|profile-json|soak|concurrency-stress|inspect-format|rewrite-format|verify-format|compat-matrix|fault-inject]" << std::endl;
+        std::cerr << "Usage: kv_test [bench|microbench|microbench-json|bench-json|bench-baseline-json|compare-baseline|trend-baselines|trend-baselines-json|profile-json|soak|concurrency-stress|concurrency-stress-json|inspect-format|rewrite-format|verify-format|compat-matrix|fault-inject]" << std::endl;
         return 1;
     }
 
@@ -3911,6 +4017,7 @@ int main(int argc, char* argv[]) {
         {"benchmark result json reports summary and metrics", test_benchmark_result_json_reports_summary_and_metrics},
         {"microbench json reports cases", test_microbench_json_reports_cases},
         {"benchmark trend json reports recent window", test_benchmark_trend_json_reports_recent_window},
+        {"stress summary json reports profile", test_stress_summary_json_reports_profile},
         {"compare benchmark baseline passes within thresholds", test_compare_benchmark_baseline_passes_within_thresholds},
         {"compare benchmark baseline rejects regression", test_compare_benchmark_baseline_rejects_regression},
         {"benchmark trend summarizes history", test_benchmark_trend_summarizes_history},
