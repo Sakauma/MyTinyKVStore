@@ -1,6 +1,4 @@
 #include "kvstore.h"
-#include "internal/format.h"
-#include "internal/metrics_helpers.h"
 #include "tests/common/cli_entrypoints.h"
 #include "tests/common/runtime_entrypoints.h"
 #include "tests/common/test_support.h"
@@ -1754,102 +1752,6 @@ int run_profile_json(const std::string& name) {
     return 0;
 }
 
-void test_internal_format_helpers_round_trip_keys() {
-    const std::string int_key = kvstore::internal::encode_int_key(42);
-    const std::string string_key = kvstore::internal::encode_string_key("alpha");
-    const std::string binary_key =
-        kvstore::internal::encode_binary_key(std::vector<uint8_t> {0x00, 0x7F, 0xFF});
-
-    require(!int_key.empty() && int_key.front() == kvstore::internal::kIntKeyTag,
-            "encoded int keys should carry the int namespace tag");
-    require(kvstore::internal::is_string_key(string_key),
-            "encoded string keys should be recognized as string keys");
-    require(kvstore::internal::decode_string_key(string_key) == "alpha",
-            "string key helpers should round-trip the original string key");
-    require(!binary_key.empty() && binary_key.front() == kvstore::internal::kBinaryKeyTag,
-            "encoded binary keys should carry the binary namespace tag");
-}
-
-void test_internal_format_helpers_checksum_distinguishes_payloads() {
-    const std::string key = kvstore::internal::encode_string_key("checksum");
-    const Value first = text("value_a");
-    const Value second = text("value_b");
-
-    const uint32_t first_checksum =
-        kvstore::internal::checksum_record(kvstore::internal::WalRecordType::kPut, key, first);
-    const uint32_t second_checksum =
-        kvstore::internal::checksum_record(kvstore::internal::WalRecordType::kPut, key, second);
-    const uint32_t delete_checksum =
-        kvstore::internal::checksum_record(kvstore::internal::WalRecordType::kDelete, key, Value {});
-
-    require(first_checksum != second_checksum,
-            "checksum helper should change when the payload changes");
-    require(first_checksum != delete_checksum,
-            "checksum helper should change when the record type changes");
-}
-
-void test_internal_metrics_helpers_compute_percentiles_and_ratios() {
-    std::array<uint64_t, kWriteLatencyBucketCount> histogram {};
-    histogram[0] = 1;
-    histogram[4] = 2;
-    histogram[7] = 1;
-
-    require(kvstore::internal::approximate_latency_percentile_us(histogram, 1, 2) == 1000,
-            "p50 helper should map into the first bucket that crosses the 50th percentile");
-    require(kvstore::internal::approximate_latency_percentile_us(histogram, 95, 100) == 10000,
-            "p95 helper should map into the tail bucket that crosses the percentile");
-    require(kvstore::internal::capped_ratio_milli(16, 4) == 4000,
-            "ratio helper should cap values at 4x");
-    require(kvstore::internal::weighted_signal_score(200, 100, 3) == 6000,
-            "weighted signal score should scale the capped ratio by the given weight");
-    require(kvstore::internal::weighted_deficit_score(4, 8, 2) == 1000,
-            "weighted deficit score should reflect the observed gap to target");
-}
-
-void test_ordering_and_updates() {
-    TestDir dir("ordering");
-    const std::string db_path = dir.file("store.dat");
-
-    {
-        KVStore store(db_path);
-        store.Put(3, text("v1"));
-        store.Delete(3);
-        store.Put(3, text("v2"));
-        store.Put(4, text("keep"));
-    }
-
-    KVStore reopened(db_path);
-    const auto latest = reopened.Get(3);
-    const auto other = reopened.Get(4);
-    require(latest.has_value(), "key 3 should exist after final put");
-    require(other.has_value(), "key 4 should exist after replay");
-    require(as_string(*latest) == "v2", "operations must replay in commit order");
-    require(as_string(*other) == "keep", "other keys should be unaffected");
-}
-
-void test_compaction_persists_snapshot_and_resets_wal() {
-    TestDir dir("compaction");
-    const std::string db_path = dir.file("store.dat");
-    const std::string wal_path = db_path + ".wal";
-
-    {
-        KVStore store(db_path);
-        store.Put(1, text("one"));
-        store.Put(2, text("two"));
-        store.Delete(1);
-        store.Compact();
-    }
-
-    require(file_size_or_zero(db_path) > 16, "compaction should materialize live data into the snapshot");
-    require(file_size_or_zero(wal_path) == 0, "compaction should rotate to an empty WAL");
-
-    KVStore reopened(db_path);
-    require(!reopened.Get(1).has_value(), "deleted key must not reappear after compaction");
-    const auto survivor = reopened.Get(2);
-    require(survivor.has_value(), "live key must survive compaction");
-    require(as_string(*survivor) == "two", "compaction should keep the latest snapshot value");
-}
-
 StressSummary run_concurrency_stress_capture(int duration_seconds, ConcurrencyStressProfile profile) {
     TestDir dir("concurrency_stress");
     const std::string db_path = dir.file("store.dat");
@@ -2702,18 +2604,11 @@ int main(int argc, char* argv[]) {
     kvstore::tests::integration::TestCases tests;
     kvstore::tests::integration::register_basic_kv_tests(tests);
     kvstore::tests::integration::register_benchmark_trend_tests(tests);
+    kvstore::tests::integration::register_durability_smoke_tests(tests);
     kvstore::tests::integration::register_json_cli_tests(tests);
     kvstore::tests::integration::register_metrics_controller_tests(tests);
     kvstore::tests::integration::register_recovery_format_tests(tests);
     kvstore::tests::integration::register_runtime_concurrency_tests(tests);
-    const std::vector<test_support::NamedTest> remaining_tests = {
-        {"internal format helpers round trip keys", test_internal_format_helpers_round_trip_keys},
-        {"internal format helpers checksum distinguishes payloads", test_internal_format_helpers_checksum_distinguishes_payloads},
-        {"internal metrics helpers compute percentiles and ratios", test_internal_metrics_helpers_compute_percentiles_and_ratios},
-        {"ordering and updates", test_ordering_and_updates},
-        {"compaction persists snapshot and resets WAL", test_compaction_persists_snapshot_and_resets_wal},
-    };
-    tests.insert(tests.end(), remaining_tests.begin(), remaining_tests.end());
 
     size_t passed = 0;
     for (const auto& [name, test] : tests) {

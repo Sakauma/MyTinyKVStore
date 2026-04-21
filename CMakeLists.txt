@@ -70,6 +70,7 @@ add_executable(kv_test
     tests/common/test_support.cpp
     tests/integration/basic_kv_tests.cpp
     tests/integration/benchmark_trend_tests.cpp
+    tests/integration/durability_smoke_tests.cpp
     tests/integration/json_cli_tests.cpp
     tests/integration/metrics_controller_tests.cpp
     tests/integration/recovery_format_tests.cpp
@@ -84,6 +85,7 @@ kvstore_apply_coverage(kv_test)
 
 add_executable(kv_unit_test
     tests/common/test_support.cpp
+    tests/unit/internal_helpers_test.cpp
     tests/unit/request_runtime_test.cpp
     tests/unit/unit_main.cpp
     tests/unit/wal_accounting_test.cpp
