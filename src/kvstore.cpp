@@ -3,6 +3,7 @@
 #include "internal/io.h"
 #include "internal/metrics_helpers.h"
 #include "internal/observability.h"
+#include "internal/recovery.h"
 
 #include <algorithm>
 #include <atomic>
@@ -67,9 +68,15 @@ public:
           wal_bytes_since_compaction_(0),
           stop_(false),
           has_fatal_error_(false) {
-        ensure_snapshot_exists();
-        load_snapshot();
-        replay_wal();
+        ensure_snapshot_file_exists(db_file_path_);
+        {
+            std::unique_lock<std::shared_mutex> lock(state_mutex_);
+            load_snapshot_into_state(db_file_path_, state_);
+            replay_wal_into_state(
+                wal_file_path_,
+                state_,
+                [this](const std::string& key, uint64_t record_size) { note_latest_wal_record(key, record_size); });
+        }
         wal_bytes_since_compaction_.store(current_wal_file_size(), std::memory_order_relaxed);
         open_wal_for_append();
         writer_thread_ = std::thread(&Impl::writer_loop, this);
@@ -1177,19 +1184,6 @@ private:
             std::memory_order_relaxed);
     }
 
-    void ensure_snapshot_exists() {
-        if (std::filesystem::exists(db_file_path_)) {
-            return;
-        }
-
-        const int fd = open_or_throw(db_file_path_, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        const SnapshotHeader header = make_snapshot_header();
-        write_all(fd, &header, sizeof(header));
-        fsync_file(fd, db_file_path_);
-        ::close(fd);
-        fsync_directory(db_file_path_);
-    }
-
     void open_wal_for_append() {
         wal_fd_ = open_or_throw(wal_file_path_, O_WRONLY | O_CREAT | O_APPEND, 0644);
     }
@@ -1204,166 +1198,6 @@ private:
         std::error_code ec;
         const auto size = std::filesystem::file_size(wal_file_path_, ec);
         return ec ? 0 : static_cast<uint64_t>(size);
-    }
-
-    void load_snapshot() {
-        std::unique_lock<std::shared_mutex> lock(state_mutex_);
-        state_.clear();
-        const int fd = open_or_throw(db_file_path_, O_RDONLY);
-        SnapshotHeader header {};
-        const size_t header_bytes = read_up_to(fd, &header, sizeof(header));
-        if (header_bytes != sizeof(header)) {
-            ::close(fd);
-            throw KVStoreError("Snapshot header is truncated: " + db_file_path_);
-        }
-        if (std::memcmp(header.magic, kSnapshotMagic, sizeof(kSnapshotMagic)) != 0) {
-            ::close(fd);
-            throw KVStoreError("Snapshot magic mismatch: " + db_file_path_);
-        }
-        if (header.version != 1 && header.version != kSnapshotVersion) {
-            ::close(fd);
-            throw KVStoreError("Unsupported snapshot version: " + std::to_string(header.version));
-        }
-
-        while (true) {
-            SnapshotEntryHeader entry {};
-            const size_t entry_bytes = read_up_to(fd, &entry, sizeof(entry));
-            if (entry_bytes == 0) {
-                break;
-            }
-            if (entry_bytes != sizeof(entry)) {
-                ::close(fd);
-                throw KVStoreError("Snapshot entry header is truncated: " + db_file_path_);
-            }
-            if (entry.magic != kSnapshotEntryMagic) {
-                ::close(fd);
-                throw KVStoreError("Snapshot entry magic mismatch: " + db_file_path_);
-            }
-
-            std::string key;
-            uint32_t value_size = entry.value_size;
-            if (header.version == 1) {
-                key = encode_int_key(static_cast<int32_t>(entry.key_size));
-            } else {
-                key.resize(entry.key_size);
-                if (!key.empty()) {
-                    const size_t key_bytes = read_up_to(fd, key.data(), key.size());
-                    if (key_bytes != key.size()) {
-                        ::close(fd);
-                        throw KVStoreError("Snapshot key is truncated: " + db_file_path_);
-                    }
-                }
-            }
-
-            std::vector<uint8_t> data(value_size);
-            if (!data.empty()) {
-                const size_t value_bytes = read_up_to(fd, data.data(), data.size());
-                if (value_bytes != data.size()) {
-                    ::close(fd);
-                    throw KVStoreError("Snapshot value is truncated: " + db_file_path_);
-                }
-            }
-            state_[key] = Value(std::move(data));
-        }
-
-        ::close(fd);
-    }
-
-    void replay_wal() {
-        const int fd = open_or_throw(wal_file_path_, O_RDONLY | O_CREAT, 0644);
-        struct stat st {};
-        if (::fstat(fd, &st) != 0) {
-            ::close(fd);
-            throw io_error("fstat", wal_file_path_);
-        }
-
-        std::unique_lock<std::shared_mutex> lock(state_mutex_);
-        const off_t file_size = st.st_size;
-        off_t offset = 0;
-        while (offset < file_size) {
-            if (file_size - offset < static_cast<off_t>(sizeof(WalRecordHeader))) {
-                break;
-            }
-
-            WalRecordHeader header {};
-            const size_t header_bytes = read_up_to(fd, &header, sizeof(header));
-            if (header_bytes != sizeof(header)) {
-                ::close(fd);
-                throw KVStoreError("WAL header truncated before EOF: " + wal_file_path_);
-            }
-            offset += sizeof(header);
-
-            if (header.magic != kWalMagic) {
-                ::close(fd);
-                throw KVStoreError("WAL magic mismatch at offset " + std::to_string(offset - sizeof(header)));
-            }
-            if (header.version != 1 && header.version != kWalVersion) {
-                ::close(fd);
-                throw KVStoreError("Unsupported WAL version: " + std::to_string(header.version));
-            }
-            if (header.type != static_cast<uint8_t>(WalRecordType::kPut) &&
-                header.type != static_cast<uint8_t>(WalRecordType::kDelete)) {
-                ::close(fd);
-                throw KVStoreError("Unknown WAL record type at offset " + std::to_string(offset - sizeof(header)));
-            }
-            if (header.type == static_cast<uint8_t>(WalRecordType::kDelete) && header.value_size != 0) {
-                ::close(fd);
-                throw KVStoreError("Delete WAL record has payload at offset " + std::to_string(offset - sizeof(header)));
-            }
-
-            std::string key;
-            int32_t legacy_key = 0;
-            if (header.version == 1) {
-                legacy_key = static_cast<int32_t>(header.key_size);
-                key = encode_int_key(legacy_key);
-                if (offset + header.value_size > file_size) {
-                    break;
-                }
-            } else {
-                if (offset + header.key_size + header.value_size > file_size) {
-                    break;
-                }
-                key.resize(header.key_size);
-                if (!key.empty()) {
-                    const size_t key_bytes = read_up_to(fd, key.data(), key.size());
-                    if (key_bytes != key.size()) {
-                        ::close(fd);
-                        throw KVStoreError("WAL key truncated before EOF: " + wal_file_path_);
-                    }
-                }
-                offset += header.key_size;
-            }
-
-            Value value(std::vector<uint8_t>(header.value_size));
-            if (!value.bytes.empty()) {
-                const size_t payload_bytes = read_up_to(fd, value.bytes.data(), value.bytes.size());
-                if (payload_bytes != value.bytes.size()) {
-                    ::close(fd);
-                    throw KVStoreError("WAL payload truncated before EOF: " + wal_file_path_);
-                }
-            }
-            offset += header.value_size;
-
-            const auto type = static_cast<WalRecordType>(header.type);
-            const uint32_t expected_checksum =
-                header.version == 1 ? checksum_record_v1(type, legacy_key, value)
-                                    : checksum_record(type, key, value);
-            if (expected_checksum != header.checksum) {
-                ::close(fd);
-                throw KVStoreError("WAL checksum mismatch at offset " + std::to_string(offset - sizeof(header) - header.value_size));
-            }
-
-            if (type == WalRecordType::kPut) {
-                state_[key] = std::move(value);
-            } else {
-                state_.erase(key);
-            }
-
-            note_latest_wal_record(key, sizeof(WalRecordHeader) + key.size() + header.value_size);
-        }
-
-        wal_bytes_since_compaction_.store(current_wal_file_size(), std::memory_order_relaxed);
-        ::close(fd);
     }
 
     uint64_t append_wal_record(WalRecordType type, const std::string& key, const Value& value) {

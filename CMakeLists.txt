@@ -49,6 +49,7 @@ add_library(kvstore SHARED
     src/internal/io.cpp
     src/internal/metrics_helpers.cpp
     src/internal/observability.cpp
+    src/internal/recovery.cpp
 )
 target_include_directories(kvstore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(kvstore PRIVATE Threads::Threads)
