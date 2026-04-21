@@ -3672,11 +3672,11 @@ void test_objective_short_delay_owns_delay_decision_when_enabled() {
     const std::string db_path = dir.file("store.dat");
 
     KVStoreOptions options;
-    options.max_batch_size = 16;
+    options.max_batch_size = 1;
     options.max_batch_delay_us = 50000;
-    options.adaptive_flush_enabled = true;
-    options.adaptive_flush_queue_depth_threshold = 1;
-    options.adaptive_flush_delay_divisor = 10;
+    options.adaptive_batching_enabled = true;
+    options.adaptive_queue_depth_threshold = 1;
+    options.adaptive_batch_size_multiplier = 4;
     options.adaptive_flush_min_batch_delay_us = 1000;
     options.adaptive_objective_enabled = true;
     options.adaptive_objective_queue_weight = 4;
@@ -3689,14 +3689,35 @@ void test_objective_short_delay_owns_delay_decision_when_enabled() {
     options.adaptive_objective_short_delay_divisor = 10;
 
     KVStore store(db_path, options);
-    store.Put(1, text("objective_owned_delay_a"));
-    store.Put(2, text("objective_owned_delay_b"));
+
+    constexpr int kWriterCount = 4;
+    std::atomic<int> ready {0};
+    std::atomic<bool> start_signal {false};
+    std::vector<std::thread> writers;
+
+    for (int writer_id = 0; writer_id < kWriterCount; ++writer_id) {
+        writers.emplace_back([&store, &ready, &start_signal, writer_id]() {
+            wait_for_start(ready, start_signal, kWriterCount);
+            store.Put(writer_id, text("objective_owned_delay_" + std::to_string(writer_id)));
+        });
+    }
+
+    while (ready.load(std::memory_order_acquire) < kWriterCount) {
+        std::this_thread::yield();
+    }
+    start_signal.store(true, std::memory_order_release);
+
+    for (auto& writer : writers) {
+        writer.join();
+    }
 
     const KVStoreMetrics metrics = store.GetMetrics();
     require(metrics.adaptive_objective_short_delay_batches_completed >= 1,
             "objective should own the short-delay decision when it is enabled");
     require(metrics.adaptive_flush_batches_completed == 0,
             "adaptive flush should not directly shorten delay when objective control is enabled");
+    require(metrics.max_pending_queue_depth >= 1,
+            "queue pressure should still be observed without adaptive flush");
     require(metrics.last_effective_batch_delay_us < options.max_batch_delay_us,
             "objective-owned short delay should still reduce the effective batch delay");
 }

@@ -103,6 +103,7 @@ Exit criteria:
 
 Current status:
 - 已开始第一刀简化：`objective` 启用时，`adaptive_flush` 不再直接修改 `batch_delay_us`，delay 缩短统一由 objective 决策；`adaptive_flush_min_batch_delay_us` 继续保留为 safety floor。
+- 已完成第二刀去耦合：queue-pressure 的 objective 评分不再依赖 `adaptive_flush_queue_depth_threshold`，而是只由 queue 深度与 `adaptive_batching` 阈值驱动，进一步减少 delay 决策路径交叉。
 
 ## Phase 5: Long-Run Evidence Pipeline
 

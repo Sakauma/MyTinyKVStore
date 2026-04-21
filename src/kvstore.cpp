@@ -588,11 +588,9 @@ private:
             const uint64_t observed_queue_depth =
                 std::max<uint64_t>(request_queue_.size(), recent_peak_queue_depth);
             const uint64_t queue_scale =
-                options_.adaptive_flush_enabled
-                    ? options_.adaptive_flush_queue_depth_threshold
-                    : (options_.adaptive_batching_enabled
-                           ? options_.adaptive_queue_depth_threshold
-                           : options_.max_batch_size);
+                options_.adaptive_batching_enabled
+                    ? options_.adaptive_queue_depth_threshold
+                    : options_.max_batch_size;
             const uint64_t pressure_score =
                 weighted_signal_score(observed_queue_depth, queue_scale, options_.adaptive_objective_queue_weight) +
                 weighted_signal_score(
