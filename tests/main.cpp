@@ -823,6 +823,24 @@ void test_batching_metrics_are_reported() {
             "latency histogram should account for every committed write");
 }
 
+void test_metrics_to_json_reports_core_fields() {
+    TestDir dir("metrics_json");
+    const std::string db_path = dir.file("store.dat");
+    KVStore store(db_path);
+
+    store.Put(1, text("json"));
+    store.Delete(1);
+
+    const std::string json = MetricsToJson(store.GetMetrics());
+    require(!json.empty() && json.front() == '{' && json.back() == '}', "metrics json should be a JSON object");
+    require(json.find("\"committed_write_requests\":2") != std::string::npos,
+            "metrics json should include committed write counts");
+    require(json.find("\"write_latency_histogram\":[") != std::string::npos,
+            "metrics json should include the latency histogram array");
+    require(json.find("\"wal_fsync_calls\":") != std::string::npos,
+            "metrics json should include fsync metrics");
+}
+
 void test_auto_compaction_triggers_and_preserves_state() {
     TestDir dir("auto_compaction");
     const std::string db_path = dir.file("store.dat");
@@ -1733,6 +1751,28 @@ void run_benchmark() {
               << std::endl;
 }
 
+void run_benchmark_json() {
+    TestDir dir("bench_json");
+    const std::string db_path = dir.file("store.dat");
+    KVStoreOptions options;
+    options.max_batch_size = 16;
+    options.max_batch_delay_us = 1000;
+    options.adaptive_flush_enabled = true;
+    options.adaptive_flush_queue_depth_threshold = 4;
+    options.adaptive_flush_delay_divisor = 4;
+    options.adaptive_flush_min_batch_delay_us = 100;
+
+    KVStore store(db_path, options);
+    for (int i = 0; i < 128; ++i) {
+        store.Put(i, text("bench_json_" + std::to_string(i)));
+    }
+    for (int i = 0; i < 256; ++i) {
+        (void)store.Get(i % 128);
+    }
+
+    std::cout << MetricsToJson(store.GetMetrics()) << std::endl;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -1741,6 +1781,10 @@ int main(int argc, char* argv[]) {
         const std::string command = argv[1];
         if (command == "bench") {
             run_benchmark();
+            return 0;
+        }
+        if (command == "bench-json") {
+            run_benchmark_json();
             return 0;
         }
         if (command == "soak") {
@@ -1770,7 +1814,7 @@ int main(int argc, char* argv[]) {
             return run_fault_injection_scenario(argv[2], argv[3]);
         }
         std::cerr << "Unknown command: " << command << '\n';
-        std::cerr << "Usage: kv_test [bench|soak|inspect-format|rewrite-format|fault-inject]" << std::endl;
+        std::cerr << "Usage: kv_test [bench|bench-json|soak|inspect-format|rewrite-format|fault-inject]" << std::endl;
         return 1;
     }
 
@@ -1797,6 +1841,7 @@ int main(int argc, char* argv[]) {
         {"many concurrent writers", test_many_concurrent_writers},
         {"concurrent compaction with writes", test_concurrent_compaction_with_writes},
         {"batching metrics are reported", test_batching_metrics_are_reported},
+        {"metrics to json reports core fields", test_metrics_to_json_reports_core_fields},
         {"auto compaction triggers and preserves state", test_auto_compaction_triggers_and_preserves_state},
         {"manual and auto compaction metrics coexist", test_manual_and_auto_compaction_metrics_coexist},
         {"invalid wal ratio triggers auto compaction", test_invalid_wal_ratio_triggers_auto_compaction},

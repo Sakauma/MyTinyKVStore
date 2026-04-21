@@ -13,6 +13,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -1705,4 +1706,72 @@ void KVStore::Compact() {
 
 KVStoreMetrics KVStore::GetMetrics() {
     return pimpl_->GetMetrics();
+}
+
+std::string MetricsToJson(const KVStoreMetrics& metrics) {
+    std::ostringstream out;
+    out << '{'
+        << "\"read_requests\":" << metrics.read_requests
+        << ",\"enqueued_write_requests\":" << metrics.enqueued_write_requests
+        << ",\"committed_write_requests\":" << metrics.committed_write_requests
+        << ",\"committed_write_batches\":" << metrics.committed_write_batches
+        << ",\"compact_requests\":" << metrics.compact_requests
+        << ",\"wal_fsync_calls\":" << metrics.wal_fsync_calls
+        << ",\"wal_bytes_written\":" << metrics.wal_bytes_written
+        << ",\"wal_bytes_since_compaction\":" << metrics.wal_bytes_since_compaction
+        << ",\"live_wal_bytes_since_compaction\":" << metrics.live_wal_bytes_since_compaction
+        << ",\"obsolete_wal_bytes_since_compaction\":" << metrics.obsolete_wal_bytes_since_compaction
+        << ",\"last_committed_batch_size\":" << metrics.last_committed_batch_size
+        << ",\"max_committed_batch_size\":" << metrics.max_committed_batch_size
+        << ",\"last_committed_batch_wal_bytes\":" << metrics.last_committed_batch_wal_bytes
+        << ",\"max_committed_batch_wal_bytes\":" << metrics.max_committed_batch_wal_bytes
+        << ",\"pending_queue_depth\":" << metrics.pending_queue_depth
+        << ",\"max_pending_queue_depth\":" << metrics.max_pending_queue_depth
+        << ",\"manual_compactions_completed\":" << metrics.manual_compactions_completed
+        << ",\"auto_compactions_completed\":" << metrics.auto_compactions_completed
+        << ",\"adaptive_batches_completed\":" << metrics.adaptive_batches_completed
+        << ",\"adaptive_flush_batches_completed\":" << metrics.adaptive_flush_batches_completed
+        << ",\"adaptive_latency_target_batches_completed\":" << metrics.adaptive_latency_target_batches_completed
+        << ",\"adaptive_fsync_pressure_batches_completed\":" << metrics.adaptive_fsync_pressure_batches_completed
+        << ",\"adaptive_read_heavy_batches_completed\":" << metrics.adaptive_read_heavy_batches_completed
+        << ",\"adaptive_compaction_pressure_batches_completed\":" << metrics.adaptive_compaction_pressure_batches_completed
+        << ",\"adaptive_wal_growth_batches_completed\":" << metrics.adaptive_wal_growth_batches_completed
+        << ",\"adaptive_objective_short_delay_batches_completed\":" << metrics.adaptive_objective_short_delay_batches_completed
+        << ",\"adaptive_objective_long_delay_batches_completed\":" << metrics.adaptive_objective_long_delay_batches_completed
+        << ",\"adaptive_objective_throughput_batches_completed\":" << metrics.adaptive_objective_throughput_batches_completed
+        << ",\"writer_wait_events\":" << metrics.writer_wait_events
+        << ",\"writer_wait_time_us\":" << metrics.writer_wait_time_us
+        << ",\"last_effective_batch_delay_us\":" << metrics.last_effective_batch_delay_us
+        << ",\"min_effective_batch_delay_us\":" << metrics.min_effective_batch_delay_us
+        << ",\"max_effective_batch_delay_us\":" << metrics.max_effective_batch_delay_us
+        << ",\"observed_fsync_pressure_per_1000_writes\":" << metrics.observed_fsync_pressure_per_1000_writes
+        << ",\"last_objective_pressure_score\":" << metrics.last_objective_pressure_score
+        << ",\"last_objective_cost_score\":" << metrics.last_objective_cost_score
+        << ",\"last_objective_throughput_score\":" << metrics.last_objective_throughput_score
+        << ",\"last_objective_balance_score\":" << metrics.last_objective_balance_score
+        << ",\"last_objective_mode\":" << metrics.last_objective_mode
+        << ",\"total_snapshot_bytes_written\":" << metrics.total_snapshot_bytes_written
+        << ",\"total_wal_bytes_reclaimed_by_compaction\":" << metrics.total_wal_bytes_reclaimed_by_compaction
+        << ",\"approx_write_latency_p50_us\":" << metrics.approx_write_latency_p50_us
+        << ",\"approx_write_latency_p95_us\":" << metrics.approx_write_latency_p95_us
+        << ",\"approx_write_latency_p99_us\":" << metrics.approx_write_latency_p99_us
+        << ",\"recent_read_requests\":" << metrics.recent_read_requests
+        << ",\"recent_write_requests\":" << metrics.recent_write_requests
+        << ",\"recent_read_ratio_per_1000_ops\":" << metrics.recent_read_ratio_per_1000_ops
+        << ",\"recent_observed_write_latency_p95_us\":" << metrics.recent_observed_write_latency_p95_us
+        << ",\"recent_peak_queue_depth\":" << metrics.recent_peak_queue_depth
+        << ",\"recent_avg_batch_size\":" << metrics.recent_avg_batch_size
+        << ",\"recent_batch_fill_per_1000\":" << metrics.recent_batch_fill_per_1000
+        << ",\"recent_avg_batch_wal_bytes\":" << metrics.recent_avg_batch_wal_bytes
+        << ",\"recent_window_batch_count\":" << metrics.recent_window_batch_count
+        << ",\"observed_obsolete_wal_ratio_percent\":" << metrics.observed_obsolete_wal_ratio_percent
+        << ",\"write_latency_histogram\":[";
+    for (size_t i = 0; i < metrics.write_latency_histogram.size(); ++i) {
+        if (i != 0) {
+            out << ',';
+        }
+        out << metrics.write_latency_histogram[i];
+    }
+    out << "]}";
+    return out.str();
 }

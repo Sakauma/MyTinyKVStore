@@ -130,6 +130,8 @@ struct KVStoreMetrics {
     std::array<uint64_t, kWriteLatencyBucketCount> write_latency_histogram {};
 };
 
+std::string MetricsToJson(const KVStoreMetrics& metrics);
+
 class KVStore {
 public:
     explicit KVStore(const std::string& db_path);
