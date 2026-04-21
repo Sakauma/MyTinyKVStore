@@ -67,6 +67,9 @@ Current status:
 - 规范 baseline 存档格式、命名和保留策略。
 - 增加“本次结果相对最近 N 次均值”的输出，不只看 oldest/latest。
 
+Current status:
+- 进行中。趋势摘要已支持 recent-window 均值与 `latest_vs_recent_avg_*` 比例，下一步继续补 baseline 保留策略和 artifact 规范。
+
 ### 3.3 Performance Review Gate
 
 - 把吞吐、尾延迟、`fsync` 压力、batch fill 之外，再逐步纳入：

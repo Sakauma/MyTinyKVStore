@@ -18,10 +18,10 @@
 - `bash scripts/microbench.sh`：构建并运行 microbench。
 - `bash scripts/bench-baseline.sh`：运行 baseline benchmark，并把 JSON 落到 `benchmarks/baselines/<timestamp>.json`。
 - `./build/target/bin/kv_test compare-baseline <baseline_json> <candidate_json> [min_write_ratio_pct min_read_ratio_pct max_latency_ratio_pct]`：比较两份 baseline。
-- `./build/target/bin/kv_test trend-baselines <baseline_dir>`：汇总一组 baseline 的长期趋势。
+- `./build/target/bin/kv_test trend-baselines <baseline_dir> [recent_window]`：汇总一组 baseline 的长期趋势，并额外计算最近 N 次均值。
 - `bash scripts/bench-regression-check.sh <baseline_json>`：生成 candidate baseline，并按默认阈值执行回归检查。
 - `bash scripts/ci-bench-regression.sh`：使用仓库提交的 `benchmarks/reference/ci-floor.json` 作为 CI floor。
-- `bash scripts/bench-trend.sh [baseline_dir]`：对一组历史 baseline 输出趋势摘要。
+- `bash scripts/bench-trend.sh [baseline_dir] [recent_window]`：对一组历史 baseline 输出趋势摘要。
 
 ## JSON Shape
 
@@ -69,8 +69,12 @@
 
 - `count`：纳入统计的 baseline 文件数
 - `oldest_file` / `latest_file`：最早与最新的 baseline 文件
+- `recent_window_count`：本次统计实际使用的 recent-window 长度
 - `avg_*` / `min_*` / `max_*`：该组 baseline 的均值、最小值和最大值
+- `recent_avg_*`：最近 N 次样本的均值
 - `latest_vs_oldest_*_ratio_pct`：最新结果相对最早结果的比例
+- `latest_vs_recent_avg_*_ratio_pct`：最新结果相对 recent-window 均值的比例
 - `write_trend` / `read_trend` / `latency_trend`：基于最新相对最早结果的方向判断，取值为 `improving` / `stable` / `regressing`
+- `recent_write_trend` / `recent_read_trend` / `recent_latency_trend`：基于最新相对 recent-window 均值的方向判断
 
-这个趋势摘要适合观察一段时间内的大方向变化，但它还不是完整的时序分析或可视化系统。
+这个趋势摘要适合同时观察长周期变化和短周期偏移，但它还不是完整的时序分析或可视化系统。

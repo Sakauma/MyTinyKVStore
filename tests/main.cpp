@@ -85,7 +85,7 @@ struct FormatKeyStats {
 int run_inspect_format(const std::string& db_path);
 int run_verify_format(const std::string& db_path);
 double extract_json_number(const std::string& json, const std::string& key);
-int run_benchmark_trend(const std::string& directory_path);
+int run_benchmark_trend(const std::string& directory_path, size_t recent_window);
 
 Value text(const std::string& input) {
     return Value(std::vector<uint8_t>(input.begin(), input.end()));
@@ -223,10 +223,12 @@ std::pair<int, std::string> capture_verify_format(const std::string& db_path) {
     return {status, out.str()};
 }
 
-std::pair<int, std::map<std::string, std::string>> capture_benchmark_trend(const std::string& directory_path) {
+std::pair<int, std::map<std::string, std::string>> capture_benchmark_trend(
+    const std::string& directory_path,
+    size_t recent_window = 5) {
     std::ostringstream out;
     auto* original = std::cout.rdbuf(out.rdbuf());
-    const int status = run_benchmark_trend(directory_path);
+    const int status = run_benchmark_trend(directory_path, recent_window);
     std::cout.rdbuf(original);
     return {status, parse_kv_line(out.str())};
 }
@@ -1000,7 +1002,7 @@ std::string classify_latency_trend(double ratio_pct) {
     return "stable";
 }
 
-int run_benchmark_trend(const std::string& directory_path) {
+int run_benchmark_trend(const std::string& directory_path, size_t recent_window = 5) {
     std::vector<std::filesystem::path> files;
     for (const auto& entry : std::filesystem::directory_iterator(directory_path)) {
         if (!entry.is_regular_file()) {
@@ -1020,9 +1022,11 @@ int run_benchmark_trend(const std::string& directory_path) {
     for (const auto& path : files) {
         summaries.push_back(load_baseline_summary(path));
     }
+    require(recent_window > 0, "benchmark trend recent window must be positive");
 
     const BaselineSummary& first = summaries.front();
     const BaselineSummary& latest = summaries.back();
+    const size_t recent_count = std::min(recent_window, summaries.size());
     double min_write_ops_per_s = first.write_ops_per_s;
     double max_write_ops_per_s = first.write_ops_per_s;
     double min_read_ops_per_s = first.read_ops_per_s;
@@ -1045,6 +1049,18 @@ int run_benchmark_trend(const std::string& directory_path) {
         sum_avg_write_latency_us += summary.avg_write_latency_us;
     }
 
+    double recent_avg_write_ops_per_s = 0.0;
+    double recent_avg_read_ops_per_s = 0.0;
+    double recent_avg_write_latency_us = 0.0;
+    for (size_t i = summaries.size() - recent_count; i < summaries.size(); ++i) {
+        recent_avg_write_ops_per_s += summaries[i].write_ops_per_s;
+        recent_avg_read_ops_per_s += summaries[i].read_ops_per_s;
+        recent_avg_write_latency_us += summaries[i].avg_write_latency_us;
+    }
+    recent_avg_write_ops_per_s /= recent_count;
+    recent_avg_read_ops_per_s /= recent_count;
+    recent_avg_write_latency_us /= recent_count;
+
     const double avg_write_ops_per_s = sum_write_ops_per_s / summaries.size();
     const double avg_read_ops_per_s = sum_read_ops_per_s / summaries.size();
     const double avg_avg_write_latency_us = sum_avg_write_latency_us / summaries.size();
@@ -1054,28 +1070,47 @@ int run_benchmark_trend(const std::string& directory_path) {
         first.read_ops_per_s == 0.0 ? 0.0 : (latest.read_ops_per_s / first.read_ops_per_s) * 100.0;
     const double latest_vs_first_latency_ratio_pct =
         first.avg_write_latency_us == 0.0 ? 0.0 : (latest.avg_write_latency_us / first.avg_write_latency_us) * 100.0;
+    const double latest_vs_recent_avg_write_ratio_pct =
+        recent_avg_write_ops_per_s == 0.0 ? 0.0 : (latest.write_ops_per_s / recent_avg_write_ops_per_s) * 100.0;
+    const double latest_vs_recent_avg_read_ratio_pct =
+        recent_avg_read_ops_per_s == 0.0 ? 0.0 : (latest.read_ops_per_s / recent_avg_read_ops_per_s) * 100.0;
+    const double latest_vs_recent_avg_latency_ratio_pct =
+        recent_avg_write_latency_us == 0.0 ? 0.0 : (latest.avg_write_latency_us / recent_avg_write_latency_us) * 100.0;
     const std::string write_trend = classify_throughput_trend(latest_vs_first_write_ratio_pct);
     const std::string read_trend = classify_throughput_trend(latest_vs_first_read_ratio_pct);
     const std::string latency_trend = classify_latency_trend(latest_vs_first_latency_ratio_pct);
+    const std::string recent_write_trend = classify_throughput_trend(latest_vs_recent_avg_write_ratio_pct);
+    const std::string recent_read_trend = classify_throughput_trend(latest_vs_recent_avg_read_ratio_pct);
+    const std::string recent_latency_trend = classify_latency_trend(latest_vs_recent_avg_latency_ratio_pct);
 
     std::cout << "count=" << summaries.size()
               << " oldest_file=" << first.file_name
               << " latest_file=" << latest.file_name
+              << " recent_window_count=" << recent_count
               << " avg_write_ops_per_s=" << avg_write_ops_per_s
               << " min_write_ops_per_s=" << min_write_ops_per_s
               << " max_write_ops_per_s=" << max_write_ops_per_s
+              << " recent_avg_write_ops_per_s=" << recent_avg_write_ops_per_s
               << " avg_read_ops_per_s=" << avg_read_ops_per_s
               << " min_read_ops_per_s=" << min_read_ops_per_s
               << " max_read_ops_per_s=" << max_read_ops_per_s
+              << " recent_avg_read_ops_per_s=" << recent_avg_read_ops_per_s
               << " avg_write_latency_us=" << avg_avg_write_latency_us
               << " min_write_latency_us=" << min_avg_write_latency_us
               << " max_write_latency_us=" << max_avg_write_latency_us
+              << " recent_avg_write_latency_us=" << recent_avg_write_latency_us
               << " latest_vs_oldest_write_ratio_pct=" << latest_vs_first_write_ratio_pct
               << " write_trend=" << write_trend
+              << " latest_vs_recent_avg_write_ratio_pct=" << latest_vs_recent_avg_write_ratio_pct
+              << " recent_write_trend=" << recent_write_trend
               << " latest_vs_oldest_read_ratio_pct=" << latest_vs_first_read_ratio_pct
               << " read_trend=" << read_trend
+              << " latest_vs_recent_avg_read_ratio_pct=" << latest_vs_recent_avg_read_ratio_pct
+              << " recent_read_trend=" << recent_read_trend
               << " latest_vs_oldest_latency_ratio_pct=" << latest_vs_first_latency_ratio_pct
               << " latency_trend=" << latency_trend
+              << " latest_vs_recent_avg_latency_ratio_pct=" << latest_vs_recent_avg_latency_ratio_pct
+              << " recent_latency_trend=" << recent_latency_trend
               << std::endl;
     return 0;
 }
@@ -1948,26 +1983,42 @@ void test_benchmark_trend_summarizes_history() {
     write_text_file((std::filesystem::path(baseline_dir) / "20260102T000000.json").string(), BenchmarkResultToJson(middle));
     write_text_file((std::filesystem::path(baseline_dir) / "20260103T000000.json").string(), BenchmarkResultToJson(latest));
 
-    const auto [status, values] = capture_benchmark_trend(baseline_dir);
+    const auto [status, values] = capture_benchmark_trend(baseline_dir, 2);
     require(status == 0, "benchmark trend should succeed for non-empty baseline directory");
     require(values.at("count") == "3", "benchmark trend should count all baseline files");
     require(values.at("oldest_file") == "20260101T000000.json", "benchmark trend should report the oldest file");
     require(values.at("latest_file") == "20260103T000000.json", "benchmark trend should report the latest file");
+    require(values.at("recent_window_count") == "2", "benchmark trend should report the applied recent window size");
     require(std::stod(values.at("avg_write_ops_per_s")) > 1099.0 &&
                 std::stod(values.at("avg_write_ops_per_s")) < 1101.0,
             "benchmark trend should report the average write throughput");
+    require(std::stod(values.at("recent_avg_write_ops_per_s")) > 1149.0 &&
+                std::stod(values.at("recent_avg_write_ops_per_s")) < 1151.0,
+            "benchmark trend should report the recent-window average write throughput");
     require(std::stod(values.at("latest_vs_oldest_write_ratio_pct")) > 119.9 &&
                 std::stod(values.at("latest_vs_oldest_write_ratio_pct")) < 120.1,
             "benchmark trend should report latest-vs-oldest write throughput ratio");
+    require(std::stod(values.at("latest_vs_recent_avg_write_ratio_pct")) > 104.2 &&
+                std::stod(values.at("latest_vs_recent_avg_write_ratio_pct")) < 104.4,
+            "benchmark trend should report latest-vs-recent-average write throughput ratio");
     require(values.at("write_trend") == "improving",
             "benchmark trend should classify higher write throughput as improving");
+    require(values.at("recent_write_trend") == "stable",
+            "benchmark trend should classify small recent throughput differences as stable");
     require(values.at("read_trend") == "improving",
             "benchmark trend should classify higher read throughput as improving");
+    require(values.at("recent_read_trend") == "improving",
+            "benchmark trend should classify recent read throughput against the recent window");
     require(std::stod(values.at("latest_vs_oldest_latency_ratio_pct")) > 79.9 &&
                 std::stod(values.at("latest_vs_oldest_latency_ratio_pct")) < 80.1,
             "benchmark trend should report latest-vs-oldest latency ratio");
+    require(std::stod(values.at("latest_vs_recent_avg_latency_ratio_pct")) > 94.0 &&
+                std::stod(values.at("latest_vs_recent_avg_latency_ratio_pct")) < 94.2,
+            "benchmark trend should report latest-vs-recent-average latency ratio");
     require(values.at("latency_trend") == "improving",
             "benchmark trend should classify lower latency as improving");
+    require(values.at("recent_latency_trend") == "improving",
+            "benchmark trend should classify lower recent latency as improving");
 }
 
 void test_internal_format_helpers_round_trip_keys() {
@@ -3609,11 +3660,12 @@ int main(int argc, char* argv[]) {
             return run_compare_benchmark_baseline(argv[2], argv[3], min_write_ratio_pct, min_read_ratio_pct, max_latency_ratio_pct);
         }
         if (command == "trend-baselines") {
-            if (argc != 3) {
-                std::cerr << "Usage: kv_test trend-baselines <baseline_dir>" << std::endl;
+            if (argc != 3 && argc != 4) {
+                std::cerr << "Usage: kv_test trend-baselines <baseline_dir> [recent_window_count]" << std::endl;
                 return 1;
             }
-            return run_benchmark_trend(argv[2]);
+            const size_t recent_window = argc == 4 ? static_cast<size_t>(std::stoul(argv[3])) : 5;
+            return run_benchmark_trend(argv[2], recent_window);
         }
         if (command == "profile-json") {
             if (argc != 3) {
