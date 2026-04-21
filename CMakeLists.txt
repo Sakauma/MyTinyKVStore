@@ -68,6 +68,7 @@ kvstore_apply_coverage(kvstore)
 
 add_executable(kv_test
     tests/common/test_support.cpp
+    tests/integration/basic_kv_tests.cpp
     tests/main.cpp
 )
 target_include_directories(kv_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)

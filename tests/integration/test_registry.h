@@ -1,0 +1,16 @@
+#ifndef KVSTORE_INTEGRATION_TEST_REGISTRY_H
+#define KVSTORE_INTEGRATION_TEST_REGISTRY_H
+
+#include "tests/common/test_support.h"
+
+#include <vector>
+
+namespace kvstore::tests::integration {
+
+using TestCases = std::vector<test_support::NamedTest>;
+
+void register_basic_kv_tests(TestCases& tests);
+
+}  // namespace kvstore::tests::integration
+
+#endif  // KVSTORE_INTEGRATION_TEST_REGISTRY_H
