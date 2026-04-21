@@ -647,6 +647,8 @@ int run_inspect_format(const std::string& db_path) {
         }
     }
 
+    rewrite_recommended = rewrite_recommended || wal_truncated;
+
     std::cout << " wal_exists=1"
               << " wal_empty=0"
               << " wal_magic=0x" << std::hex << wal_header.magic << std::dec
@@ -723,6 +725,54 @@ int run_compatibility_matrix() {
     require(current_inspect.at("snapshot_version") == "2", "current case should report snapshot v2");
     require(current_inspect.at("rewrite_recommended") == "0", "current case should not recommend rewrite");
 
+    const std::string live_wal_db_path = dir.file("current_v2_live_wal.dat");
+    {
+        KVStore store(live_wal_db_path);
+        store.Put(1, text("one"));
+        store.Compact();
+        store.Put(2, text("two"));
+        store.Delete(1);
+    }
+
+    const auto live_wal_inspect = capture_inspect_format(live_wal_db_path);
+    const auto [live_wal_verify_status, live_wal_verify_output] = capture_verify_format(live_wal_db_path);
+    require(live_wal_verify_status == 0, "current v2 layout with live WAL should verify cleanly");
+    require(live_wal_inspect.at("snapshot_version") == "2", "live WAL case should keep snapshot v2");
+    require(live_wal_inspect.at("wal_version") == "2", "live WAL case should report WAL v2");
+    require(live_wal_inspect.at("wal_records") == "2", "live WAL case should retain post-snapshot WAL records");
+    require(live_wal_inspect.at("rewrite_recommended") == "0",
+            "live WAL case should not recommend rewrite");
+
+    const std::string truncated_db_path = dir.file("current_v2_truncated_wal.dat");
+    const std::string truncated_wal_path = truncated_db_path + ".wal";
+    {
+        KVStore store(truncated_db_path);
+        store.Put(1, text("stable"));
+        store.Compact();
+        store.Put(2, text("latest"));
+    }
+    append_bytes(truncated_wal_path, {0xAA, 0xBB, 0xCC});
+
+    const auto truncated_inspect = capture_inspect_format(truncated_db_path);
+    const auto [truncated_verify_status, truncated_verify_output] = capture_verify_format(truncated_db_path);
+    require(truncated_verify_status == 2, "truncated WAL case should require rewrite");
+    require(truncated_inspect.at("snapshot_version") == "2", "truncated WAL case should keep snapshot v2");
+    require(truncated_inspect.at("wal_truncated") == "1", "truncated WAL case should report WAL truncation");
+    require(truncated_inspect.at("rewrite_recommended") == "1",
+            "truncated WAL case should explicitly recommend rewrite");
+
+    require(run_rewrite_format(truncated_db_path) == 0,
+            "truncated WAL compatibility matrix case should rewrite successfully");
+    const auto rewritten_truncated_inspect = capture_inspect_format(truncated_db_path);
+    const auto [rewritten_truncated_verify_status, rewritten_truncated_verify_output] =
+        capture_verify_format(truncated_db_path);
+    require(rewritten_truncated_verify_status == 0,
+            "rewritten truncated WAL case should verify cleanly");
+    require(rewritten_truncated_inspect.at("wal_truncated") == "0",
+            "rewritten truncated WAL case should clear the truncation signal");
+    require(rewritten_truncated_inspect.at("rewrite_recommended") == "0",
+            "rewritten truncated WAL case should stop recommending rewrite");
+
     const std::string legacy_db_path = dir.file("legacy_v1.dat");
     const std::string legacy_wal_path = legacy_db_path + ".wal";
     write_legacy_snapshot_v1(legacy_db_path, {
@@ -764,6 +814,28 @@ int run_compatibility_matrix() {
               << " verify_status=" << rewritten_verify_status
               << " rewrite_recommended=" << rewritten_inspect.at("rewrite_recommended")
               << " rewritten_verify_output_bytes=" << rewritten_verify_output.size()
+              << '\n';
+    std::cout << "case=current_v2_live_wal"
+              << " snapshot_version=" << live_wal_inspect.at("snapshot_version")
+              << " wal_version=" << value_or(live_wal_inspect, "wal_version", "missing")
+              << " wal_records=" << live_wal_inspect.at("wal_records")
+              << " verify_status=" << live_wal_verify_status
+              << " rewrite_recommended=" << live_wal_inspect.at("rewrite_recommended")
+              << " live_wal_verify_output_bytes=" << live_wal_verify_output.size()
+              << '\n';
+    std::cout << "case=current_v2_truncated_wal"
+              << " snapshot_version=" << truncated_inspect.at("snapshot_version")
+              << " wal_truncated=" << truncated_inspect.at("wal_truncated")
+              << " verify_status=" << truncated_verify_status
+              << " rewrite_recommended=" << truncated_inspect.at("rewrite_recommended")
+              << " truncated_verify_output_bytes=" << truncated_verify_output.size()
+              << '\n';
+    std::cout << "case=current_v2_truncated_wal_after_rewrite"
+              << " snapshot_version=" << rewritten_truncated_inspect.at("snapshot_version")
+              << " wal_truncated=" << rewritten_truncated_inspect.at("wal_truncated")
+              << " verify_status=" << rewritten_truncated_verify_status
+              << " rewrite_recommended=" << rewritten_truncated_inspect.at("rewrite_recommended")
+              << " rewritten_truncated_verify_output_bytes=" << rewritten_truncated_verify_output.size()
               << '\n';
     return 0;
 }
@@ -1548,6 +1620,26 @@ void test_inspect_format_recommends_rewrite_for_legacy_v1() {
     require(values.at("rewrite_recommended") == "1", "legacy data should recommend rewrite");
 }
 
+void test_inspect_format_recommends_rewrite_for_truncated_wal() {
+    TestDir dir("inspect_truncated_wal");
+    const std::string db_path = dir.file("store.dat");
+    const std::string wal_path = db_path + ".wal";
+
+    {
+        KVStore store(db_path);
+        store.Put(1, text("one"));
+        store.Compact();
+        store.Put(2, text("two"));
+    }
+
+    append_bytes(wal_path, {0xAA, 0xBB, 0xCC});
+
+    const auto values = capture_inspect_format(db_path);
+    require(values.at("wal_truncated") == "1", "inspect-format should flag a truncated WAL tail");
+    require(values.at("rewrite_recommended") == "1",
+            "truncated WAL should explicitly recommend rewrite to restore a clean layout");
+}
+
 void test_verify_format_accepts_current_layout() {
     TestDir dir("verify_current");
     const std::string db_path = dir.file("store.dat");
@@ -1580,6 +1672,41 @@ void test_verify_format_rejects_legacy_layout() {
     require(status == 2, "verify-format should reject legacy layout and request rewrite");
     require(output.find("rewrite_recommended=1") != std::string::npos,
             "verify-format should expose the rewrite recommendation");
+}
+
+void test_rewrite_format_recovers_truncated_current_wal() {
+    TestDir dir("rewrite_truncated_current");
+    const std::string db_path = dir.file("store.dat");
+    const std::string wal_path = db_path + ".wal";
+
+    {
+        KVStore store(db_path);
+        store.Put(1, text("stable"));
+        store.Compact();
+        store.Put(2, text("latest"));
+    }
+
+    append_bytes(wal_path, {0xDE, 0xAD});
+
+    const auto [before_status, before_output] = capture_verify_format(db_path);
+    require(before_status == 2, "verify-format should reject a truncated current WAL layout");
+    require(before_output.find("wal_truncated=1") != std::string::npos,
+            "verify-format should surface the truncated WAL signal");
+
+    require(run_rewrite_format(db_path) == 0, "rewrite-format should recover a truncated WAL layout");
+
+    const auto [after_status, after_output] = capture_verify_format(db_path);
+    require(after_status == 0, "rewrite-format should restore a clean current layout");
+    require(after_output.find("wal_truncated=0") != std::string::npos,
+            "rewritten layout should no longer report WAL truncation");
+
+    KVStore reopened(db_path);
+    const auto stable = reopened.Get(1);
+    const auto latest = reopened.Get(2);
+    require(stable.has_value() && as_string(*stable) == "stable",
+            "rewrite-format should preserve the snapshot portion of truncated current data");
+    require(latest.has_value() && as_string(*latest) == "latest",
+            "rewrite-format should preserve committed WAL records before the truncated tail");
 }
 
 void test_compatibility_matrix_command_succeeds() {
@@ -3271,8 +3398,10 @@ int main(int argc, char* argv[]) {
         {"legacy v1 rewrite upgrades snapshot to v2", test_legacy_v1_rewrite_upgrades_snapshot_to_v2},
         {"inspect format reports key type counts", test_inspect_format_reports_key_type_counts},
         {"inspect format recommends rewrite for legacy v1", test_inspect_format_recommends_rewrite_for_legacy_v1},
+        {"inspect format recommends rewrite for truncated wal", test_inspect_format_recommends_rewrite_for_truncated_wal},
         {"verify format accepts current layout", test_verify_format_accepts_current_layout},
         {"verify format rejects legacy layout", test_verify_format_rejects_legacy_layout},
+        {"rewrite format recovers truncated current wal", test_rewrite_format_recovers_truncated_current_wal},
         {"compatibility matrix command succeeds", test_compatibility_matrix_command_succeeds},
         {"benchmark result json reports summary and metrics", test_benchmark_result_json_reports_summary_and_metrics},
         {"compare benchmark baseline passes within thresholds", test_compare_benchmark_baseline_passes_within_thresholds},

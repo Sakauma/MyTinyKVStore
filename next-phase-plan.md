@@ -54,6 +54,9 @@ Current status:
 - 把现有 `current_v2` / `legacy_v1` 扩到更多格式情形，例如空 WAL、legacy after rewrite、截断 WAL。
 - 明确每种情形的 `inspect-format` / `verify-format` / `rewrite-format` 期望行为。
 
+Current status:
+- 已完成。
+
 ### C2. Migration Policy
 
 - 写清未来格式升级时允许和不允许的兼容策略。
