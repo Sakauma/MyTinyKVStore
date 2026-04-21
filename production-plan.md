@@ -30,8 +30,8 @@
 ### 5. Engineering and CI
 
 - 缺少稳定 CI 流程来持续执行构建、测试和 sanitizer。
-- 已有 coverage 入口和 baseline JSON 产出链路。
-- 还缺少历史基线比较与性能回归门槛。
+- 已有 coverage 入口、baseline JSON 产出链路，以及基于默认阈值的 baseline 比较入口。
+- 还缺少 CI 中的强制回归门槛和长期历史趋势对比。
 
 ### 6. Operations and Observability
 

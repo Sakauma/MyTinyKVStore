@@ -82,6 +82,7 @@ struct FormatKeyStats {
 
 int run_inspect_format(const std::string& db_path);
 int run_verify_format(const std::string& db_path);
+double extract_json_number(const std::string& json, const std::string& key);
 
 Value text(const std::string& input) {
     return Value(std::vector<uint8_t>(input.begin(), input.end()));
@@ -138,6 +139,20 @@ void write_u32_at(const std::string& path, std::streamoff offset, uint32_t value
     require(file.is_open(), "Expected file to exist for overwrite");
     file.seekp(offset);
     file.write(reinterpret_cast<const char*>(&value), sizeof(value));
+}
+
+void write_text_file(const std::string& path, const std::string& contents) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    require(out.is_open(), "Expected text file to be writable");
+    out << contents;
+}
+
+std::string read_text_file(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    require(in.is_open(), "Expected text file to be readable");
+    std::ostringstream out;
+    out << in.rdbuf();
+    return out.str();
 }
 
 uintmax_t file_size_or_zero(const std::string& path) {
@@ -730,6 +745,48 @@ int run_compatibility_matrix() {
     return 0;
 }
 
+int run_compare_benchmark_baseline(
+    const std::string& baseline_path,
+    const std::string& candidate_path,
+    double min_write_ratio_pct = 85.0,
+    double min_read_ratio_pct = 85.0,
+    double max_latency_ratio_pct = 125.0) {
+    const std::string baseline_json = read_text_file(baseline_path);
+    const std::string candidate_json = read_text_file(candidate_path);
+
+    const double baseline_write_ops_per_s = extract_json_number(baseline_json, "write_ops_per_s");
+    const double candidate_write_ops_per_s = extract_json_number(candidate_json, "write_ops_per_s");
+    const double baseline_read_ops_per_s = extract_json_number(baseline_json, "read_ops_per_s");
+    const double candidate_read_ops_per_s = extract_json_number(candidate_json, "read_ops_per_s");
+    const double baseline_avg_write_latency_us = extract_json_number(baseline_json, "avg_write_latency_us");
+    const double candidate_avg_write_latency_us = extract_json_number(candidate_json, "avg_write_latency_us");
+
+    require(baseline_write_ops_per_s > 0.0, "baseline write throughput must be positive");
+    require(baseline_read_ops_per_s > 0.0, "baseline read throughput must be positive");
+    require(baseline_avg_write_latency_us > 0.0, "baseline write latency must be positive");
+
+    const double write_ratio_pct = (candidate_write_ops_per_s / baseline_write_ops_per_s) * 100.0;
+    const double read_ratio_pct = (candidate_read_ops_per_s / baseline_read_ops_per_s) * 100.0;
+    const double latency_ratio_pct = (candidate_avg_write_latency_us / baseline_avg_write_latency_us) * 100.0;
+
+    const bool write_ok = write_ratio_pct >= min_write_ratio_pct;
+    const bool read_ok = read_ratio_pct >= min_read_ratio_pct;
+    const bool latency_ok = latency_ratio_pct <= max_latency_ratio_pct;
+    const bool pass = write_ok && read_ok && latency_ok;
+
+    std::cout << "baseline=" << baseline_path
+              << " candidate=" << candidate_path
+              << " write_ratio_pct=" << write_ratio_pct
+              << " read_ratio_pct=" << read_ratio_pct
+              << " latency_ratio_pct=" << latency_ratio_pct
+              << " min_write_ratio_pct=" << min_write_ratio_pct
+              << " min_read_ratio_pct=" << min_read_ratio_pct
+              << " max_latency_ratio_pct=" << max_latency_ratio_pct
+              << " status=" << (pass ? "pass" : "fail")
+              << std::endl;
+    return pass ? 0 : 2;
+}
+
 KVStoreOptions benchmark_options() {
     KVStoreOptions options;
     options.max_batch_size = 32;
@@ -859,6 +916,27 @@ std::string BenchmarkResultToJson(const BenchmarkResult& result) {
         << "\"metrics\":" << MetricsToJson(result.metrics)
         << "}";
     return out.str();
+}
+
+double extract_json_number(const std::string& json, const std::string& key) {
+    const std::string needle = "\"" + key + "\":";
+    const size_t pos = json.find(needle);
+    require(pos != std::string::npos, "Expected numeric key in json: " + key);
+    size_t cursor = pos + needle.size();
+    while (cursor < json.size() && std::isspace(static_cast<unsigned char>(json[cursor]))) {
+        ++cursor;
+    }
+    size_t end = cursor;
+    while (end < json.size()) {
+        const char ch = json[end];
+        if ((ch >= '0' && ch <= '9') || ch == '-' || ch == '+' || ch == '.' || ch == 'e' || ch == 'E') {
+            ++end;
+            continue;
+        }
+        break;
+    }
+    require(end > cursor, "Expected numeric value in json for key: " + key);
+    return std::stod(json.substr(cursor, end - cursor));
 }
 
 std::optional<KVStoreProfile> parse_profile_name(const std::string& name) {
@@ -1241,6 +1319,60 @@ void test_benchmark_result_json_reports_summary_and_metrics() {
             "benchmark baseline json should include option metadata");
     require(json.find("\"metrics\":{") != std::string::npos,
             "benchmark baseline json should include kv metrics");
+}
+
+void test_compare_benchmark_baseline_passes_within_thresholds() {
+    TestDir dir("compare_baseline_pass");
+    const std::string baseline_path = dir.file("baseline.json");
+    const std::string candidate_path = dir.file("candidate.json");
+
+    BenchmarkResult baseline;
+    baseline.config = make_benchmark_config("baseline", 1, 1, 100, 64);
+    baseline.duration_s = 1.0;
+    baseline.writes = 1000;
+    baseline.reads = 2000;
+    baseline.write_ops_per_s = 1000.0;
+    baseline.read_ops_per_s = 2000.0;
+    baseline.avg_write_latency_us = 100.0;
+
+    BenchmarkResult candidate = baseline;
+    candidate.config.label = "candidate";
+    candidate.write_ops_per_s = 900.0;
+    candidate.read_ops_per_s = 1800.0;
+    candidate.avg_write_latency_us = 115.0;
+
+    write_text_file(baseline_path, BenchmarkResultToJson(baseline));
+    write_text_file(candidate_path, BenchmarkResultToJson(candidate));
+
+    const int status = run_compare_benchmark_baseline(baseline_path, candidate_path);
+    require(status == 0, "compare-baseline should pass when throughput and latency stay within thresholds");
+}
+
+void test_compare_benchmark_baseline_rejects_regression() {
+    TestDir dir("compare_baseline_fail");
+    const std::string baseline_path = dir.file("baseline.json");
+    const std::string candidate_path = dir.file("candidate.json");
+
+    BenchmarkResult baseline;
+    baseline.config = make_benchmark_config("baseline", 1, 1, 100, 64);
+    baseline.duration_s = 1.0;
+    baseline.writes = 1000;
+    baseline.reads = 2000;
+    baseline.write_ops_per_s = 1000.0;
+    baseline.read_ops_per_s = 2000.0;
+    baseline.avg_write_latency_us = 100.0;
+
+    BenchmarkResult candidate = baseline;
+    candidate.config.label = "candidate";
+    candidate.write_ops_per_s = 700.0;
+    candidate.read_ops_per_s = 1500.0;
+    candidate.avg_write_latency_us = 140.0;
+
+    write_text_file(baseline_path, BenchmarkResultToJson(baseline));
+    write_text_file(candidate_path, BenchmarkResultToJson(candidate));
+
+    const int status = run_compare_benchmark_baseline(baseline_path, candidate_path);
+    require(status == 2, "compare-baseline should reject throughput/latency regressions beyond thresholds");
 }
 
 void test_ordering_and_updates() {
@@ -2516,6 +2648,16 @@ int main(int argc, char* argv[]) {
             run_benchmark_baseline_json();
             return 0;
         }
+        if (command == "compare-baseline") {
+            if (argc < 4 || argc > 7) {
+                std::cerr << "Usage: kv_test compare-baseline <baseline_json> <candidate_json> [min_write_ratio_pct min_read_ratio_pct max_latency_ratio_pct]" << std::endl;
+                return 1;
+            }
+            const double min_write_ratio_pct = argc > 4 ? std::stod(argv[4]) : 85.0;
+            const double min_read_ratio_pct = argc > 5 ? std::stod(argv[5]) : 85.0;
+            const double max_latency_ratio_pct = argc > 6 ? std::stod(argv[6]) : 125.0;
+            return run_compare_benchmark_baseline(argv[2], argv[3], min_write_ratio_pct, min_read_ratio_pct, max_latency_ratio_pct);
+        }
         if (command == "profile-json") {
             if (argc != 3) {
                 std::cerr << "Usage: kv_test profile-json <balanced|write-heavy|read-heavy|low-latency>" << std::endl;
@@ -2560,7 +2702,7 @@ int main(int argc, char* argv[]) {
             return run_fault_injection_scenario(argv[2], argv[3]);
         }
         std::cerr << "Unknown command: " << command << '\n';
-        std::cerr << "Usage: kv_test [bench|bench-json|bench-baseline-json|profile-json|soak|inspect-format|rewrite-format|verify-format|compat-matrix|fault-inject]" << std::endl;
+        std::cerr << "Usage: kv_test [bench|bench-json|bench-baseline-json|compare-baseline|profile-json|soak|inspect-format|rewrite-format|verify-format|compat-matrix|fault-inject]" << std::endl;
         return 1;
     }
 
@@ -2582,6 +2724,8 @@ int main(int argc, char* argv[]) {
         {"verify format rejects legacy layout", test_verify_format_rejects_legacy_layout},
         {"compatibility matrix command succeeds", test_compatibility_matrix_command_succeeds},
         {"benchmark result json reports summary and metrics", test_benchmark_result_json_reports_summary_and_metrics},
+        {"compare benchmark baseline passes within thresholds", test_compare_benchmark_baseline_passes_within_thresholds},
+        {"compare benchmark baseline rejects regression", test_compare_benchmark_baseline_rejects_regression},
         {"ordering and updates", test_ordering_and_updates},
         {"compaction persists snapshot and resets WAL", test_compaction_persists_snapshot_and_resets_wal},
         {"truncated WAL tail is ignored", test_truncated_wal_tail_is_ignored},
