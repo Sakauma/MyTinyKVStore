@@ -69,6 +69,7 @@ Current status:
 - 已将 bench/microbench/profile/stress JSON integration tests 提炼到 `tests/integration/json_cli_tests.cpp`，并补上轻量 fixture wrapper，避免为验证 JSON 结构而直接执行完整 benchmark 负载。
 - 已将第二批 metrics/controller integration tests 提炼到 `tests/integration/metrics_controller_tests.cpp`，`tests/main.cpp` 进一步收缩为 CLI 入口与未拆分 integration glue。
 - 已将第三批 recovery/format migration integration tests 提炼到 `tests/integration/recovery_format_tests.cpp`，并补上可复用的 CLI entrypoint 头以支撑跨文件复用格式检查命令。
+- 已将第四批 runtime/concurrency integration tests 提炼到 `tests/integration/runtime_concurrency_tests.cpp`，并补上 runtime entrypoint 头以跨文件复用 failpoint、soak profile 与 stress profile 配置入口。
 
 ## Phase 3: Continuous Performance Governance
 

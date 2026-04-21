@@ -73,6 +73,7 @@ add_executable(kv_test
     tests/integration/json_cli_tests.cpp
     tests/integration/metrics_controller_tests.cpp
     tests/integration/recovery_format_tests.cpp
+    tests/integration/runtime_concurrency_tests.cpp
     tests/main.cpp
 )
 target_include_directories(kv_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)
