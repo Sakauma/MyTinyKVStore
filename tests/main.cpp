@@ -1101,6 +1101,12 @@ enum class SoakProfile {
     kReadHeavy,
 };
 
+enum class ConcurrencyStressProfile {
+    kBalanced,
+    kWriteHeavy,
+    kCompactionHeavy,
+};
+
 std::optional<SoakProfile> parse_soak_profile_name(const std::string& name) {
     if (name == "balanced") {
         return SoakProfile::kBalanced;
@@ -1114,12 +1120,36 @@ std::optional<SoakProfile> parse_soak_profile_name(const std::string& name) {
     return std::nullopt;
 }
 
+std::optional<ConcurrencyStressProfile> parse_concurrency_stress_profile_name(const std::string& name) {
+    if (name == "balanced") {
+        return ConcurrencyStressProfile::kBalanced;
+    }
+    if (name == "write-heavy") {
+        return ConcurrencyStressProfile::kWriteHeavy;
+    }
+    if (name == "compaction-heavy") {
+        return ConcurrencyStressProfile::kCompactionHeavy;
+    }
+    return std::nullopt;
+}
+
 struct SoakProfileConfig {
     KVStoreOptions options;
     int writer_count = 4;
     int reader_count = 2;
     int key_space = 256;
     int compaction_interval_ms = 50;
+};
+
+struct ConcurrencyStressProfileConfig {
+    KVStoreOptions options;
+    int writer_count = 8;
+    int reader_count = 4;
+    int metrics_reader_count = 1;
+    int compactor_count = 1;
+    int keys_per_writer = 96;
+    int compaction_interval_ms = 5;
+    int batch_width = 4;
 };
 
 SoakProfileConfig make_soak_profile_config(SoakProfile profile) {
@@ -1156,6 +1186,51 @@ SoakProfileConfig make_soak_profile_config(SoakProfile profile) {
             config.options.max_batch_delay_us = 1000;
             config.options.adaptive_flush_queue_depth_threshold = 4;
             config.options.adaptive_flush_min_batch_delay_us = 50;
+            return config;
+    }
+    return config;
+}
+
+ConcurrencyStressProfileConfig make_concurrency_stress_profile_config(ConcurrencyStressProfile profile) {
+    ConcurrencyStressProfileConfig config;
+    config.options.max_batch_size = 32;
+    config.options.max_batch_wal_bytes = 1 << 16;
+    config.options.max_batch_delay_us = 1500;
+    config.options.adaptive_batching_enabled = true;
+    config.options.adaptive_queue_depth_threshold = 8;
+    config.options.adaptive_batch_size_multiplier = 4;
+    config.options.adaptive_batch_wal_bytes_multiplier = 4;
+    config.options.adaptive_flush_enabled = true;
+    config.options.adaptive_flush_queue_depth_threshold = 4;
+    config.options.adaptive_flush_delay_divisor = 4;
+    config.options.adaptive_flush_min_batch_delay_us = 50;
+    config.options.auto_compact_wal_bytes_threshold = 4096;
+    config.options.auto_compact_invalid_wal_ratio_percent = 60;
+    config.options.adaptive_recent_window_batches = 32;
+    config.options.adaptive_recent_write_sample_limit = 256;
+
+    switch (profile) {
+        case ConcurrencyStressProfile::kBalanced:
+            return config;
+        case ConcurrencyStressProfile::kWriteHeavy:
+            config.writer_count = 12;
+            config.reader_count = 2;
+            config.keys_per_writer = 128;
+            config.compaction_interval_ms = 8;
+            config.options.max_batch_size = 64;
+            config.options.max_batch_delay_us = 2500;
+            config.options.auto_compact_wal_bytes_threshold = 8192;
+            return config;
+        case ConcurrencyStressProfile::kCompactionHeavy:
+            config.writer_count = 6;
+            config.reader_count = 3;
+            config.compactor_count = 2;
+            config.keys_per_writer = 80;
+            config.compaction_interval_ms = 1;
+            config.options.max_batch_size = 24;
+            config.options.max_batch_delay_us = 800;
+            config.options.auto_compact_wal_bytes_threshold = 2048;
+            config.options.auto_compact_invalid_wal_ratio_percent = 45;
             return config;
     }
     return config;
@@ -2030,6 +2105,27 @@ void test_recommended_profiles_are_distinct() {
             "write-heavy profile should tolerate a larger WAL before compaction");
 }
 
+void test_concurrency_stress_profiles_are_distinct() {
+    const ConcurrencyStressProfileConfig balanced =
+        make_concurrency_stress_profile_config(ConcurrencyStressProfile::kBalanced);
+    const ConcurrencyStressProfileConfig write_heavy =
+        make_concurrency_stress_profile_config(ConcurrencyStressProfile::kWriteHeavy);
+    const ConcurrencyStressProfileConfig compaction_heavy =
+        make_concurrency_stress_profile_config(ConcurrencyStressProfile::kCompactionHeavy);
+
+    require(write_heavy.writer_count > balanced.writer_count,
+            "write-heavy stress profile should use more writers than balanced");
+    require(write_heavy.options.max_batch_size > balanced.options.max_batch_size,
+            "write-heavy stress profile should favor larger batches than balanced");
+    require(compaction_heavy.compactor_count > balanced.compactor_count,
+            "compaction-heavy stress profile should run more compactor threads");
+    require(compaction_heavy.compaction_interval_ms < balanced.compaction_interval_ms,
+            "compaction-heavy stress profile should compact more frequently than balanced");
+    require(compaction_heavy.options.auto_compact_wal_bytes_threshold <
+                balanced.options.auto_compact_wal_bytes_threshold,
+            "compaction-heavy stress profile should compact at a smaller WAL threshold");
+}
+
 void test_options_to_json_reports_profile_fields() {
     const std::string json = OptionsToJson(RecommendedOptions(KVStoreProfile::kBalanced));
     require(!json.empty() && json.front() == '{' && json.back() == '}', "options json should be a JSON object");
@@ -2724,6 +2820,160 @@ void test_objective_throughput_score_can_dominate_latency_pressure() {
             "throughput-dominated objective control should expand the effective batch delay");
 }
 
+void run_concurrency_stress_test(int duration_seconds, ConcurrencyStressProfile profile) {
+    TestDir dir("concurrency_stress");
+    const std::string db_path = dir.file("store.dat");
+
+    const ConcurrencyStressProfileConfig config = make_concurrency_stress_profile_config(profile);
+    const int total_keys = config.writer_count * config.keys_per_writer;
+    std::vector<std::vector<std::optional<std::string>>> expected_by_writer(
+        static_cast<size_t>(config.writer_count),
+        std::vector<std::optional<std::string>>(static_cast<size_t>(config.keys_per_writer)));
+
+    KVStoreMetrics final_metrics;
+    {
+        KVStore store(db_path, config.options);
+        std::atomic<bool> stop {false};
+        std::vector<std::thread> threads;
+
+        for (int writer_id = 0; writer_id < config.writer_count; ++writer_id) {
+            threads.emplace_back([&store, &stop, &config, &expected_by_writer, writer_id]() {
+                std::mt19937 gen(15000 + writer_id);
+                std::uniform_int_distribution<int> key_dist(0, config.keys_per_writer - 1);
+                std::uniform_int_distribution<int> op_dist(0, 9);
+                uint64_t version = 0;
+                auto& expected = expected_by_writer[static_cast<size_t>(writer_id)];
+
+                while (!stop.load(std::memory_order_acquire)) {
+                    const int selector = op_dist(gen);
+                    if (selector < 3) {
+                        const int local_key = key_dist(gen);
+                        const int global_key = writer_id * config.keys_per_writer + local_key;
+                        store.Delete(global_key);
+                        expected[static_cast<size_t>(local_key)] = std::nullopt;
+                        continue;
+                    }
+
+                    if (selector < 7) {
+                        const int local_key = key_dist(gen);
+                        const int global_key = writer_id * config.keys_per_writer + local_key;
+                        const std::string payload =
+                            "stress_" + std::to_string(writer_id) + "_" +
+                            std::to_string(local_key) + "_" + std::to_string(version++);
+                        store.Put(global_key, text(payload));
+                        expected[static_cast<size_t>(local_key)] = payload;
+                        continue;
+                    }
+
+                    std::vector<BatchWriteOperation> operations;
+                    std::vector<std::pair<int, std::optional<std::string>>> applied;
+                    operations.reserve(static_cast<size_t>(config.batch_width));
+                    applied.reserve(static_cast<size_t>(config.batch_width));
+                    for (int batch_index = 0; batch_index < config.batch_width; ++batch_index) {
+                        const int local_key = key_dist(gen);
+                        const int global_key = writer_id * config.keys_per_writer + local_key;
+                        const bool do_delete = (op_dist(gen) % 4) == 0;
+                        if (do_delete) {
+                            operations.push_back(BatchWriteOperation::DeleteInt(global_key));
+                            applied.push_back({local_key, std::nullopt});
+                            continue;
+                        }
+                        const std::string payload =
+                            "stress_batch_" + std::to_string(writer_id) + "_" +
+                            std::to_string(local_key) + "_" + std::to_string(version++);
+                        operations.push_back(BatchWriteOperation::PutInt(global_key, text(payload)));
+                        applied.push_back({local_key, payload});
+                    }
+                    store.WriteBatch(operations);
+                    for (const auto& [local_key, value] : applied) {
+                        expected[static_cast<size_t>(local_key)] = value;
+                    }
+                }
+            });
+        }
+
+        for (int reader_id = 0; reader_id < config.reader_count; ++reader_id) {
+            threads.emplace_back([&store, &stop, total_keys, reader_id]() {
+                std::mt19937 gen(25000 + reader_id);
+                std::uniform_int_distribution<int> key_dist(0, total_keys - 1);
+                while (!stop.load(std::memory_order_acquire)) {
+                    const auto value = store.Get(key_dist(gen));
+                    if (value.has_value()) {
+                        const std::string text_value = as_string(*value);
+                        require(text_value.rfind("stress_", 0) == 0,
+                                "concurrency stress readers should only observe complete values");
+                    }
+                }
+            });
+        }
+
+        for (int observer_id = 0; observer_id < config.metrics_reader_count; ++observer_id) {
+            threads.emplace_back([&store, &stop]() {
+                uint64_t last_enqueued = 0;
+                uint64_t last_committed = 0;
+                while (!stop.load(std::memory_order_acquire)) {
+                    const KVStoreMetrics metrics = store.GetMetrics();
+                    require(metrics.enqueued_write_requests >= last_enqueued,
+                            "enqueued write requests should be monotonic during stress");
+                    require(metrics.committed_write_requests >= last_committed,
+                            "committed write requests should be monotonic during stress");
+                    require(metrics.pending_queue_depth <= metrics.max_pending_queue_depth,
+                            "current queue depth should stay below the historical high watermark");
+                    require(metrics.last_committed_batch_size <= metrics.max_committed_batch_size,
+                            "last batch size should not exceed the historical batch maximum");
+                    last_enqueued = metrics.enqueued_write_requests;
+                    last_committed = metrics.committed_write_requests;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+            });
+        }
+
+        for (int compactor_id = 0; compactor_id < config.compactor_count; ++compactor_id) {
+            threads.emplace_back([&store, &stop, &config]() {
+                while (!stop.load(std::memory_order_acquire)) {
+                    store.Compact();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(config.compaction_interval_ms));
+                }
+            });
+        }
+
+        std::this_thread::sleep_for(std::chrono::seconds(duration_seconds));
+        stop.store(true, std::memory_order_release);
+
+        for (auto& thread : threads) {
+            thread.join();
+        }
+
+        store.Compact();
+        final_metrics = store.GetMetrics();
+    }
+
+    require(final_metrics.committed_write_requests > 0,
+            "concurrency stress should commit at least one write");
+    require(final_metrics.max_pending_queue_depth > 0,
+            "concurrency stress should drive the pending queue above zero");
+    require(final_metrics.manual_compactions_completed >= static_cast<uint64_t>(config.compactor_count),
+            "concurrency stress should complete manual compactions");
+
+    KVStore reopened(db_path);
+    for (int writer_id = 0; writer_id < config.writer_count; ++writer_id) {
+        for (int local_key = 0; local_key < config.keys_per_writer; ++local_key) {
+            const int global_key = writer_id * config.keys_per_writer + local_key;
+            const auto actual = reopened.Get(global_key);
+            const auto& expected =
+                expected_by_writer[static_cast<size_t>(writer_id)][static_cast<size_t>(local_key)];
+            if (!expected.has_value()) {
+                require(!actual.has_value(),
+                        "deleted writer-owned keys should remain deleted after stress restart");
+                continue;
+            }
+            require(actual.has_value(), "expected live stress key missing after restart");
+            require(as_string(*actual) == *expected,
+                    "reopened state should match the stress oracle for writer-owned keys");
+        }
+    }
+}
+
 void run_soak_test(int duration_seconds, SoakProfile profile) {
     TestDir dir("soak");
     const std::string db_path = dir.file("store.dat");
@@ -2960,6 +3210,17 @@ int main(int argc, char* argv[]) {
             run_soak_test(duration_seconds, *profile);
             return 0;
         }
+        if (command == "concurrency-stress") {
+            const int duration_seconds = argc > 2 ? std::stoi(argv[2]) : 10;
+            const std::string profile_name = argc > 3 ? argv[3] : "balanced";
+            const auto profile = parse_concurrency_stress_profile_name(profile_name);
+            if (!profile.has_value()) {
+                std::cerr << "Unknown concurrency stress profile: " << profile_name << std::endl;
+                return 1;
+            }
+            run_concurrency_stress_test(duration_seconds, *profile);
+            return 0;
+        }
         if (command == "inspect-format") {
             if (argc != 3) {
                 std::cerr << "Usage: kv_test inspect-format <db_path>" << std::endl;
@@ -2992,7 +3253,7 @@ int main(int argc, char* argv[]) {
             return run_fault_injection_scenario(argv[2], argv[3]);
         }
         std::cerr << "Unknown command: " << command << '\n';
-        std::cerr << "Usage: kv_test [bench|bench-json|bench-baseline-json|compare-baseline|trend-baselines|profile-json|soak|inspect-format|rewrite-format|verify-format|compat-matrix|fault-inject]" << std::endl;
+        std::cerr << "Usage: kv_test [bench|bench-json|bench-baseline-json|compare-baseline|trend-baselines|profile-json|soak|concurrency-stress|inspect-format|rewrite-format|verify-format|compat-matrix|fault-inject]" << std::endl;
         return 1;
     }
 
@@ -3035,6 +3296,7 @@ int main(int argc, char* argv[]) {
         {"concurrent compaction with writes", test_concurrent_compaction_with_writes},
         {"batching metrics are reported", test_batching_metrics_are_reported},
         {"recommended profiles are distinct", test_recommended_profiles_are_distinct},
+        {"concurrency stress profiles are distinct", test_concurrency_stress_profiles_are_distinct},
         {"options to json reports profile fields", test_options_to_json_reports_profile_fields},
         {"metrics to json reports core fields", test_metrics_to_json_reports_core_fields},
         {"auto compaction triggers and preserves state", test_auto_compaction_triggers_and_preserves_state},

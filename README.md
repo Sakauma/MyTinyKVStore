@@ -157,11 +157,13 @@ cd build && ctest --output-on-failure
 - `bash scripts/ci-bench-regression.sh`：使用仓库内的 CI 参考 baseline 执行回归门槛检查。
 - `bash scripts/bench-trend.sh [baseline_dir]`：汇总一组历史 baseline，输出吞吐/延迟趋势摘要。
 - `bash scripts/soak.sh 10 [balanced|write-heavy|read-heavy]`：运行带 compaction 的 soak test，并在结束后重启校验数据一致性。
+- `bash scripts/concurrency-stress.sh 10 [balanced|write-heavy|compaction-heavy]`：运行更激进的并发 stress，混合 `Put`、`Delete`、`WriteBatch`、并发 `Get`、metrics 观测和多轮 compaction，并在结束后重启校验。
 - `bash scripts/inspect-format.sh <db_path>`：检查快照和 WAL 的格式版本、记录数量、键类型分布，以及是否建议重写迁移。
 - `bash scripts/rewrite-format.sh <db_path>`：加载数据库并执行一次 `Compact()`，把数据重写到当前格式。
 - `bash scripts/verify-format.sh <db_path>`：检查一份数据是否已经处于当前受支持格式；若仍建议重写则返回非零状态。
 - `bash scripts/compatibility-matrix.sh`：运行当前格式与 legacy v1 的兼容矩阵检查。
 - `bash scripts/profile.sh <balanced|write-heavy|read-heavy|low-latency>`：打印推荐配置模板的 JSON。
+- `bash scripts/tsan.sh`：若工具链支持 ThreadSanitizer，则执行 TSan 构建、完整测试和一轮 `balanced` 并发 stress；若运行时缺失则打印 `SKIP`。
 
 当前测试程序还内置了故障注入入口 `kv_test fault-inject <scenario> <db_path>`，用于在 WAL `fsync` 之后、快照 rename 前后、WAL 轮转后等关键持久化点模拟进程崩溃。常规测试会自动通过子进程调用这些场景来验证重启恢复。
 若需要结构化指标，可调用 `kv_test bench-json` 或直接使用库函数 `MetricsToJson(store.GetMetrics())`。
@@ -186,6 +188,7 @@ cmake --build build-asan
 ```
 
 也可以启用 `-DKVSTORE_ENABLE_UBSAN=ON` 进行未定义行为检查。
+若需要并发专向检查，也可以启用 `-DKVSTORE_ENABLE_TSAN=ON` 或直接运行 `bash scripts/tsan.sh`；若本机工具链缺少 TSan 运行时，脚本会自动跳过。
 
 ### Coverage
 

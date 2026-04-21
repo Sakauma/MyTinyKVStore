@@ -22,7 +22,11 @@
 - `bash scripts/soak.sh 10 balanced`
 - `bash scripts/soak.sh 10 write-heavy`
 - `bash scripts/soak.sh 10 read-heavy`
+- `bash scripts/concurrency-stress.sh 10 balanced`
+- `bash scripts/concurrency-stress.sh 10 compaction-heavy`
 - `./build/target/bin/kv_test fault-inject <scenario> <db_path>`
+- `bash scripts/tsan.sh`
+  若工具链缺少 TSan 运行时，脚本会打印 `SKIP` 并退出。
 
 ### 3. Format Inspection and Rewrite
 
@@ -62,3 +66,9 @@
 
 - 检查 `wal_bytes_since_compaction` 和 `observed_obsolete_wal_ratio_percent`。
 - 提高自动 compaction 阈值，或切换到 `write-heavy` 作为起点。
+
+### Concurrency stress instability
+
+- 先运行 `bash scripts/concurrency-stress.sh 10 balanced`，确认是否只在 compaction-heavy 负载下出现问题。
+- 再运行 `bash scripts/tsan.sh`，检查是否存在隐藏的数据竞争。
+- 若只在 compaction-heavy 触发，优先关注 `manual_compactions_completed`、`pending_queue_depth` 和 `writer_wait_time_us` 是否异常上升。

@@ -7,6 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(KVSTORE_ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(KVSTORE_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
+option(KVSTORE_ENABLE_TSAN "Enable ThreadSanitizer" OFF)
 option(KVSTORE_ENABLE_COVERAGE "Enable coverage instrumentation" OFF)
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/target/bin)
@@ -15,6 +16,10 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/target/lib)
 find_package(Threads REQUIRED)
 
 function(kvstore_apply_sanitizers target_name)
+    if (KVSTORE_ENABLE_TSAN AND (KVSTORE_ENABLE_ASAN OR KVSTORE_ENABLE_UBSAN))
+        message(FATAL_ERROR "ThreadSanitizer cannot be combined with AddressSanitizer or UndefinedBehaviorSanitizer")
+    endif()
+
     if (KVSTORE_ENABLE_ASAN)
         target_compile_options(${target_name} PRIVATE -fsanitize=address -fno-omit-frame-pointer)
         target_link_options(${target_name} PRIVATE -fsanitize=address -fno-omit-frame-pointer)
@@ -23,6 +28,11 @@ function(kvstore_apply_sanitizers target_name)
     if (KVSTORE_ENABLE_UBSAN)
         target_compile_options(${target_name} PRIVATE -fsanitize=undefined -fno-omit-frame-pointer)
         target_link_options(${target_name} PRIVATE -fsanitize=undefined -fno-omit-frame-pointer)
+    endif()
+
+    if (KVSTORE_ENABLE_TSAN)
+        target_compile_options(${target_name} PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
+        target_link_options(${target_name} PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
     endif()
 endfunction()
 

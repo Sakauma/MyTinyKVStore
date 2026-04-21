@@ -44,6 +44,9 @@ Current status:
 Exit criteria:
 - 长时运行和并发 stress 有稳定脚本入口，且能重启校验。
 
+Current status:
+- 已完成。
+
 ## Phase C: Format Evolution
 
 ### C1. Compatibility Matrix Expansion
