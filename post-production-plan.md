@@ -35,6 +35,7 @@ Exit criteria:
 
 Current status:
 - 进行中。已补 writer / format / recovery 三份设计说明，后续继续随拆分同步更新。
+- 已继续拆出 observability/profile 辅助模块，`MetricsToJson`、`OptionsToJson` 与 `RecommendedOptions` 不再直接堆在 `src/kvstore.cpp` 中。
 
 ## Phase 2: Refactor-Safe Test Harness
 
