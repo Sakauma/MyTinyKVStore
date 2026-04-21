@@ -11,7 +11,7 @@ mkdir -p "$output_dir"
 cmake -S "$repo_root" -B "$repo_root/build"
 cmake --build "$repo_root/build"
 
-profiles=(balanced write-heavy compaction-heavy)
+profiles=(balanced write-heavy compaction-heavy recovery-heavy)
 for profile in "${profiles[@]}"; do
   "$repo_root/build/target/bin/kv_test" concurrency-stress-json "$duration_seconds" "$profile" \
     > "$output_dir/$profile.json"

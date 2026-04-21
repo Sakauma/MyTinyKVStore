@@ -157,10 +157,10 @@ cd build && ctest --output-on-failure
 - `bash scripts/bench-regression-check.sh <baseline_json>`：生成新的 candidate baseline，并按默认阈值与参考基线比较。
 - `bash scripts/ci-bench-regression.sh`：使用仓库内的 CI 参考 baseline 执行回归门槛检查。
 - `bash scripts/bench-trend.sh [baseline_dir] [recent_window]`：汇总一组历史 baseline，输出 oldest/latest 和 recent-window 两种视角的趋势摘要。
-- `bash scripts/collect-artifacts.sh [output_dir] [baseline_dir] [recent_window]`：统一落盘 `microbench`、`stressbench baseline`、`trend summary` 和 `compatibility matrix` artifact。
+- `bash scripts/collect-artifacts.sh [output_dir] [baseline_dir] [recent_window]`：统一落盘 `microbench`、`stressbench baseline`、`trend summary`、`compatibility matrix`，以及全部标准 stress profile 的 artifact。
 - `bash scripts/soak.sh 10 [balanced|write-heavy|read-heavy]`：运行带 compaction 的 soak test，并在结束后重启校验数据一致性。
-- `bash scripts/concurrency-stress.sh 10 [balanced|write-heavy|compaction-heavy]`：运行更激进的并发 stress，混合 `Put`、`Delete`、`WriteBatch`、并发 `Get`、metrics 观测和多轮 compaction，并在结束后重启校验。
-- `bash scripts/multi-profile-stress.sh [output_dir] [duration_seconds]`：批量运行 `balanced`、`write-heavy`、`compaction-heavy` 三个标准 stress profile，并把 JSON 摘要落盘。
+- `bash scripts/concurrency-stress.sh 10 [balanced|write-heavy|compaction-heavy|recovery-heavy]`：运行更激进的并发 stress，混合 `Put`、`Delete`、`WriteBatch`、并发 `Get`、metrics 观测和多轮 compaction，并在结束后重启校验；`recovery-heavy` 会额外重复 reopen 验证。
+- `bash scripts/multi-profile-stress.sh [output_dir] [duration_seconds]`：批量运行 `balanced`、`write-heavy`、`compaction-heavy`、`recovery-heavy` 四个标准 stress profile，并把 JSON 摘要落盘。
 - `bash scripts/inspect-format.sh <db_path>`：检查快照和 WAL 的格式版本、记录数量、键类型分布，以及是否建议重写迁移。
 - `bash scripts/rewrite-format.sh <db_path>`：加载数据库并执行一次 `Compact()`，把数据重写到当前格式。
 - `bash scripts/verify-format.sh <db_path>`：检查一份数据是否已经处于当前受支持格式；若仍建议重写则返回非零状态。

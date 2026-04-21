@@ -23,7 +23,7 @@
 - `bash scripts/bench-regression-check.sh <baseline_json>`：生成 candidate baseline，并按默认阈值执行回归检查。
 - `bash scripts/ci-bench-regression.sh`：使用仓库提交的 `benchmarks/reference/ci-floor.json` 作为 CI floor。
 - `bash scripts/bench-trend.sh [baseline_dir] [recent_window]`：对一组历史 baseline 输出趋势摘要。
-- `bash scripts/collect-artifacts.sh [output_dir] [baseline_dir] [recent_window]`：把 `microbench`、`stressbench baseline`、趋势摘要和兼容矩阵统一落成 artifact 文件。
+- `bash scripts/collect-artifacts.sh [output_dir] [baseline_dir] [recent_window]`：把 `microbench`、`stressbench baseline`、趋势摘要、兼容矩阵和多 profile stress 摘要统一落成 artifact 文件。
 
 ## JSON Shape
 

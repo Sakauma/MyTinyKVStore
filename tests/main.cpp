@@ -318,6 +318,7 @@ struct StressSummary {
     int writer_count = 0;
     int reader_count = 0;
     int compactor_count = 0;
+    int recovery_reopen_cycles = 0;
     uint64_t committed_write_requests = 0;
     uint64_t max_pending_queue_depth = 0;
     uint64_t manual_compactions_completed = 0;
@@ -1405,6 +1406,7 @@ std::string StressSummaryToJson(const StressSummary& summary) {
         << ",\"writer_count\":" << summary.writer_count
         << ",\"reader_count\":" << summary.reader_count
         << ",\"compactor_count\":" << summary.compactor_count
+        << ",\"recovery_reopen_cycles\":" << summary.recovery_reopen_cycles
         << ",\"committed_write_requests\":" << summary.committed_write_requests
         << ",\"max_pending_queue_depth\":" << summary.max_pending_queue_depth
         << ",\"manual_compactions_completed\":" << summary.manual_compactions_completed
@@ -1462,6 +1464,7 @@ enum class ConcurrencyStressProfile {
     kBalanced,
     kWriteHeavy,
     kCompactionHeavy,
+    kRecoveryHeavy,
 };
 
 std::optional<SoakProfile> parse_soak_profile_name(const std::string& name) {
@@ -1487,6 +1490,9 @@ std::optional<ConcurrencyStressProfile> parse_concurrency_stress_profile_name(co
     if (name == "compaction-heavy") {
         return ConcurrencyStressProfile::kCompactionHeavy;
     }
+    if (name == "recovery-heavy") {
+        return ConcurrencyStressProfile::kRecoveryHeavy;
+    }
     return std::nullopt;
 }
 
@@ -1498,6 +1504,8 @@ std::string concurrency_stress_profile_name(ConcurrencyStressProfile profile) {
             return "write-heavy";
         case ConcurrencyStressProfile::kCompactionHeavy:
             return "compaction-heavy";
+        case ConcurrencyStressProfile::kRecoveryHeavy:
+            return "recovery-heavy";
     }
     return "unknown";
 }
@@ -1519,6 +1527,7 @@ struct ConcurrencyStressProfileConfig {
     int keys_per_writer = 96;
     int compaction_interval_ms = 5;
     int batch_width = 4;
+    int recovery_reopen_cycles = 1;
 };
 
 SoakProfileConfig make_soak_profile_config(SoakProfile profile) {
@@ -1600,6 +1609,19 @@ ConcurrencyStressProfileConfig make_concurrency_stress_profile_config(Concurrenc
             config.options.max_batch_delay_us = 800;
             config.options.auto_compact_wal_bytes_threshold = 2048;
             config.options.auto_compact_invalid_wal_ratio_percent = 45;
+            return config;
+        case ConcurrencyStressProfile::kRecoveryHeavy:
+            config.writer_count = 4;
+            config.reader_count = 1;
+            config.compactor_count = 1;
+            config.keys_per_writer = 64;
+            config.compaction_interval_ms = 2;
+            config.batch_width = 3;
+            config.recovery_reopen_cycles = 6;
+            config.options.max_batch_size = 16;
+            config.options.max_batch_delay_us = 700;
+            config.options.auto_compact_wal_bytes_threshold = 2048;
+            config.options.auto_compact_invalid_wal_ratio_percent = 40;
             return config;
     }
     return config;
@@ -2086,6 +2108,7 @@ void test_stress_summary_json_reports_profile() {
     summary.writer_count = 8;
     summary.reader_count = 4;
     summary.compactor_count = 1;
+    summary.recovery_reopen_cycles = 6;
     summary.committed_write_requests = 123;
     summary.max_pending_queue_depth = 7;
 
@@ -2096,6 +2119,8 @@ void test_stress_summary_json_reports_profile() {
             "stress summary json should include committed write counts");
     require(json.find("\"max_pending_queue_depth\":7") != std::string::npos,
             "stress summary json should include queue metrics");
+    require(json.find("\"recovery_reopen_cycles\":6") != std::string::npos,
+            "stress summary json should include recovery reopen counts");
 }
 
 void test_compare_benchmark_baseline_passes_within_thresholds() {
@@ -2682,6 +2707,8 @@ void test_concurrency_stress_profiles_are_distinct() {
         make_concurrency_stress_profile_config(ConcurrencyStressProfile::kWriteHeavy);
     const ConcurrencyStressProfileConfig compaction_heavy =
         make_concurrency_stress_profile_config(ConcurrencyStressProfile::kCompactionHeavy);
+    const ConcurrencyStressProfileConfig recovery_heavy =
+        make_concurrency_stress_profile_config(ConcurrencyStressProfile::kRecoveryHeavy);
 
     require(write_heavy.writer_count > balanced.writer_count,
             "write-heavy stress profile should use more writers than balanced");
@@ -2694,6 +2721,12 @@ void test_concurrency_stress_profiles_are_distinct() {
     require(compaction_heavy.options.auto_compact_wal_bytes_threshold <
                 balanced.options.auto_compact_wal_bytes_threshold,
             "compaction-heavy stress profile should compact at a smaller WAL threshold");
+    require(recovery_heavy.recovery_reopen_cycles > balanced.recovery_reopen_cycles,
+            "recovery-heavy stress profile should repeat reopen validation more often than balanced");
+    require(recovery_heavy.reader_count < balanced.reader_count,
+            "recovery-heavy stress profile should trade reader threads for reopen checks");
+    require(recovery_heavy.options.max_batch_delay_us < balanced.options.max_batch_delay_us,
+            "recovery-heavy stress profile should prefer shorter delays around recovery checks");
 }
 
 void test_options_to_json_reports_profile_fields() {
@@ -3528,21 +3561,23 @@ StressSummary run_concurrency_stress_capture(int duration_seconds, ConcurrencySt
     require(final_metrics.manual_compactions_completed >= static_cast<uint64_t>(config.compactor_count),
             "concurrency stress should complete manual compactions");
 
-    KVStore reopened(db_path);
-    for (int writer_id = 0; writer_id < config.writer_count; ++writer_id) {
-        for (int local_key = 0; local_key < config.keys_per_writer; ++local_key) {
-            const int global_key = writer_id * config.keys_per_writer + local_key;
-            const auto actual = reopened.Get(global_key);
-            const auto& expected =
-                expected_by_writer[static_cast<size_t>(writer_id)][static_cast<size_t>(local_key)];
-            if (!expected.has_value()) {
-                require(!actual.has_value(),
-                        "deleted writer-owned keys should remain deleted after stress restart");
-                continue;
+    for (int reopen_index = 0; reopen_index < config.recovery_reopen_cycles; ++reopen_index) {
+        KVStore reopened(db_path);
+        for (int writer_id = 0; writer_id < config.writer_count; ++writer_id) {
+            for (int local_key = 0; local_key < config.keys_per_writer; ++local_key) {
+                const int global_key = writer_id * config.keys_per_writer + local_key;
+                const auto actual = reopened.Get(global_key);
+                const auto& expected =
+                    expected_by_writer[static_cast<size_t>(writer_id)][static_cast<size_t>(local_key)];
+                if (!expected.has_value()) {
+                    require(!actual.has_value(),
+                            "deleted writer-owned keys should remain deleted after stress restart");
+                    continue;
+                }
+                require(actual.has_value(), "expected live stress key missing after restart");
+                require(as_string(*actual) == *expected,
+                        "reopened state should match the stress oracle for writer-owned keys");
             }
-            require(actual.has_value(), "expected live stress key missing after restart");
-            require(as_string(*actual) == *expected,
-                    "reopened state should match the stress oracle for writer-owned keys");
         }
     }
 
@@ -3552,6 +3587,7 @@ StressSummary run_concurrency_stress_capture(int duration_seconds, ConcurrencySt
     summary.writer_count = config.writer_count;
     summary.reader_count = config.reader_count;
     summary.compactor_count = config.compactor_count;
+    summary.recovery_reopen_cycles = config.recovery_reopen_cycles;
     summary.committed_write_requests = final_metrics.committed_write_requests;
     summary.max_pending_queue_depth = final_metrics.max_pending_queue_depth;
     summary.manual_compactions_completed = final_metrics.manual_compactions_completed;
@@ -3566,6 +3602,7 @@ void run_concurrency_stress_test(int duration_seconds, ConcurrencyStressProfile 
     std::cout << "[STRESS]"
               << " profile=" << summary.profile
               << " duration_seconds=" << summary.duration_seconds
+              << " recovery_reopen_cycles=" << summary.recovery_reopen_cycles
               << " committed_write_requests=" << summary.committed_write_requests
               << " max_pending_queue_depth=" << summary.max_pending_queue_depth
               << " manual_compactions_completed=" << summary.manual_compactions_completed

@@ -106,7 +106,7 @@ Exit criteria:
 - 每个 profile 都能输出统一结果摘要。
 
 Current status:
-- 进行中。`balanced`、`write-heavy`、`compaction-heavy` 已支持统一的 JSON stress 摘要与批量脚本；`recovery-heavy` 仍待补齐。
+- 已完成。`balanced`、`write-heavy`、`compaction-heavy`、`recovery-heavy` 现已全部支持统一的 JSON stress 摘要与批量脚本。
 
 ### 5.2 Artifact-Oriented Reporting
 
@@ -114,7 +114,7 @@ Current status:
 - 为后续 CI 历史归档或外部可视化留接口。
 
 Current status:
-- 进行中。趋势摘要已具备 JSON 输出，artifact 收集脚本会把 `microbench`、`stressbench baseline`、`trend summary` 和 `compatibility matrix` 统一落盘。
+- 已完成。artifact 收集脚本现已统一落盘 `microbench`、`stressbench baseline`、`trend summary`、`compatibility matrix`，以及全部标准 stress profile 的 JSON 摘要。
 
 Exit criteria:
 - 长期运行结果不是只出现在终端，而是能被后续流程消费。
