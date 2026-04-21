@@ -5,6 +5,7 @@
 #include "internal/metrics_helpers.h"
 #include "internal/observability.h"
 #include "internal/recovery.h"
+#include "internal/writer_policy.h"
 
 #include <algorithm>
 #include <atomic>
@@ -38,27 +39,6 @@ public:
         WalRecordType type;
         std::string key;
         Value value;
-    };
-
-    struct BatchPolicy {
-        size_t max_batch_size;
-        uint64_t max_batch_wal_bytes;
-        uint32_t batch_delay_us;
-        uint64_t observed_queue_depth;
-        uint64_t objective_pressure_score;
-        uint64_t objective_cost_score;
-        uint64_t objective_throughput_score;
-        int64_t objective_balance_score;
-        int64_t objective_mode;
-        bool adaptive_batching;
-        bool adaptive_flush;
-        bool latency_target_adjusted;
-        bool fsync_pressure_adjusted;
-        bool read_heavy_adjusted;
-        bool compaction_pressure_adjusted;
-        bool wal_growth_adjusted;
-        bool objective_short_delay_adjusted;
-        bool objective_long_delay_adjusted;
     };
 
     Impl(std::string db_path, KVStoreOptions options)
@@ -523,214 +503,17 @@ private:
     }
 
     BatchPolicy current_batch_policy_locked() const {
-        BatchPolicy policy {
-            options_.max_batch_size,
-            options_.max_batch_wal_bytes,
-            options_.max_batch_delay_us,
+        const WriterPolicySignals signals {
             request_queue_.size(),
-            0,
-            0,
-            0,
-            0,
-            0,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
+            recent_peak_queue_depth_.load(std::memory_order_relaxed),
+            effective_recent_read_ratio_per_1000_ops(),
+            current_obsolete_wal_ratio_percent(),
+            recent_avg_batch_size_.load(std::memory_order_relaxed),
+            recent_avg_batch_wal_bytes_.load(std::memory_order_relaxed),
+            recent_observed_write_latency_p95_us_.load(std::memory_order_relaxed),
+            observed_fsync_pressure_per_1000_writes_.load(std::memory_order_relaxed),
         };
-        const uint64_t recent_peak_queue_depth = recent_peak_queue_depth_.load(std::memory_order_relaxed);
-        const uint64_t recent_read_ratio = effective_recent_read_ratio_per_1000_ops();
-        const uint64_t current_obsolete_ratio = current_obsolete_wal_ratio_percent();
-        const uint64_t recent_avg_batch_size = recent_avg_batch_size_.load(std::memory_order_relaxed);
-        const uint64_t recent_avg_batch_wal_bytes = recent_avg_batch_wal_bytes_.load(std::memory_order_relaxed);
-        if (options_.adaptive_batching_enabled &&
-            (request_queue_.size() >= options_.adaptive_queue_depth_threshold ||
-             recent_peak_queue_depth >= options_.adaptive_queue_depth_threshold)) {
-            policy.adaptive_batching = true;
-            policy.max_batch_size = saturating_multiply(options_.max_batch_size, options_.adaptive_batch_size_multiplier);
-            if (policy.max_batch_size == 0) {
-                policy.max_batch_size = 1;
-            }
-            if (options_.max_batch_wal_bytes == 0) {
-                policy.max_batch_wal_bytes = 0;
-            } else {
-                policy.max_batch_wal_bytes = saturating_multiply(
-                    options_.max_batch_wal_bytes,
-                    options_.adaptive_batch_wal_bytes_multiplier);
-            }
-        }
-
-        if (!options_.adaptive_objective_enabled &&
-            options_.adaptive_flush_enabled &&
-            options_.max_batch_delay_us > 0 &&
-            (request_queue_.size() >= options_.adaptive_flush_queue_depth_threshold ||
-             recent_peak_queue_depth >= options_.adaptive_flush_queue_depth_threshold)) {
-            policy.adaptive_flush = true;
-            size_t pressure_steps = request_queue_.size() / options_.adaptive_flush_queue_depth_threshold;
-            if (pressure_steps == 0) {
-                pressure_steps = std::max<size_t>(
-                    1,
-                    recent_peak_queue_depth / options_.adaptive_flush_queue_depth_threshold);
-            }
-            uint32_t effective_delay = options_.max_batch_delay_us;
-            for (size_t step = 0; step < pressure_steps; ++step) {
-                effective_delay = std::max(
-                    options_.adaptive_flush_min_batch_delay_us,
-                    effective_delay / options_.adaptive_flush_delay_divisor);
-                if (effective_delay <= options_.adaptive_flush_min_batch_delay_us) {
-                    break;
-                }
-            }
-            policy.batch_delay_us = effective_delay;
-        }
-
-        const uint64_t observed_p95_us = recent_observed_write_latency_p95_us_.load(std::memory_order_relaxed);
-        if (options_.adaptive_objective_enabled) {
-            const uint64_t observed_pressure =
-                observed_fsync_pressure_per_1000_writes_.load(std::memory_order_relaxed);
-            const uint64_t observed_queue_depth =
-                std::max<uint64_t>(request_queue_.size(), recent_peak_queue_depth);
-            const uint64_t queue_scale =
-                options_.adaptive_batching_enabled
-                    ? options_.adaptive_queue_depth_threshold
-                    : options_.max_batch_size;
-            const uint64_t pressure_score =
-                weighted_signal_score(observed_queue_depth, queue_scale, options_.adaptive_objective_queue_weight) +
-                weighted_signal_score(
-                    observed_p95_us,
-                    options_.adaptive_latency_target_p95_us,
-                    options_.adaptive_objective_latency_weight) +
-                weighted_signal_score(
-                    recent_read_ratio,
-                    options_.adaptive_read_heavy_read_per_1000_ops_threshold,
-                    options_.adaptive_objective_read_weight);
-            const uint64_t throughput_score =
-                weighted_deficit_score(
-                    recent_avg_batch_size,
-                    options_.adaptive_objective_target_batch_size,
-                    options_.adaptive_objective_throughput_weight);
-            const uint64_t cost_score =
-                throughput_score +
-                weighted_signal_score(
-                    observed_pressure,
-                    options_.adaptive_fsync_pressure_per_1000_writes_threshold,
-                    options_.adaptive_objective_fsync_weight) +
-                weighted_signal_score(
-                    current_obsolete_ratio,
-                    options_.adaptive_compaction_pressure_obsolete_ratio_percent_threshold,
-                    options_.adaptive_objective_compaction_weight) +
-                weighted_signal_score(
-                    recent_avg_batch_wal_bytes,
-                    options_.adaptive_wal_growth_bytes_per_batch_threshold,
-                    options_.adaptive_objective_wal_growth_weight);
-            policy.objective_pressure_score = pressure_score;
-            policy.objective_cost_score = cost_score;
-            policy.objective_throughput_score = throughput_score;
-            policy.objective_balance_score =
-                static_cast<int64_t>(pressure_score) - static_cast<int64_t>(cost_score);
-
-            if (pressure_score >= cost_score + options_.adaptive_objective_short_delay_score_threshold &&
-                policy.batch_delay_us > options_.adaptive_flush_min_batch_delay_us) {
-                policy.objective_short_delay_adjusted = true;
-                policy.objective_mode = 1;
-                policy.batch_delay_us = std::max(
-                    options_.adaptive_flush_min_batch_delay_us,
-                    policy.batch_delay_us / options_.adaptive_objective_short_delay_divisor);
-            } else if (cost_score >= pressure_score + options_.adaptive_objective_long_delay_score_threshold &&
-                       options_.adaptive_objective_long_delay_multiplier > 1) {
-                policy.objective_long_delay_adjusted = true;
-                policy.objective_mode = -1;
-                uint32_t boosted_delay = saturating_multiply(
-                    policy.batch_delay_us,
-                    options_.adaptive_objective_long_delay_multiplier);
-                if (options_.adaptive_objective_max_batch_delay_us > 0) {
-                    boosted_delay = std::min(
-                        boosted_delay,
-                        options_.adaptive_objective_max_batch_delay_us);
-                }
-                if (boosted_delay > 0) {
-                    policy.batch_delay_us = boosted_delay;
-                }
-            }
-            return policy;
-        }
-
-        if (options_.adaptive_read_heavy_read_per_1000_ops_threshold > 0 &&
-            recent_read_ratio >= options_.adaptive_read_heavy_read_per_1000_ops_threshold) {
-            policy.read_heavy_adjusted = true;
-            policy.batch_delay_us = std::max(
-                options_.adaptive_flush_min_batch_delay_us,
-                policy.batch_delay_us / options_.adaptive_read_heavy_delay_divisor);
-            policy.max_batch_size = std::max<size_t>(1, policy.max_batch_size / options_.adaptive_read_heavy_batch_size_divisor);
-            if (policy.max_batch_wal_bytes > 0) {
-                policy.max_batch_wal_bytes =
-                    std::max<uint64_t>(sizeof(WalRecordHeader), policy.max_batch_wal_bytes / options_.adaptive_read_heavy_batch_size_divisor);
-            }
-        }
-
-        if (options_.adaptive_latency_target_p95_us > 0 &&
-            observed_p95_us > options_.adaptive_latency_target_p95_us &&
-            policy.batch_delay_us > options_.adaptive_flush_min_batch_delay_us) {
-            policy.adaptive_flush = true;
-            policy.latency_target_adjusted = true;
-            policy.batch_delay_us = std::max(
-                options_.adaptive_flush_min_batch_delay_us,
-                policy.batch_delay_us / std::max<uint32_t>(2, options_.adaptive_flush_delay_divisor));
-        }
-
-        if (!policy.read_heavy_adjusted && !policy.latency_target_adjusted &&
-            options_.adaptive_fsync_pressure_per_1000_writes_threshold > 0) {
-            const uint64_t observed_pressure =
-                observed_fsync_pressure_per_1000_writes_.load(std::memory_order_relaxed);
-            if (observed_pressure >= options_.adaptive_fsync_pressure_per_1000_writes_threshold &&
-                options_.adaptive_fsync_pressure_delay_multiplier > 1) {
-                policy.fsync_pressure_adjusted = true;
-                uint32_t boosted_delay = saturating_multiply(
-                    policy.batch_delay_us,
-                    options_.adaptive_fsync_pressure_delay_multiplier);
-                if (options_.adaptive_fsync_pressure_max_batch_delay_us > 0) {
-                    boosted_delay = std::min(
-                        boosted_delay,
-                        options_.adaptive_fsync_pressure_max_batch_delay_us);
-                }
-                if (boosted_delay > 0) {
-                    policy.batch_delay_us = boosted_delay;
-                }
-            }
-        }
-
-        if (!policy.read_heavy_adjusted &&
-            options_.adaptive_compaction_pressure_obsolete_ratio_percent_threshold > 0 &&
-            current_obsolete_ratio >= options_.adaptive_compaction_pressure_obsolete_ratio_percent_threshold) {
-            policy.compaction_pressure_adjusted = true;
-            uint32_t boosted_delay = saturating_multiply(
-                policy.batch_delay_us,
-                options_.adaptive_compaction_pressure_delay_multiplier);
-            if (boosted_delay > 0) {
-                policy.batch_delay_us = boosted_delay;
-            }
-        }
-
-        if (!policy.read_heavy_adjusted &&
-            options_.adaptive_wal_growth_bytes_per_batch_threshold > 0 &&
-            recent_avg_batch_wal_bytes >= options_.adaptive_wal_growth_bytes_per_batch_threshold) {
-            policy.wal_growth_adjusted = true;
-            uint32_t boosted_delay = saturating_multiply(
-                policy.batch_delay_us,
-                options_.adaptive_wal_growth_delay_multiplier);
-            if (options_.adaptive_wal_growth_max_batch_delay_us > 0) {
-                boosted_delay = std::min(boosted_delay, options_.adaptive_wal_growth_max_batch_delay_us);
-            }
-            if (boosted_delay > 0) {
-                policy.batch_delay_us = boosted_delay;
-            }
-        }
-        return policy;
+        return compute_batch_policy(options_, signals);
     }
 
     void collect_write_batch(
