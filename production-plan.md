@@ -8,8 +8,8 @@
 
 ### 1. Data Model
 
-- 已支持 `int` 键、字符串键和字符串范围扫描。
-- 还不支持二进制键，以及更完整的跨类型迁移与比较语义。
+- 已支持 `int` 键、字符串键、二进制键和字符串范围扫描。
+- 还缺少更完整的跨类型迁移与比较语义。
 
 ### 2. File Format and Compatibility
 
@@ -78,11 +78,12 @@ Exit criteria:
 ## Phase 4: Data Model Expansion
 
 - 支持字符串键。
+- 支持二进制键。
 - 设计统一的键编码与比较语义，为范围扫描做准备。
 - 在稳定编码格式基础上增加范围扫描接口。
 
 Exit criteria:
-- 字符串键和范围扫描不破坏现有恢复、compaction 和并发语义。
+- 字符串键、二进制键和范围扫描不破坏现有恢复、compaction 和并发语义。
 - 新数据模型有完整测试覆盖。
 
 ## Phase 5: Adaptive Controller Upgrade

@@ -143,15 +143,24 @@ struct BatchWriteOperation {
         kDelete,
     };
 
+    enum class KeyKind {
+        kString,
+        kInt,
+        kBinary,
+    };
+
     Type type = Type::kPut;
+    KeyKind key_kind = KeyKind::kString;
     std::string key;
+    std::vector<uint8_t> binary_key;
     Value value;
-    bool key_is_string = true;
 
     static BatchWriteOperation Put(std::string key, Value value);
     static BatchWriteOperation Delete(std::string key);
     static BatchWriteOperation PutInt(int key, Value value);
     static BatchWriteOperation DeleteInt(int key);
+    static BatchWriteOperation PutBinary(std::vector<uint8_t> key, Value value);
+    static BatchWriteOperation DeleteBinary(std::vector<uint8_t> key);
 };
 
 std::string MetricsToJson(const KVStoreMetrics& metrics);
@@ -166,11 +175,14 @@ public:
 
     void Put(int key, Value value);
     void Put(const std::string& key, Value value);
+    void Put(const std::vector<uint8_t>& key, Value value);
     void WriteBatch(const std::vector<BatchWriteOperation>& operations);
     std::optional<Value> Get(int key);
     std::optional<Value> Get(const std::string& key);
+    std::optional<Value> Get(const std::vector<uint8_t>& key);
     void Delete(int key);
     void Delete(const std::string& key);
+    void Delete(const std::vector<uint8_t>& key);
     std::vector<std::pair<std::string, Value>> Scan(const std::string& start_key, const std::string& end_key);
     void Compact();
     KVStoreMetrics GetMetrics();

@@ -435,9 +435,36 @@ void test_string_scan_returns_sorted_range() {
     require(results[2].first == "date" && as_string(results[2].second) == "d", "scan should include the upper bound");
 }
 
+void test_binary_keys_do_not_collide_with_other_namespaces() {
+    TestDir dir("binary_keys");
+    const std::string db_path = dir.file("store.dat");
+    const std::vector<uint8_t> binary_42 = {'4', '2'};
+    const std::vector<uint8_t> binary_raw = {0x00, 0xFF, 0x42};
+
+    {
+        KVStore store(db_path);
+        store.Put(42, text("int-key"));
+        store.Put(std::string("42"), text("string-key"));
+        store.Put(binary_42, text("binary-key"));
+        store.Put(binary_raw, text("raw-binary"));
+    }
+
+    KVStore reopened(db_path);
+    const auto int_value = reopened.Get(42);
+    const auto string_value = reopened.Get(std::string("42"));
+    const auto binary_value = reopened.Get(binary_42);
+    const auto raw_binary_value = reopened.Get(binary_raw);
+    require(int_value.has_value() && as_string(*int_value) == "int-key", "int namespace should be preserved");
+    require(string_value.has_value() && as_string(*string_value) == "string-key", "string namespace should be preserved");
+    require(binary_value.has_value() && as_string(*binary_value) == "binary-key", "binary namespace should be preserved");
+    require(raw_binary_value.has_value() && as_string(*raw_binary_value) == "raw-binary",
+            "binary keys should support embedded zero bytes");
+}
+
 void test_write_batch_persists_mixed_key_types() {
     TestDir dir("batch_mixed_keys");
     const std::string db_path = dir.file("store.dat");
+    const std::vector<uint8_t> binary_key = {0x00, 0x01, 0x02};
 
     {
         KVStore store(db_path);
@@ -445,6 +472,7 @@ void test_write_batch_persists_mixed_key_types() {
             BatchWriteOperation::PutInt(42, text("int-key")),
             BatchWriteOperation::Put("42", text("string-key")),
             BatchWriteOperation::Put("alpha", text("word")),
+            BatchWriteOperation::PutBinary(binary_key, text("binary-word")),
         });
     }
 
@@ -452,12 +480,15 @@ void test_write_batch_persists_mixed_key_types() {
     const auto int_value = reopened.Get(42);
     const auto string_value = reopened.Get(std::string("42"));
     const auto alpha_value = reopened.Get(std::string("alpha"));
+    const auto binary_value = reopened.Get(binary_key);
     require(int_value.has_value(), "batch int key should persist");
     require(string_value.has_value(), "batch string key should persist");
     require(alpha_value.has_value(), "batch string key should persist");
+    require(binary_value.has_value(), "batch binary key should persist");
     require(as_string(*int_value) == "int-key", "batch int key should keep its namespace");
     require(as_string(*string_value) == "string-key", "batch string key should not collide with int namespace");
     require(as_string(*alpha_value) == "word", "batch string key should round-trip");
+    require(as_string(*binary_value) == "binary-word", "batch binary key should round-trip");
 }
 
 void test_write_batch_mixes_put_and_delete() {
@@ -1983,6 +2014,7 @@ int main(int argc, char* argv[]) {
         {"basic persistence", test_basic_persistence},
         {"string keys do not collide with int keys", test_string_keys_do_not_collide_with_int_keys},
         {"string scan returns sorted range", test_string_scan_returns_sorted_range},
+        {"binary keys do not collide with other namespaces", test_binary_keys_do_not_collide_with_other_namespaces},
         {"batch write persists mixed key types", test_write_batch_persists_mixed_key_types},
         {"batch write mixes put and delete", test_write_batch_mixes_put_and_delete},
         {"batch write preserves operation order", test_write_batch_preserves_operation_order},

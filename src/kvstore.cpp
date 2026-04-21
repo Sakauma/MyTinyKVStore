@@ -34,6 +34,7 @@ constexpr uint32_t kSnapshotVersion = 2;
 constexpr char kSnapshotMagic[8] = {'K', 'V', 'S', 'N', 'A', 'P', '0', '1'};
 constexpr char kIntKeyTag = '\x01';
 constexpr char kStringKeyTag = '\x02';
+constexpr char kBinaryKeyTag = '\x03';
 constexpr std::array<uint64_t, kWriteLatencyBucketCount - 1> kWriteLatencyBucketUpperBoundsUs = {
     50,
     100,
@@ -200,6 +201,14 @@ std::string encode_int_key(int32_t key) {
 std::string encode_string_key(const std::string& key) {
     std::string encoded(1, kStringKeyTag);
     encoded += key;
+    return encoded;
+}
+
+std::string encode_binary_key(const std::vector<uint8_t>& key) {
+    std::string encoded(1, kBinaryKeyTag);
+    if (!key.empty()) {
+        encoded.append(reinterpret_cast<const char*>(key.data()), key.size());
+    }
     return encoded;
 }
 
@@ -1718,34 +1727,51 @@ KVStore::~KVStore() = default;
 BatchWriteOperation BatchWriteOperation::Put(std::string key, Value value) {
     BatchWriteOperation operation;
     operation.type = Type::kPut;
+    operation.key_kind = KeyKind::kString;
     operation.key = std::move(key);
     operation.value = std::move(value);
-    operation.key_is_string = true;
     return operation;
 }
 
 BatchWriteOperation BatchWriteOperation::Delete(std::string key) {
     BatchWriteOperation operation;
     operation.type = Type::kDelete;
+    operation.key_kind = KeyKind::kString;
     operation.key = std::move(key);
-    operation.key_is_string = true;
     return operation;
 }
 
 BatchWriteOperation BatchWriteOperation::PutInt(int key, Value value) {
     BatchWriteOperation operation;
     operation.type = Type::kPut;
+    operation.key_kind = KeyKind::kInt;
     operation.key = std::to_string(key);
     operation.value = std::move(value);
-    operation.key_is_string = false;
     return operation;
 }
 
 BatchWriteOperation BatchWriteOperation::DeleteInt(int key) {
     BatchWriteOperation operation;
     operation.type = Type::kDelete;
+    operation.key_kind = KeyKind::kInt;
     operation.key = std::to_string(key);
-    operation.key_is_string = false;
+    return operation;
+}
+
+BatchWriteOperation BatchWriteOperation::PutBinary(std::vector<uint8_t> key, Value value) {
+    BatchWriteOperation operation;
+    operation.type = Type::kPut;
+    operation.key_kind = KeyKind::kBinary;
+    operation.binary_key = std::move(key);
+    operation.value = std::move(value);
+    return operation;
+}
+
+BatchWriteOperation BatchWriteOperation::DeleteBinary(std::vector<uint8_t> key) {
+    BatchWriteOperation operation;
+    operation.type = Type::kDelete;
+    operation.key_kind = KeyKind::kBinary;
+    operation.binary_key = std::move(key);
     return operation;
 }
 
@@ -1755,6 +1781,10 @@ void KVStore::Put(int key, Value value) {
 
 void KVStore::Put(const std::string& key, Value value) {
     pimpl_->Put(encode_string_key(key), std::move(value));
+}
+
+void KVStore::Put(const std::vector<uint8_t>& key, Value value) {
+    pimpl_->Put(encode_binary_key(key), std::move(value));
 }
 
 void KVStore::WriteBatch(const std::vector<BatchWriteOperation>& operations) {
@@ -1767,14 +1797,20 @@ void KVStore::WriteBatch(const std::vector<BatchWriteOperation>& operations) {
     for (const auto& operation : operations) {
         Impl::BatchMutation mutation;
         mutation.type = operation.type == BatchWriteOperation::Type::kPut ? WalRecordType::kPut : WalRecordType::kDelete;
-        if (operation.key_is_string) {
-            mutation.key = encode_string_key(operation.key);
-        } else {
-            try {
-                mutation.key = encode_int_key(std::stoi(operation.key));
-            } catch (const std::exception&) {
-                throw KVStoreError("BatchWriteOperation integer key is invalid: " + operation.key);
-            }
+        switch (operation.key_kind) {
+            case BatchWriteOperation::KeyKind::kString:
+                mutation.key = encode_string_key(operation.key);
+                break;
+            case BatchWriteOperation::KeyKind::kInt:
+                try {
+                    mutation.key = encode_int_key(std::stoi(operation.key));
+                } catch (const std::exception&) {
+                    throw KVStoreError("BatchWriteOperation integer key is invalid: " + operation.key);
+                }
+                break;
+            case BatchWriteOperation::KeyKind::kBinary:
+                mutation.key = encode_binary_key(operation.binary_key);
+                break;
         }
         mutation.value = operation.value;
         encoded_operations.push_back(std::move(mutation));
@@ -1791,12 +1827,20 @@ std::optional<Value> KVStore::Get(const std::string& key) {
     return pimpl_->Get(encode_string_key(key));
 }
 
+std::optional<Value> KVStore::Get(const std::vector<uint8_t>& key) {
+    return pimpl_->Get(encode_binary_key(key));
+}
+
 void KVStore::Delete(int key) {
     pimpl_->Delete(encode_int_key(key));
 }
 
 void KVStore::Delete(const std::string& key) {
     pimpl_->Delete(encode_string_key(key));
+}
+
+void KVStore::Delete(const std::vector<uint8_t>& key) {
+    pimpl_->Delete(encode_binary_key(key));
 }
 
 std::vector<std::pair<std::string, Value>> KVStore::Scan(const std::string& start_key, const std::string& end_key) {
