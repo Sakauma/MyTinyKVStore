@@ -71,6 +71,7 @@ Current status:
 - 已将第三批 recovery/format migration integration tests 提炼到 `tests/integration/recovery_format_tests.cpp`，并补上可复用的 CLI entrypoint 头以支撑跨文件复用格式检查命令。
 - 已将第四批 runtime/concurrency integration tests 提炼到 `tests/integration/runtime_concurrency_tests.cpp`，并补上 runtime entrypoint 头以跨文件复用 failpoint、soak profile 与 stress profile 配置入口。
 - 已将 internal format/metrics helper tests 下沉到 `kv_unit_test`，并将 residual durability smoke tests 提炼到 `tests/integration/durability_smoke_tests.cpp`，`tests/main.cpp` 现进一步收缩为 CLI/fixture glue。
+- 已将 inspect/verify/rewrite/compatibility 相关 CLI 实现提炼到 `tests/common/format_cli.cpp`，`tests/main.cpp` 不再直接持有磁盘格式探测与兼容矩阵实现。
 
 ## Phase 3: Continuous Performance Governance
 
