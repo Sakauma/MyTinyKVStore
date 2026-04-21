@@ -3667,6 +3667,40 @@ void test_objective_policy_prefers_short_delay_under_latency_pressure() {
             "objective balance should be positive when pressure favors shorter delays");
 }
 
+void test_objective_short_delay_owns_delay_decision_when_enabled() {
+    TestDir dir("objective_owns_delay");
+    const std::string db_path = dir.file("store.dat");
+
+    KVStoreOptions options;
+    options.max_batch_size = 16;
+    options.max_batch_delay_us = 50000;
+    options.adaptive_flush_enabled = true;
+    options.adaptive_flush_queue_depth_threshold = 1;
+    options.adaptive_flush_delay_divisor = 10;
+    options.adaptive_flush_min_batch_delay_us = 1000;
+    options.adaptive_objective_enabled = true;
+    options.adaptive_objective_queue_weight = 4;
+    options.adaptive_objective_latency_weight = 0;
+    options.adaptive_objective_read_weight = 0;
+    options.adaptive_objective_fsync_weight = 0;
+    options.adaptive_objective_compaction_weight = 0;
+    options.adaptive_objective_wal_growth_weight = 0;
+    options.adaptive_objective_short_delay_score_threshold = 100;
+    options.adaptive_objective_short_delay_divisor = 10;
+
+    KVStore store(db_path, options);
+    store.Put(1, text("objective_owned_delay_a"));
+    store.Put(2, text("objective_owned_delay_b"));
+
+    const KVStoreMetrics metrics = store.GetMetrics();
+    require(metrics.adaptive_objective_short_delay_batches_completed >= 1,
+            "objective should own the short-delay decision when it is enabled");
+    require(metrics.adaptive_flush_batches_completed == 0,
+            "adaptive flush should not directly shorten delay when objective control is enabled");
+    require(metrics.last_effective_batch_delay_us < options.max_batch_delay_us,
+            "objective-owned short delay should still reduce the effective batch delay");
+}
+
 void test_objective_policy_prefers_long_delay_under_cost_pressure() {
     TestDir dir("objective_long_delay");
     const std::string db_path = dir.file("store.dat");
@@ -4526,6 +4560,8 @@ int main(int argc, char* argv[]) {
         {"wal growth signal relaxes batch delay", test_wal_growth_signal_relaxes_batch_delay},
         {"objective policy prefers short delay under latency pressure",
          test_objective_policy_prefers_short_delay_under_latency_pressure},
+        {"objective short delay owns delay decision when enabled",
+         test_objective_short_delay_owns_delay_decision_when_enabled},
         {"objective policy prefers long delay under cost pressure",
          test_objective_policy_prefers_long_delay_under_cost_pressure},
         {"objective throughput score can dominate latency pressure",

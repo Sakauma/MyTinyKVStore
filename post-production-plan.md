@@ -80,6 +80,9 @@ Current status:
 Exit criteria:
 - 性能治理从“单次回归检查”升级成“多维、可追溯、可解释”的长期机制。
 
+Current status:
+- 已推进。`microbench` 已补齐 `compaction` / `rewrite` case，并新增独立的 `microbench regression` 命令、脚本、CI floor 与 `microbench trend` 产物；后续可继续细化各 case 的门槛策略。
+
 ## Phase 4: Controller Simplification Before Further Tuning
 
 ### 4.1 Audit Current Adaptive Rules
@@ -88,7 +91,6 @@ Exit criteria:
 - 明确哪些信号重叠、哪些分支已经不再值得保留。
 
 Current status:
-- 已推进。`microbench` 已补齐 `compaction` / `rewrite` case，并新增独立的 `microbench regression` 命令、脚本和 CI floor；当前还补上了 `microbench trend` 命令与 artifact，后续可继续细化各 case 的门槛策略。
 - 已完成第一轮审计，见 `docs/internal/controller-audit.md`。当前主要结论是 delay 决策已出现“单信号规则 + objective 规则”双层重叠，下一步应优先收缩 delay 路径，而不是继续叠加新开关。
 
 ### 4.2 Reduce Policy Surface
@@ -98,6 +100,9 @@ Current status:
 
 Exit criteria:
 - 控制器更容易解释，新增调优不再建立在继续膨胀的规则树之上。
+
+Current status:
+- 已开始第一刀简化：`objective` 启用时，`adaptive_flush` 不再直接修改 `batch_delay_us`，delay 缩短统一由 objective 决策；`adaptive_flush_min_batch_delay_us` 继续保留为 safety floor。
 
 ## Phase 5: Long-Run Evidence Pipeline
 

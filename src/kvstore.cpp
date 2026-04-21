@@ -557,7 +557,8 @@ private:
             }
         }
 
-        if (options_.adaptive_flush_enabled &&
+        if (!options_.adaptive_objective_enabled &&
+            options_.adaptive_flush_enabled &&
             options_.max_batch_delay_us > 0 &&
             (request_queue_.size() >= options_.adaptive_flush_queue_depth_threshold ||
              recent_peak_queue_depth >= options_.adaptive_flush_queue_depth_threshold)) {
