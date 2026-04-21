@@ -47,6 +47,7 @@ add_library(kvstore SHARED
     src/kvstore.cpp
     src/internal/compaction.cpp
     src/internal/format.cpp
+    src/internal/latency_metrics.cpp
     src/internal/io.cpp
     src/internal/metrics_helpers.cpp
     src/internal/metrics_snapshot.cpp

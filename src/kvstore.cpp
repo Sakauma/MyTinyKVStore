@@ -1,6 +1,7 @@
 #include "kvstore.h"
 #include "internal/compaction.h"
 #include "internal/format.h"
+#include "internal/latency_metrics.h"
 #include "internal/io.h"
 #include "internal/metrics_helpers.h"
 #include "internal/metrics_snapshot.h"
@@ -809,25 +810,14 @@ private:
         const auto elapsed = std::chrono::steady_clock::now() - request.enqueue_time;
         const uint64_t elapsed_us =
             static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count());
-        size_t bucket = kWriteLatencyBucketCount - 1;
-        for (size_t i = 0; i + 1 < kWriteLatencyBucketCount; ++i) {
-            if (elapsed_us <= kWriteLatencyBucketUpperBoundsUs[i]) {
-                bucket = i;
-                break;
-            }
-        }
-        write_latency_histogram_[bucket].fetch_add(1, std::memory_order_relaxed);
-
-        recent_latency_buckets_.push_back(bucket);
-        recent_latency_bucket_counts_[bucket] += 1;
-        while (recent_latency_buckets_.size() > options_.adaptive_recent_write_sample_limit) {
-            const size_t old_bucket = recent_latency_buckets_.front();
-            recent_latency_buckets_.pop_front();
-            recent_latency_bucket_counts_[old_bucket] -= 1;
-        }
-        recent_observed_write_latency_p95_us_.store(
-            approximate_latency_percentile_us(recent_latency_bucket_counts_, 95, 100),
-            std::memory_order_relaxed);
+        record_write_latency_sample(LatencyMetricsContext {
+            elapsed_us,
+            options_.adaptive_recent_write_sample_limit,
+            recent_latency_buckets_,
+            recent_latency_bucket_counts_,
+            write_latency_histogram_,
+            recent_observed_write_latency_p95_us_,
+        });
     }
 
     void open_wal_for_append() {
