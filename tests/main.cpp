@@ -198,6 +198,41 @@ std::pair<int, std::string> capture_verify_format(const std::string& db_path) {
     return {status, out.str()};
 }
 
+struct BenchmarkConfig {
+    std::string label;
+    int writer_count = 8;
+    int reader_count = 4;
+    int duration_ms = 3000;
+    int key_space = 50000;
+};
+
+struct BenchmarkResult {
+    BenchmarkConfig config;
+    KVStoreOptions options;
+    KVStoreMetrics metrics;
+    double duration_s = 0.0;
+    uint64_t writes = 0;
+    uint64_t reads = 0;
+    double write_ops_per_s = 0.0;
+    double read_ops_per_s = 0.0;
+    double avg_write_latency_us = 0.0;
+};
+
+BenchmarkConfig make_benchmark_config(
+    std::string label,
+    int writer_count,
+    int reader_count,
+    int duration_ms,
+    int key_space) {
+    BenchmarkConfig config;
+    config.label = std::move(label);
+    config.writer_count = writer_count;
+    config.reader_count = reader_count;
+    config.duration_ms = duration_ms;
+    config.key_space = key_space;
+    return config;
+}
+
 uint64_t histogram_total(const std::array<uint64_t, kWriteLatencyBucketCount>& histogram) {
     uint64_t total = 0;
     for (uint64_t value : histogram) {
@@ -695,6 +730,137 @@ int run_compatibility_matrix() {
     return 0;
 }
 
+KVStoreOptions benchmark_options() {
+    KVStoreOptions options;
+    options.max_batch_size = 32;
+    options.max_batch_wal_bytes = 1 << 20;
+    options.max_batch_delay_us = 2000;
+    options.adaptive_recent_window_batches = 64;
+    options.adaptive_recent_write_sample_limit = 512;
+    options.adaptive_objective_enabled = true;
+    options.adaptive_objective_queue_weight = 1;
+    options.adaptive_objective_latency_weight = 3;
+    options.adaptive_objective_read_weight = 2;
+    options.adaptive_objective_throughput_weight = 2;
+    options.adaptive_objective_target_batch_size = 16;
+    options.adaptive_objective_fsync_weight = 2;
+    options.adaptive_objective_compaction_weight = 1;
+    options.adaptive_objective_wal_growth_weight = 1;
+    options.adaptive_objective_short_delay_score_threshold = 500;
+    options.adaptive_objective_long_delay_score_threshold = 500;
+    options.adaptive_objective_short_delay_divisor = 2;
+    options.adaptive_objective_long_delay_multiplier = 2;
+    options.adaptive_objective_max_batch_delay_us = 8000;
+    options.adaptive_read_heavy_read_per_1000_ops_threshold = 700;
+    options.adaptive_read_heavy_delay_divisor = 4;
+    options.adaptive_read_heavy_batch_size_divisor = 2;
+    options.adaptive_flush_enabled = true;
+    options.adaptive_flush_queue_depth_threshold = 8;
+    options.adaptive_flush_delay_divisor = 4;
+    options.adaptive_flush_min_batch_delay_us = 100;
+    options.adaptive_latency_target_p95_us = 12000;
+    options.adaptive_fsync_pressure_per_1000_writes_threshold = 350;
+    options.adaptive_fsync_pressure_delay_multiplier = 2;
+    options.adaptive_fsync_pressure_max_batch_delay_us = 8000;
+    options.adaptive_compaction_pressure_obsolete_ratio_percent_threshold = 50;
+    options.adaptive_compaction_pressure_delay_multiplier = 2;
+    options.adaptive_wal_growth_bytes_per_batch_threshold = 200;
+    options.adaptive_wal_growth_delay_multiplier = 2;
+    options.adaptive_wal_growth_max_batch_delay_us = 6000;
+    options.adaptive_batching_enabled = true;
+    options.adaptive_queue_depth_threshold = 8;
+    options.adaptive_batch_size_multiplier = 4;
+    options.adaptive_batch_wal_bytes_multiplier = 4;
+    return options;
+}
+
+BenchmarkResult run_benchmark_capture(const BenchmarkConfig& config) {
+    TestDir dir("bench_" + config.label);
+    const std::string db_path = dir.file("store.dat");
+    const KVStoreOptions options = benchmark_options();
+    KVStore store(db_path, options);
+
+    std::atomic<bool> stop {false};
+    std::atomic<uint64_t> write_ops {0};
+    std::atomic<uint64_t> read_ops {0};
+    std::atomic<uint64_t> write_latency_ns {0};
+
+    std::vector<std::thread> threads;
+    for (int writer_id = 0; writer_id < config.writer_count; ++writer_id) {
+        threads.emplace_back([&store, &stop, &write_ops, &write_latency_ns, &config, writer_id]() {
+            std::mt19937 gen(1337 + writer_id);
+            std::uniform_int_distribution<int> key_dist(writer_id * 100000, writer_id * 100000 + config.key_space - 1);
+            while (!stop.load(std::memory_order_acquire)) {
+                const int key = key_dist(gen);
+                const auto begin = std::chrono::steady_clock::now();
+                store.Put(key, text("payload_" + std::to_string(key)));
+                const auto end = std::chrono::steady_clock::now();
+                write_ops.fetch_add(1, std::memory_order_relaxed);
+                write_latency_ns.fetch_add(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count(),
+                    std::memory_order_relaxed);
+            }
+        });
+    }
+
+    for (int reader_id = 0; reader_id < config.reader_count; ++reader_id) {
+        threads.emplace_back([&store, &stop, &read_ops, &config, reader_id]() {
+            std::mt19937 gen(4242 + reader_id);
+            std::uniform_int_distribution<int> key_dist(0, config.writer_count * 100000 + config.key_space - 1);
+            while (!stop.load(std::memory_order_acquire)) {
+                (void)store.Get(key_dist(gen));
+                read_ops.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    std::this_thread::sleep_for(std::chrono::milliseconds(config.duration_ms));
+    stop.store(true, std::memory_order_release);
+
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    const auto end = std::chrono::steady_clock::now();
+    BenchmarkResult result;
+    result.config = config;
+    result.options = options;
+    result.duration_s = std::chrono::duration<double>(end - start).count();
+    result.writes = write_ops.load(std::memory_order_relaxed);
+    result.reads = read_ops.load(std::memory_order_relaxed);
+    result.write_ops_per_s = result.duration_s == 0.0 ? 0.0 : result.writes / result.duration_s;
+    result.read_ops_per_s = result.duration_s == 0.0 ? 0.0 : result.reads / result.duration_s;
+    result.avg_write_latency_us =
+        result.writes == 0 ? 0.0 : static_cast<double>(write_latency_ns.load(std::memory_order_relaxed)) / result.writes / 1000.0;
+    result.metrics = store.GetMetrics();
+    return result;
+}
+
+std::string BenchmarkResultToJson(const BenchmarkResult& result) {
+    std::ostringstream out;
+    out << "{"
+        << "\"label\":\"" << result.config.label << "\","
+        << "\"workload\":{"
+        << "\"writers\":" << result.config.writer_count << ','
+        << "\"readers\":" << result.config.reader_count << ','
+        << "\"duration_ms\":" << result.config.duration_ms << ','
+        << "\"key_space\":" << result.config.key_space
+        << "},"
+        << "\"summary\":{"
+        << "\"duration_s\":" << result.duration_s << ','
+        << "\"writes\":" << result.writes << ','
+        << "\"reads\":" << result.reads << ','
+        << "\"write_ops_per_s\":" << result.write_ops_per_s << ','
+        << "\"read_ops_per_s\":" << result.read_ops_per_s << ','
+        << "\"avg_write_latency_us\":" << result.avg_write_latency_us
+        << "},"
+        << "\"options\":" << OptionsToJson(result.options) << ','
+        << "\"metrics\":" << MetricsToJson(result.metrics)
+        << "}";
+    return out.str();
+}
+
 std::optional<KVStoreProfile> parse_profile_name(const std::string& name) {
     if (name == "balanced") {
         return KVStoreProfile::kBalanced;
@@ -1059,6 +1225,22 @@ void test_verify_format_rejects_legacy_layout() {
 
 void test_compatibility_matrix_command_succeeds() {
     require(run_compatibility_matrix() == 0, "compatibility matrix command should succeed");
+}
+
+void test_benchmark_result_json_reports_summary_and_metrics() {
+    const BenchmarkResult result = run_benchmark_capture(
+        make_benchmark_config("test-baseline", 2, 1, 50, 128));
+    const std::string json = BenchmarkResultToJson(result);
+    require(json.find("\"label\":\"test-baseline\"") != std::string::npos,
+            "benchmark baseline json should include the benchmark label");
+    require(json.find("\"workload\":{") != std::string::npos,
+            "benchmark baseline json should include workload metadata");
+    require(json.find("\"summary\":{") != std::string::npos,
+            "benchmark baseline json should include summary metrics");
+    require(json.find("\"options\":{") != std::string::npos,
+            "benchmark baseline json should include option metadata");
+    require(json.find("\"metrics\":{") != std::string::npos,
+            "benchmark baseline json should include kv metrics");
 }
 
 void test_ordering_and_updates() {
@@ -1751,7 +1933,15 @@ void test_adaptive_flush_shortens_batch_delay() {
     }
     start_signal.store(true, std::memory_order_release);
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    wait_until(
+        [&store]() {
+            const KVStoreMetrics metrics = store.GetMetrics();
+            return metrics.committed_write_requests >= 2 &&
+                   metrics.committed_write_batches >= 1 &&
+                   metrics.adaptive_flush_batches_completed >= 1;
+        },
+        "adaptive flush should commit the first shortened-delay batch before the delayed write arrives");
+
     std::thread writer3([&store]() {
         store.Put(3, text("flush_3"));
     });
@@ -2219,111 +2409,16 @@ void run_soak_test(int duration_seconds) {
 }
 
 void run_benchmark() {
-    TestDir dir("bench");
-    const std::string db_path = dir.file("store.dat");
-    KVStoreOptions options;
-    options.max_batch_size = 32;
-    options.max_batch_wal_bytes = 1 << 20;
-    options.max_batch_delay_us = 2000;
-    options.adaptive_recent_window_batches = 64;
-    options.adaptive_recent_write_sample_limit = 512;
-    options.adaptive_objective_enabled = true;
-    options.adaptive_objective_queue_weight = 1;
-    options.adaptive_objective_latency_weight = 3;
-    options.adaptive_objective_read_weight = 2;
-    options.adaptive_objective_throughput_weight = 2;
-    options.adaptive_objective_target_batch_size = 16;
-    options.adaptive_objective_fsync_weight = 2;
-    options.adaptive_objective_compaction_weight = 1;
-    options.adaptive_objective_wal_growth_weight = 1;
-    options.adaptive_objective_short_delay_score_threshold = 500;
-    options.adaptive_objective_long_delay_score_threshold = 500;
-    options.adaptive_objective_short_delay_divisor = 2;
-    options.adaptive_objective_long_delay_multiplier = 2;
-    options.adaptive_objective_max_batch_delay_us = 8000;
-    options.adaptive_read_heavy_read_per_1000_ops_threshold = 700;
-    options.adaptive_read_heavy_delay_divisor = 4;
-    options.adaptive_read_heavy_batch_size_divisor = 2;
-    options.adaptive_flush_enabled = true;
-    options.adaptive_flush_queue_depth_threshold = 8;
-    options.adaptive_flush_delay_divisor = 4;
-    options.adaptive_flush_min_batch_delay_us = 100;
-    options.adaptive_latency_target_p95_us = 12000;
-    options.adaptive_fsync_pressure_per_1000_writes_threshold = 350;
-    options.adaptive_fsync_pressure_delay_multiplier = 2;
-    options.adaptive_fsync_pressure_max_batch_delay_us = 8000;
-    options.adaptive_compaction_pressure_obsolete_ratio_percent_threshold = 50;
-    options.adaptive_compaction_pressure_delay_multiplier = 2;
-    options.adaptive_wal_growth_bytes_per_batch_threshold = 200;
-    options.adaptive_wal_growth_delay_multiplier = 2;
-    options.adaptive_wal_growth_max_batch_delay_us = 6000;
-    options.adaptive_batching_enabled = true;
-    options.adaptive_queue_depth_threshold = 8;
-    options.adaptive_batch_size_multiplier = 4;
-    options.adaptive_batch_wal_bytes_multiplier = 4;
-    KVStore store(db_path, options);
+    const BenchmarkResult result = run_benchmark_capture(
+        make_benchmark_config("default", 8, 4, 3000, 50000));
+    const KVStoreMetrics& metrics = result.metrics;
 
-    constexpr int kWriterCount = 8;
-    constexpr int kReaderCount = 4;
-    constexpr int kDurationSeconds = 3;
-    constexpr int kKeySpace = 50000;
-
-    std::atomic<bool> stop {false};
-    std::atomic<uint64_t> write_ops {0};
-    std::atomic<uint64_t> read_ops {0};
-    std::atomic<uint64_t> write_latency_ns {0};
-
-    std::vector<std::thread> threads;
-    for (int writer_id = 0; writer_id < kWriterCount; ++writer_id) {
-        threads.emplace_back([&store, &stop, &write_ops, &write_latency_ns, writer_id]() {
-            std::mt19937 gen(1337 + writer_id);
-            std::uniform_int_distribution<int> key_dist(writer_id * 100000, writer_id * 100000 + kKeySpace - 1);
-            while (!stop.load(std::memory_order_acquire)) {
-                const int key = key_dist(gen);
-                const auto begin = std::chrono::steady_clock::now();
-                store.Put(key, text("payload_" + std::to_string(key)));
-                const auto end = std::chrono::steady_clock::now();
-                write_ops.fetch_add(1, std::memory_order_relaxed);
-                write_latency_ns.fetch_add(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count(),
-                    std::memory_order_relaxed);
-            }
-        });
-    }
-
-    for (int reader_id = 0; reader_id < kReaderCount; ++reader_id) {
-        threads.emplace_back([&store, &stop, &read_ops, reader_id]() {
-            std::mt19937 gen(4242 + reader_id);
-            std::uniform_int_distribution<int> key_dist(0, kWriterCount * 100000 + kKeySpace - 1);
-            while (!stop.load(std::memory_order_acquire)) {
-                (void)store.Get(key_dist(gen));
-                read_ops.fetch_add(1, std::memory_order_relaxed);
-            }
-        });
-    }
-
-    const auto start = std::chrono::steady_clock::now();
-    std::this_thread::sleep_for(std::chrono::seconds(kDurationSeconds));
-    stop.store(true, std::memory_order_release);
-
-    for (auto& thread : threads) {
-        thread.join();
-    }
-
-    const auto end = std::chrono::steady_clock::now();
-    const double seconds = std::chrono::duration<double>(end - start).count();
-    const uint64_t writes = write_ops.load(std::memory_order_relaxed);
-    const uint64_t reads = read_ops.load(std::memory_order_relaxed);
-    const double avg_write_latency_us =
-        writes == 0 ? 0.0 : static_cast<double>(write_latency_ns.load(std::memory_order_relaxed)) / writes / 1000.0;
-    const KVStoreMetrics metrics = store.GetMetrics();
-
-    std::cout << "[BENCH] duration_s=" << seconds
-              << " writes=" << writes
-              << " reads=" << reads
-              << " write_ops_per_s=" << (writes / seconds)
-              << " read_ops_per_s=" << (reads / seconds)
-              << " avg_write_latency_us=" << avg_write_latency_us
+    std::cout << "[BENCH] duration_s=" << result.duration_s
+              << " writes=" << result.writes
+              << " reads=" << result.reads
+              << " write_ops_per_s=" << result.write_ops_per_s
+              << " read_ops_per_s=" << result.read_ops_per_s
+              << " avg_write_latency_us=" << result.avg_write_latency_us
               << " p50_write_latency_us=" << metrics.approx_write_latency_p50_us
               << " p95_write_latency_us=" << metrics.approx_write_latency_p95_us
               << " p99_write_latency_us=" << metrics.approx_write_latency_p99_us
@@ -2397,6 +2492,12 @@ void run_benchmark_json() {
     std::cout << MetricsToJson(store.GetMetrics()) << std::endl;
 }
 
+void run_benchmark_baseline_json() {
+    const BenchmarkResult result = run_benchmark_capture(
+        make_benchmark_config("default-baseline", 8, 4, 3000, 50000));
+    std::cout << BenchmarkResultToJson(result) << std::endl;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -2409,6 +2510,10 @@ int main(int argc, char* argv[]) {
         }
         if (command == "bench-json") {
             run_benchmark_json();
+            return 0;
+        }
+        if (command == "bench-baseline-json") {
+            run_benchmark_baseline_json();
             return 0;
         }
         if (command == "profile-json") {
@@ -2455,7 +2560,7 @@ int main(int argc, char* argv[]) {
             return run_fault_injection_scenario(argv[2], argv[3]);
         }
         std::cerr << "Unknown command: " << command << '\n';
-        std::cerr << "Usage: kv_test [bench|bench-json|profile-json|soak|inspect-format|rewrite-format|verify-format|compat-matrix|fault-inject]" << std::endl;
+        std::cerr << "Usage: kv_test [bench|bench-json|bench-baseline-json|profile-json|soak|inspect-format|rewrite-format|verify-format|compat-matrix|fault-inject]" << std::endl;
         return 1;
     }
 
@@ -2476,6 +2581,7 @@ int main(int argc, char* argv[]) {
         {"verify format accepts current layout", test_verify_format_accepts_current_layout},
         {"verify format rejects legacy layout", test_verify_format_rejects_legacy_layout},
         {"compatibility matrix command succeeds", test_compatibility_matrix_command_succeeds},
+        {"benchmark result json reports summary and metrics", test_benchmark_result_json_reports_summary_and_metrics},
         {"ordering and updates", test_ordering_and_updates},
         {"compaction persists snapshot and resets WAL", test_compaction_persists_snapshot_and_resets_wal},
         {"truncated WAL tail is ignored", test_truncated_wal_tail_is_ignored},

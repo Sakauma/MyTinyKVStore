@@ -4,3 +4,4 @@ build/
 build-*/
 *.dat
 *.dat.wal
+benchmarks/baselines/*.json
