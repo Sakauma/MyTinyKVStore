@@ -13,6 +13,7 @@ cmake -S "$repo_root" -B "$repo_root/build"
 cmake --build "$repo_root/build"
 
 "$repo_root/build/target/bin/kv_test" microbench-json > "$output_dir/microbench.json"
+"$repo_root/build/target/bin/kv_test" trend-microbench-json "$baseline_dir" "$recent_window" > "$output_dir/microbench-trend-summary.json"
 "$repo_root/build/target/bin/kv_test" bench-baseline-json > "$output_dir/stressbench-baseline.json"
 "$repo_root/build/target/bin/kv_test" trend-baselines-json "$baseline_dir" "$recent_window" > "$output_dir/trend-summary.json"
 "$repo_root/build/target/bin/kv_test" compat-matrix > "$output_dir/compatibility-matrix.txt"

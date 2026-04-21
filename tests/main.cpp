@@ -280,6 +280,20 @@ struct MicrobenchComparisonResult {
 
 std::vector<MicrobenchCaseResult> parse_microbench_results_json(const std::string& json);
 
+struct MicrobenchTrendCaseSummary {
+    std::string name;
+    double avg_ops_per_s = 0.0;
+    double min_ops_per_s = 0.0;
+    double max_ops_per_s = 0.0;
+    double recent_avg_ops_per_s = 0.0;
+    double latest_vs_oldest_ratio_pct = 0.0;
+    double latest_vs_recent_avg_ratio_pct = 0.0;
+    std::string trend;
+    std::string recent_trend;
+};
+
+std::string MicrobenchTrendSummaryToJson(const std::vector<MicrobenchTrendCaseSummary>& summaries);
+
 struct BaselineSummary {
     std::string file_name;
     double write_ops_per_s = 0.0;
@@ -1138,6 +1152,9 @@ TrendSummary collect_benchmark_trend_summary(const std::string& directory_path, 
         if (entry.path().extension() != ".json") {
             continue;
         }
+        if (entry.path().filename().string().rfind("microbench-", 0) == 0) {
+            continue;
+        }
         files.push_back(entry.path());
     }
 
@@ -1278,6 +1295,100 @@ int run_benchmark_trend(const std::string& directory_path, size_t recent_window)
 
 int run_benchmark_trend_json(const std::string& directory_path, size_t recent_window) {
     std::cout << TrendSummaryToJson(collect_benchmark_trend_summary(directory_path, recent_window)) << std::endl;
+    return 0;
+}
+
+std::vector<MicrobenchTrendCaseSummary> collect_microbench_trend_summary(
+    const std::string& directory_path,
+    size_t recent_window) {
+    std::vector<std::filesystem::path> files;
+    for (const auto& entry : std::filesystem::directory_iterator(directory_path)) {
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        if (entry.path().extension() != ".json") {
+            continue;
+        }
+        if (entry.path().filename().string().rfind("microbench-", 0) != 0) {
+            continue;
+        }
+        files.push_back(entry.path());
+    }
+
+    std::sort(files.begin(), files.end());
+    require(!files.empty(), "microbench trend requires at least one microbench json file");
+    require(recent_window > 0, "microbench trend recent window must be positive");
+
+    std::map<std::string, std::vector<double>> history_by_case;
+    for (const auto& path : files) {
+        for (const auto& result : parse_microbench_results_json(read_text_file(path.string()))) {
+            history_by_case[result.name].push_back(result.ops_per_s);
+        }
+    }
+
+    std::vector<MicrobenchTrendCaseSummary> summaries;
+    for (const auto& [name, history] : history_by_case) {
+        require(!history.empty(), "microbench trend history must not be empty");
+        const size_t recent_count = std::min(recent_window, history.size());
+        double min_ops_per_s = history.front();
+        double max_ops_per_s = history.front();
+        double sum_ops_per_s = 0.0;
+        for (double value : history) {
+            min_ops_per_s = std::min(min_ops_per_s, value);
+            max_ops_per_s = std::max(max_ops_per_s, value);
+            sum_ops_per_s += value;
+        }
+        double recent_avg_ops_per_s = 0.0;
+        for (size_t i = history.size() - recent_count; i < history.size(); ++i) {
+            recent_avg_ops_per_s += history[i];
+        }
+        recent_avg_ops_per_s /= recent_count;
+
+        const double avg_ops_per_s = sum_ops_per_s / history.size();
+        const double latest_vs_oldest_ratio_pct =
+            history.front() == 0.0 ? 0.0 : (history.back() / history.front()) * 100.0;
+        const double latest_vs_recent_avg_ratio_pct =
+            recent_avg_ops_per_s == 0.0 ? 0.0 : (history.back() / recent_avg_ops_per_s) * 100.0;
+
+        summaries.push_back({
+            name,
+            avg_ops_per_s,
+            min_ops_per_s,
+            max_ops_per_s,
+            recent_avg_ops_per_s,
+            latest_vs_oldest_ratio_pct,
+            latest_vs_recent_avg_ratio_pct,
+            classify_throughput_trend(latest_vs_oldest_ratio_pct),
+            classify_throughput_trend(latest_vs_recent_avg_ratio_pct),
+        });
+    }
+
+    std::sort(summaries.begin(), summaries.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.name < rhs.name;
+    });
+    return summaries;
+}
+
+int run_microbench_trend(const std::string& directory_path, size_t recent_window) {
+    const auto summaries = collect_microbench_trend_summary(directory_path, recent_window);
+    for (const auto& summary : summaries) {
+        std::cout << "name=" << summary.name
+                  << " avg_ops_per_s=" << summary.avg_ops_per_s
+                  << " min_ops_per_s=" << summary.min_ops_per_s
+                  << " max_ops_per_s=" << summary.max_ops_per_s
+                  << " recent_avg_ops_per_s=" << summary.recent_avg_ops_per_s
+                  << " latest_vs_oldest_ratio_pct=" << summary.latest_vs_oldest_ratio_pct
+                  << " latest_vs_recent_avg_ratio_pct=" << summary.latest_vs_recent_avg_ratio_pct
+                  << " trend=" << summary.trend
+                  << " recent_trend=" << summary.recent_trend
+                  << std::endl;
+    }
+    return 0;
+}
+
+int run_microbench_trend_json(const std::string& directory_path, size_t recent_window) {
+    std::cout << MicrobenchTrendSummaryToJson(collect_microbench_trend_summary(directory_path, recent_window))
+              << std::endl;
     return 0;
 }
 
@@ -1512,6 +1623,29 @@ std::string StressSummaryToJson(const StressSummary& summary) {
         << ",\"observed_fsync_pressure_per_1000_writes\":" << summary.observed_fsync_pressure_per_1000_writes
         << ",\"last_effective_batch_delay_us\":" << summary.last_effective_batch_delay_us
         << '}';
+    return out.str();
+}
+
+std::string MicrobenchTrendSummaryToJson(const std::vector<MicrobenchTrendCaseSummary>& summaries) {
+    std::ostringstream out;
+    out << "{\"cases\":[";
+    for (size_t i = 0; i < summaries.size(); ++i) {
+        if (i != 0) {
+            out << ',';
+        }
+        out << '{'
+            << "\"name\":\"" << summaries[i].name << "\""
+            << ",\"avg_ops_per_s\":" << summaries[i].avg_ops_per_s
+            << ",\"min_ops_per_s\":" << summaries[i].min_ops_per_s
+            << ",\"max_ops_per_s\":" << summaries[i].max_ops_per_s
+            << ",\"recent_avg_ops_per_s\":" << summaries[i].recent_avg_ops_per_s
+            << ",\"latest_vs_oldest_ratio_pct\":" << summaries[i].latest_vs_oldest_ratio_pct
+            << ",\"latest_vs_recent_avg_ratio_pct\":" << summaries[i].latest_vs_recent_avg_ratio_pct
+            << ",\"trend\":\"" << summaries[i].trend << "\""
+            << ",\"recent_trend\":\"" << summaries[i].recent_trend << "\""
+            << '}';
+    }
+    out << "]}";
     return out.str();
 }
 
@@ -2412,6 +2546,45 @@ void test_benchmark_trend_summarizes_history() {
             "benchmark trend should classify lower latency as improving");
     require(values.at("recent_latency_trend") == "improving",
             "benchmark trend should classify lower recent latency as improving");
+}
+
+void test_microbench_trend_summarizes_history() {
+    TestDir dir("microbench_trend");
+    const std::string baseline_dir = dir.file("baselines");
+    std::filesystem::create_directories(baseline_dir);
+
+    write_text_file(
+        (std::filesystem::path(baseline_dir) / "microbench-20260101T000000.json").string(),
+        MicrobenchResultsToJson({
+            {"wal_append", 1.0, 100.0, 500, 1},
+            {"compaction", 1.0, 20.0, 5, 1},
+        }));
+    write_text_file(
+        (std::filesystem::path(baseline_dir) / "microbench-20260102T000000.json").string(),
+        MicrobenchResultsToJson({
+            {"wal_append", 1.0, 110.0, 500, 1},
+            {"compaction", 1.0, 18.0, 5, 1},
+        }));
+    write_text_file(
+        (std::filesystem::path(baseline_dir) / "microbench-20260103T000000.json").string(),
+        MicrobenchResultsToJson({
+            {"wal_append", 1.0, 120.0, 500, 1},
+            {"compaction", 1.0, 25.0, 5, 1},
+        }));
+
+    std::ostringstream out;
+    auto* original = std::cout.rdbuf(out.rdbuf());
+    const int status = run_microbench_trend_json(baseline_dir, 2);
+    std::cout.rdbuf(original);
+
+    require(status == 0, "microbench trend json should succeed for non-empty directories");
+    const std::string json = out.str();
+    require(json.find("\"name\":\"wal_append\"") != std::string::npos,
+            "microbench trend json should include the wal_append case");
+    require(json.find("\"name\":\"compaction\"") != std::string::npos,
+            "microbench trend json should include the compaction case");
+    require(json.find("\"trend\":\"improving\"") != std::string::npos,
+            "microbench trend json should classify improving throughput");
 }
 
 void test_internal_format_helpers_round_trip_keys() {
@@ -4190,6 +4363,22 @@ int main(int argc, char* argv[]) {
             const size_t recent_window = argc == 4 ? static_cast<size_t>(std::stoul(argv[3])) : 5;
             return run_benchmark_trend_json(argv[2], recent_window);
         }
+        if (command == "trend-microbench") {
+            if (argc != 3 && argc != 4) {
+                std::cerr << "Usage: kv_test trend-microbench <baseline_dir> [recent_window_count]" << std::endl;
+                return 1;
+            }
+            const size_t recent_window = argc == 4 ? static_cast<size_t>(std::stoul(argv[3])) : 5;
+            return run_microbench_trend(argv[2], recent_window);
+        }
+        if (command == "trend-microbench-json") {
+            if (argc != 3 && argc != 4) {
+                std::cerr << "Usage: kv_test trend-microbench-json <baseline_dir> [recent_window_count]" << std::endl;
+                return 1;
+            }
+            const size_t recent_window = argc == 4 ? static_cast<size_t>(std::stoul(argv[3])) : 5;
+            return run_microbench_trend_json(argv[2], recent_window);
+        }
         if (command == "profile-json") {
             if (argc != 3) {
                 std::cerr << "Usage: kv_test profile-json <balanced|write-heavy|read-heavy|low-latency>" << std::endl;
@@ -4262,7 +4451,7 @@ int main(int argc, char* argv[]) {
             return run_fault_injection_scenario(argv[2], argv[3]);
         }
         std::cerr << "Unknown command: " << command << '\n';
-        std::cerr << "Usage: kv_test [bench|microbench|microbench-json|bench-json|bench-baseline-json|compare-microbench|compare-baseline|trend-baselines|trend-baselines-json|profile-json|soak|concurrency-stress|concurrency-stress-json|inspect-format|rewrite-format|verify-format|compat-matrix|fault-inject]" << std::endl;
+        std::cerr << "Usage: kv_test [bench|microbench|microbench-json|bench-json|bench-baseline-json|compare-microbench|compare-baseline|trend-baselines|trend-baselines-json|trend-microbench|trend-microbench-json|profile-json|soak|concurrency-stress|concurrency-stress-json|inspect-format|rewrite-format|verify-format|compat-matrix|fault-inject]" << std::endl;
         return 1;
     }
 
@@ -4294,6 +4483,7 @@ int main(int argc, char* argv[]) {
         {"compare benchmark baseline passes within thresholds", test_compare_benchmark_baseline_passes_within_thresholds},
         {"compare benchmark baseline rejects regression", test_compare_benchmark_baseline_rejects_regression},
         {"benchmark trend summarizes history", test_benchmark_trend_summarizes_history},
+        {"microbench trend summarizes history", test_microbench_trend_summarizes_history},
         {"internal format helpers round trip keys", test_internal_format_helpers_round_trip_keys},
         {"internal format helpers checksum distinguishes payloads", test_internal_format_helpers_checksum_distinguishes_payloads},
         {"internal metrics helpers compute percentiles and ratios", test_internal_metrics_helpers_compute_percentiles_and_ratios},

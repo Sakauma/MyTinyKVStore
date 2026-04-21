@@ -19,14 +19,18 @@
 - `bash scripts/bench-baseline.sh`：运行 baseline benchmark，并把 JSON 落到 `benchmarks/baselines/<timestamp>.json`。
 - `./build/target/bin/kv_test compare-baseline <baseline_json> <candidate_json> [min_write_ratio_pct min_read_ratio_pct max_latency_ratio_pct]`：比较两份 baseline。
 - `./build/target/bin/kv_test compare-microbench <baseline_json> <candidate_json> [min_ops_ratio_pct min_compaction_ratio_pct min_rewrite_ratio_pct min_recovery_ratio_pct]`：比较两份 microbench JSON。
+- `./build/target/bin/kv_test trend-microbench <baseline_dir> [recent_window]`：汇总一组 microbench baseline 的长期趋势。
+- `./build/target/bin/kv_test trend-microbench-json <baseline_dir> [recent_window]`：输出结构化 microbench 趋势 JSON。
 - `./build/target/bin/kv_test trend-baselines <baseline_dir> [recent_window]`：汇总一组 baseline 的长期趋势，并额外计算最近 N 次均值。
 - `./build/target/bin/kv_test trend-baselines-json <baseline_dir> [recent_window]`：输出结构化趋势 JSON。
 - `bash scripts/bench-regression-check.sh <baseline_json>`：生成 candidate baseline，并按默认阈值执行回归检查。
 - `bash scripts/ci-bench-regression.sh`：使用仓库提交的 `benchmarks/reference/ci-floor.json` 作为 CI floor。
 - `bash scripts/microbench-regression-check.sh <baseline_json>`：生成 candidate microbench，并按默认阈值执行单项能力回归检查。
 - `bash scripts/ci-microbench-regression.sh`：使用仓库提交的 `benchmarks/reference/microbench-floor.json` 作为 microbench floor。
+- `bash scripts/microbench-trend.sh [baseline_dir] [recent_window]`：对一组历史 microbench baseline 输出趋势摘要。
 - `bash scripts/bench-trend.sh [baseline_dir] [recent_window]`：对一组历史 baseline 输出趋势摘要。
 - `bash scripts/collect-artifacts.sh [output_dir] [baseline_dir] [recent_window]`：把 `microbench`、`stressbench baseline`、趋势摘要、兼容矩阵和多 profile stress 摘要统一落成 artifact 文件。
+- `bash scripts/collect-artifacts.sh [output_dir] [baseline_dir] [recent_window]`：同时还会落一份 `microbench-trend-summary.json`，便于跟踪单项能力的长期变化。
 
 ## JSON Shape
 
