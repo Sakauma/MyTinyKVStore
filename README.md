@@ -171,6 +171,7 @@ cd build && ctest --output-on-failure
 当前测试程序还内置了故障注入入口 `kv_test fault-inject <scenario> <db_path>`，用于在 WAL `fsync` 之后、快照 rename 前后、WAL 轮转后等关键持久化点模拟进程崩溃。常规测试会自动通过子进程调用这些场景来验证重启恢复。
 若需要结构化指标，可调用 `kv_test bench-json` 或直接使用库函数 `MetricsToJson(store.GetMetrics())`。
 若需要按单项能力拆开的 benchmark，可调用 `kv_test microbench` 或 `kv_test microbench-json`。
+当前 `microbench` 已覆盖 `wal_append`、`scan`、`recovery`、`compaction`、`rewrite` 五类单项能力。
 若需要可归档的 benchmark 基线，可调用 `kv_test bench-baseline-json` 或 `bash scripts/bench-baseline.sh`。
 若需要自动判断是否出现明显退化，可调用 `kv_test compare-baseline ...` 或 `bash scripts/bench-regression-check.sh ...`。
 若需要查看一段时间内的趋势，可调用 `kv_test trend-baselines <dir> [recent_window]` 或 `bash scripts/bench-trend.sh ...`。

@@ -2060,6 +2060,8 @@ void test_microbench_json_reports_cases() {
     std::vector<MicrobenchCaseResult> results;
     results.push_back({"wal_append", 0.1, 1000.0, 100, 4096});
     results.push_back({"scan", 0.2, 500.0, 100, 0});
+    results.push_back({"compaction", 0.3, 10.0, 3, 8192});
+    results.push_back({"rewrite", 0.4, 5.0, 2, 4096});
 
     const std::string json = MicrobenchResultsToJson(results);
     require(json.find("\"cases\":[") != std::string::npos,
@@ -2068,6 +2070,10 @@ void test_microbench_json_reports_cases() {
             "microbench json should include the wal_append case");
     require(json.find("\"name\":\"scan\"") != std::string::npos,
             "microbench json should include the scan case");
+    require(json.find("\"name\":\"compaction\"") != std::string::npos,
+            "microbench json should include the compaction case");
+    require(json.find("\"name\":\"rewrite\"") != std::string::npos,
+            "microbench json should include the rewrite case");
 }
 
 void test_benchmark_trend_json_reports_recent_window() {
@@ -3875,6 +3881,67 @@ std::vector<MicrobenchCaseResult> run_microbench_capture() {
             duration_s > 0.0 ? static_cast<double>(kReopens) / duration_s : 0.0,
             kReopens,
             0,
+        });
+    }
+
+    {
+        TestDir dir("microbench_compaction");
+        const std::string db_path = dir.file("store.dat");
+        KVStore store(db_path);
+        constexpr int kKeys = 1500;
+        for (int i = 0; i < kKeys; ++i) {
+            store.Put(i, text("compact_" + std::to_string(i)));
+        }
+        for (int i = 0; i < kKeys / 3; ++i) {
+            store.Delete(i);
+        }
+
+        constexpr int kOperations = 5;
+        const auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < kOperations; ++i) {
+            store.Compact();
+            store.Put(5000 + i, text("compact_probe_" + std::to_string(i)));
+        }
+        const auto end = std::chrono::steady_clock::now();
+        const double duration_s = std::chrono::duration<double>(end - start).count();
+        results.push_back({
+            "compaction",
+            duration_s,
+            duration_s > 0.0 ? static_cast<double>(kOperations) / duration_s : 0.0,
+            kOperations,
+            store.GetMetrics().total_snapshot_bytes_written,
+        });
+    }
+
+    {
+        TestDir dir("microbench_rewrite");
+        const std::string db_path = dir.file("store.dat");
+        {
+            KVStore store(db_path);
+            constexpr int kKeys = 1200;
+            for (int i = 0; i < kKeys; ++i) {
+                store.Put(i, text("rewrite_" + std::to_string(i)));
+            }
+        }
+
+        constexpr int kOperations = 5;
+        const auto start = std::chrono::steady_clock::now();
+        uint64_t rewritten_bytes = 0;
+        for (int i = 0; i < kOperations; ++i) {
+            require(run_rewrite_format(db_path) == 0, "microbench rewrite should succeed");
+            KVStore reopened(db_path);
+            const auto sample = reopened.Get(42);
+            require(sample.has_value(), "microbench rewrite should preserve valid data");
+            rewritten_bytes = reopened.GetMetrics().total_snapshot_bytes_written;
+        }
+        const auto end = std::chrono::steady_clock::now();
+        const double duration_s = std::chrono::duration<double>(end - start).count();
+        results.push_back({
+            "rewrite",
+            duration_s,
+            duration_s > 0.0 ? static_cast<double>(kOperations) / duration_s : 0.0,
+            kOperations,
+            rewritten_bytes,
         });
     }
 

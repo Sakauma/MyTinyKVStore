@@ -30,6 +30,7 @@
 `microbench-json` 会返回：
 
 - `cases`：单项 case 列表；当前包含 `wal_append`、`scan`、`recovery`
+- `cases`：单项 case 列表；当前包含 `wal_append`、`scan`、`recovery`、`compaction`、`rewrite`
 - 每个 case 含 `name`、`duration_s`、`ops_per_s`、`operations`、`bytes`
 
 `bench-baseline-json` 则包含四部分：
