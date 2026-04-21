@@ -13,7 +13,7 @@
 
 ### 2. File Format and Compatibility
 
-- 已有磁盘格式规范、版本检查、迁移工具、richer `inspect-format` 输出和 `verify-format` 自动校验入口。
+- 已有磁盘格式规范、版本检查、迁移工具、richer `inspect-format` 输出、`verify-format` 自动校验入口和可执行兼容矩阵。
 - 还缺少更完整的跨版本兼容策略和迁移矩阵。
 
 ### 3. Reliability Validation

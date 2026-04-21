@@ -626,6 +626,75 @@ int run_verify_format(const std::string& db_path) {
     return 0;
 }
 
+int run_compatibility_matrix() {
+    TestDir dir("compatibility_matrix");
+    const auto value_or = [](const std::map<std::string, std::string>& values,
+                             const std::string& key,
+                             std::string fallback) {
+        const auto it = values.find(key);
+        return it == values.end() ? fallback : it->second;
+    };
+
+    const std::string current_db_path = dir.file("current_v2.dat");
+    {
+        KVStore store(current_db_path);
+        store.Put(1, text("one"));
+        store.Put(std::string("alpha"), text("two"));
+        store.Put(std::vector<uint8_t> {0x01, 0x02}, text("three"));
+        store.Compact();
+    }
+
+    const auto current_inspect = capture_inspect_format(current_db_path);
+    const auto [current_verify_status, current_verify_output] = capture_verify_format(current_db_path);
+    require(current_verify_status == 0, "current compatibility matrix case should verify cleanly");
+    require(current_inspect.at("snapshot_version") == "2", "current case should report snapshot v2");
+    require(current_inspect.at("rewrite_recommended") == "0", "current case should not recommend rewrite");
+
+    const std::string legacy_db_path = dir.file("legacy_v1.dat");
+    const std::string legacy_wal_path = legacy_db_path + ".wal";
+    write_legacy_snapshot_v1(legacy_db_path, {
+        {7, text("seven")},
+        {8, text("eight")},
+    });
+    append_legacy_wal_record_v1(legacy_wal_path, 1, 9, text("nine"));
+
+    const auto legacy_inspect = capture_inspect_format(legacy_db_path);
+    const auto [legacy_verify_status, legacy_verify_output] = capture_verify_format(legacy_db_path);
+    require(legacy_verify_status == 2, "legacy compatibility matrix case should require rewrite");
+    require(legacy_inspect.at("snapshot_version") == "1", "legacy case should report snapshot v1");
+    require(legacy_inspect.at("rewrite_recommended") == "1", "legacy case should recommend rewrite");
+
+    require(run_rewrite_format(legacy_db_path) == 0, "legacy compatibility matrix case should rewrite successfully");
+    const auto rewritten_inspect = capture_inspect_format(legacy_db_path);
+    const auto [rewritten_verify_status, rewritten_verify_output] = capture_verify_format(legacy_db_path);
+    require(rewritten_verify_status == 0, "rewritten legacy case should verify cleanly");
+    require(rewritten_inspect.at("snapshot_version") == "2", "rewritten legacy case should upgrade to snapshot v2");
+    require(rewritten_inspect.at("rewrite_recommended") == "0", "rewritten legacy case should stop recommending rewrite");
+
+    std::cout << "case=current_v2"
+              << " snapshot_version=" << current_inspect.at("snapshot_version")
+              << " wal_version=" << value_or(current_inspect, "wal_version", "empty")
+              << " verify_status=" << current_verify_status
+              << " rewrite_recommended=" << current_inspect.at("rewrite_recommended")
+              << " current_verify_output_bytes=" << current_verify_output.size()
+              << '\n';
+    std::cout << "case=legacy_v1"
+              << " snapshot_version=" << legacy_inspect.at("snapshot_version")
+              << " wal_version=" << value_or(legacy_inspect, "wal_version", "missing")
+              << " verify_status=" << legacy_verify_status
+              << " rewrite_recommended=" << legacy_inspect.at("rewrite_recommended")
+              << " legacy_verify_output_bytes=" << legacy_verify_output.size()
+              << '\n';
+    std::cout << "case=legacy_v1_after_rewrite"
+              << " snapshot_version=" << rewritten_inspect.at("snapshot_version")
+              << " wal_exists=" << rewritten_inspect.at("wal_exists")
+              << " verify_status=" << rewritten_verify_status
+              << " rewrite_recommended=" << rewritten_inspect.at("rewrite_recommended")
+              << " rewritten_verify_output_bytes=" << rewritten_verify_output.size()
+              << '\n';
+    return 0;
+}
+
 std::optional<KVStoreProfile> parse_profile_name(const std::string& name) {
     if (name == "balanced") {
         return KVStoreProfile::kBalanced;
@@ -986,6 +1055,10 @@ void test_verify_format_rejects_legacy_layout() {
     require(status == 2, "verify-format should reject legacy layout and request rewrite");
     require(output.find("rewrite_recommended=1") != std::string::npos,
             "verify-format should expose the rewrite recommendation");
+}
+
+void test_compatibility_matrix_command_succeeds() {
+    require(run_compatibility_matrix() == 0, "compatibility matrix command should succeed");
 }
 
 void test_ordering_and_updates() {
@@ -2371,6 +2444,9 @@ int main(int argc, char* argv[]) {
             }
             return run_verify_format(argv[2]);
         }
+        if (command == "compat-matrix") {
+            return run_compatibility_matrix();
+        }
         if (command == "fault-inject") {
             if (argc != 4) {
                 std::cerr << "Usage: kv_test fault-inject <scenario> <db_path>" << std::endl;
@@ -2379,7 +2455,7 @@ int main(int argc, char* argv[]) {
             return run_fault_injection_scenario(argv[2], argv[3]);
         }
         std::cerr << "Unknown command: " << command << '\n';
-        std::cerr << "Usage: kv_test [bench|bench-json|profile-json|soak|inspect-format|rewrite-format|verify-format|fault-inject]" << std::endl;
+        std::cerr << "Usage: kv_test [bench|bench-json|profile-json|soak|inspect-format|rewrite-format|verify-format|compat-matrix|fault-inject]" << std::endl;
         return 1;
     }
 
@@ -2399,6 +2475,7 @@ int main(int argc, char* argv[]) {
         {"inspect format recommends rewrite for legacy v1", test_inspect_format_recommends_rewrite_for_legacy_v1},
         {"verify format accepts current layout", test_verify_format_accepts_current_layout},
         {"verify format rejects legacy layout", test_verify_format_rejects_legacy_layout},
+        {"compatibility matrix command succeeds", test_compatibility_matrix_command_succeeds},
         {"ordering and updates", test_ordering_and_updates},
         {"compaction persists snapshot and resets WAL", test_compaction_persists_snapshot_and_resets_wal},
         {"truncated WAL tail is ignored", test_truncated_wal_tail_is_ignored},
