@@ -52,6 +52,7 @@ add_library(kvstore SHARED
     src/internal/metrics_snapshot.cpp
     src/internal/observability.cpp
     src/internal/recovery.cpp
+    src/internal/wal_accounting.cpp
     src/internal/writer_policy.cpp
 )
 target_include_directories(kvstore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

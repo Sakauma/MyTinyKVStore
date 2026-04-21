@@ -6,6 +6,7 @@
 #include "internal/metrics_snapshot.h"
 #include "internal/observability.h"
 #include "internal/recovery.h"
+#include "internal/wal_accounting.h"
 #include "internal/writer_policy.h"
 
 #include <algorithm>
@@ -726,12 +727,8 @@ private:
 
     uint64_t current_obsolete_wal_ratio_percent() const {
         const uint64_t total_wal_bytes = wal_bytes_since_compaction_.load(std::memory_order_relaxed);
-        if (total_wal_bytes == 0) {
-            return 0;
-        }
         const uint64_t live_wal_bytes = live_wal_bytes_since_compaction_.load(std::memory_order_relaxed);
-        const uint64_t obsolete_wal_bytes = total_wal_bytes >= live_wal_bytes ? total_wal_bytes - live_wal_bytes : 0;
-        return (obsolete_wal_bytes * 100) / total_wal_bytes;
+        return obsolete_wal_ratio_percent(total_wal_bytes, live_wal_bytes);
     }
 
     void process_compaction_request(const std::shared_ptr<Request>& request, bool is_auto_compaction) {
@@ -827,32 +824,17 @@ private:
     }
 
     void note_latest_wal_record(const std::string& key, uint64_t record_size) {
-        const auto it = latest_wal_record_bytes_.find(key);
-        if (it != latest_wal_record_bytes_.end()) {
-            live_wal_bytes_since_compaction_.fetch_sub(it->second, std::memory_order_relaxed);
-            it->second = record_size;
-        } else {
-            latest_wal_record_bytes_[key] = record_size;
-        }
-        live_wal_bytes_since_compaction_.fetch_add(record_size, std::memory_order_relaxed);
+        track_latest_wal_record(
+            latest_wal_record_bytes_,
+            live_wal_bytes_since_compaction_,
+            key,
+            record_size);
     }
 
     bool should_auto_compact() const {
         const uint64_t total_wal_bytes = wal_bytes_since_compaction_.load(std::memory_order_relaxed);
         const uint64_t live_wal_bytes = live_wal_bytes_since_compaction_.load(std::memory_order_relaxed);
-        const uint64_t obsolete_wal_bytes = total_wal_bytes >= live_wal_bytes ? total_wal_bytes - live_wal_bytes : 0;
-
-        if (options_.auto_compact_wal_bytes_threshold > 0 &&
-            total_wal_bytes >= options_.auto_compact_wal_bytes_threshold) {
-            return true;
-        }
-
-        if (options_.auto_compact_invalid_wal_ratio_percent == 0 || total_wal_bytes == 0) {
-            return false;
-        }
-
-        return obsolete_wal_bytes * 100 >=
-               static_cast<uint64_t>(options_.auto_compact_invalid_wal_ratio_percent) * total_wal_bytes;
+        return kvstore::internal::should_auto_compact(options_, total_wal_bytes, live_wal_bytes);
     }
 
     uint64_t wal_record_size_for_request(const Request& request) const {

@@ -40,6 +40,7 @@ Current status:
 - 已将 compaction 的快照重写与 WAL 轮转步骤提炼到内部 compaction 模块，主文件中对应流程继续收敛为编排逻辑。
 - 已将 writer policy 的批处理/延迟决策提炼到内部 writer-policy 模块，`current_batch_policy_locked()` 现只负责采样信号并调用统一计算逻辑。
 - 已将 metrics 聚合提炼到内部 metrics-snapshot 模块，`GetMetrics()` 现只保留即时队列深度和 obsolete ratio 的采样职责。
+- 已将 WAL live/obsolete 字节计算与 auto-compaction 判定提炼到内部 wal-accounting 模块，主文件中的相关逻辑进一步收缩为状态读取。
 
 ## Phase 2: Refactor-Safe Test Harness
 
