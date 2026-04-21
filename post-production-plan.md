@@ -74,6 +74,7 @@ Current status:
 - 已将 inspect/verify/rewrite/compatibility 相关 CLI 实现提炼到 `tests/common/format_cli.cpp`，`tests/main.cpp` 不再直接持有磁盘格式探测与兼容矩阵实现。
 - 已将 baseline compare、trend 汇总与 microbench trend 相关 CLI 逻辑提炼到 `tests/common/benchmark_cli.cpp`，`tests/main.cpp` 继续收缩为 benchmark 执行与运行时命令编排。
 - 已将 `bench` / `microbench` 执行路径与 benchmark JSON fixture 提炼到 `tests/common/benchmark_runtime.cpp`，`tests/main.cpp` 现主要保留 runtime profile、stress/soak 和命令分发。
+- 已将 runtime profile、stress/soak、failpoint child 与相关 JSON/summary entrypoint 提炼到 `tests/common/runtime_cli.cpp`，`tests/main.cpp` 进一步收缩为纯 CLI 分发与 integration registry。
 
 ## Phase 3: Continuous Performance Governance
 
