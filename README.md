@@ -31,7 +31,7 @@
 2. 公共写接口只负责入队和等待确认；后台 writer 线程串行消费请求，保证全局提交顺序。
 3. writer 会尽量收集当前队列中的写请求，顺序写入 WAL，并对整个批次执行一次 `fsync`。
 4. 当前批次会同时受“最大请求数”“最大 WAL 字节数”“最大等待时间”三种条件约束。
-5. WAL 持久化完成后，writer 再把该批次更新应用到内存中的有序 `std::map<int, Value>`。
+5. WAL 持久化完成后，writer 再把该批次更新应用到内存中的有序 `std::map<std::string, Value>`。
 6. 每个写请求完成时都会更新延迟直方图，用于观测批量策略对尾延迟的影响。
 7. `Get` 使用读写锁直接读取内存态，多个读线程可以并发执行。
 8. writer 会跟踪“当前 WAL 中仍代表最新状态的记录字节数”，从而估算自上次 compaction 以来的无效 WAL 字节。
@@ -45,9 +45,17 @@ KVStore store("data.db");
 KVStore tuned_store("data.db", KVStoreOptions{});
 
 store.Put(42, Value(std::vector<uint8_t>{'o', 'k'}));
+store.Put(std::string("user:42"), Value(std::vector<uint8_t>{'a', 'b'}));
 auto value = store.Get(42);
+auto string_value = store.Get(std::string("user:42"));
+auto range = store.Scan("user:00", "user:99");
 KVStoreMetrics metrics = store.GetMetrics();
 ```
+
+当前公开 API 同时支持：
+
+- `int` 键：保留兼容旧接口
+- `std::string` 键：用于新的持久化格式与范围扫描
 
 可调参数：
 
@@ -148,7 +156,7 @@ cd build && ctest --output-on-failure
 
 当前测试程序还内置了故障注入入口 `kv_test fault-inject <scenario> <db_path>`，用于在 WAL `fsync` 之后、快照 rename 前后、WAL 轮转后等关键持久化点模拟进程崩溃。常规测试会自动通过子进程调用这些场景来验证重启恢复。
 
-磁盘格式说明见 [docs/file-format.md](/home/sakauma/code/lpue/docs/file-format.md)。
+磁盘格式说明见 [docs/file-format.md](/home/sakauma/code/lpue/docs/file-format.md)。当前程序会写入版本 `2` 的 snapshot / WAL，同时保留对版本 `1` 整型键格式的读取兼容。
 
 ### 可选 Sanitizer
 

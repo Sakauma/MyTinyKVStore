@@ -27,10 +27,12 @@
 namespace {
 
 constexpr uint32_t kWalMagic = 0x4B565741;
-constexpr uint16_t kWalVersion = 1;
+constexpr uint16_t kWalVersion = 2;
 constexpr uint32_t kSnapshotEntryMagic = 0x4B565345;
-constexpr uint32_t kSnapshotVersion = 1;
+constexpr uint32_t kSnapshotVersion = 2;
 constexpr char kSnapshotMagic[8] = {'K', 'V', 'S', 'N', 'A', 'P', '0', '1'};
+constexpr char kIntKeyTag = '\x01';
+constexpr char kStringKeyTag = '\x02';
 constexpr std::array<uint64_t, kWriteLatencyBucketCount - 1> kWriteLatencyBucketUpperBoundsUs = {
     50,
     100,
@@ -56,6 +58,16 @@ struct WalRecordHeader {
     uint16_t version;
     uint8_t type;
     uint8_t reserved;
+    uint32_t key_size;
+    uint32_t value_size;
+    uint32_t checksum;
+};
+
+struct WalRecordHeaderV1 {
+    uint32_t magic;
+    uint16_t version;
+    uint8_t type;
+    uint8_t reserved;
     int32_t key;
     uint32_t value_size;
     uint32_t checksum;
@@ -69,14 +81,22 @@ struct SnapshotHeader {
 
 struct SnapshotEntryHeader {
     uint32_t magic;
+    uint32_t key_size;
+    uint32_t value_size;
+};
+
+struct SnapshotEntryHeaderV1 {
+    uint32_t magic;
     int32_t key;
     uint32_t value_size;
 };
 #pragma pack(pop)
 
 static_assert(sizeof(WalRecordHeader) == 20, "Unexpected WAL header size");
+static_assert(sizeof(WalRecordHeaderV1) == 20, "Unexpected WAL v1 header size");
 static_assert(sizeof(SnapshotHeader) == 16, "Unexpected snapshot header size");
 static_assert(sizeof(SnapshotEntryHeader) == 12, "Unexpected snapshot entry size");
+static_assert(sizeof(SnapshotEntryHeaderV1) == 12, "Unexpected snapshot v1 entry size");
 
 template <typename T>
 T saturating_multiply(T lhs, T rhs) {
@@ -167,13 +187,43 @@ uint32_t fnv1a_append(uint32_t seed, const void* data, size_t size) {
     return hash;
 }
 
-uint32_t checksum_record(WalRecordType type, int32_t key, const Value& value) {
+std::string encode_int_key(int32_t key) {
+    std::string encoded(1, kIntKeyTag);
+    encoded.push_back(static_cast<char>((static_cast<uint32_t>(key) >> 24) & 0xFF));
+    encoded.push_back(static_cast<char>((static_cast<uint32_t>(key) >> 16) & 0xFF));
+    encoded.push_back(static_cast<char>((static_cast<uint32_t>(key) >> 8) & 0xFF));
+    encoded.push_back(static_cast<char>(static_cast<uint32_t>(key) & 0xFF));
+    return encoded;
+}
+
+std::string encode_string_key(const std::string& key) {
+    std::string encoded(1, kStringKeyTag);
+    encoded += key;
+    return encoded;
+}
+
+bool is_string_key(const std::string& key) {
+    return !key.empty() && key.front() == kStringKeyTag;
+}
+
+std::string decode_string_key(const std::string& key) {
+    if (!is_string_key(key)) {
+        throw KVStoreError("Attempted to decode non-string key");
+    }
+    return key.substr(1);
+}
+
+uint32_t checksum_record(WalRecordType type, const std::string& key, const Value& value) {
     uint32_t hash = 2166136261u;
     const uint8_t type_byte = static_cast<uint8_t>(type);
+    const uint32_t key_size = static_cast<uint32_t>(key.size());
     const uint32_t size = static_cast<uint32_t>(value.bytes.size());
     hash = fnv1a_append(hash, &type_byte, sizeof(type_byte));
-    hash = fnv1a_append(hash, &key, sizeof(key));
+    hash = fnv1a_append(hash, &key_size, sizeof(key_size));
     hash = fnv1a_append(hash, &size, sizeof(size));
+    if (!key.empty()) {
+        hash = fnv1a_append(hash, key.data(), key.size());
+    }
     if (!value.bytes.empty()) {
         hash = fnv1a_append(hash, value.bytes.data(), value.bytes.size());
     }
@@ -336,7 +386,7 @@ public:
         close_if_open(wal_fd_);
     }
 
-    void Put(int key, Value value) {
+    void Put(const std::string& key, Value value) {
         auto request = std::make_shared<Request>();
         request->type = RequestType::kPut;
         request->key = key;
@@ -344,7 +394,7 @@ public:
         enqueue_and_wait(std::move(request));
     }
 
-    std::optional<Value> Get(int key) {
+    std::optional<Value> Get(const std::string& key) {
         throw_if_fatal();
         read_requests_.fetch_add(1, std::memory_order_relaxed);
         std::shared_lock<std::shared_mutex> lock(state_mutex_);
@@ -355,11 +405,25 @@ public:
         return it->second;
     }
 
-    void Delete(int key) {
+    void Delete(const std::string& key) {
         auto request = std::make_shared<Request>();
         request->type = RequestType::kDelete;
         request->key = key;
         enqueue_and_wait(std::move(request));
+    }
+
+    std::vector<std::pair<std::string, Value>> Scan(const std::string& start_key, const std::string& end_key) {
+        std::vector<std::pair<std::string, Value>> result;
+        const std::string encoded_start = encode_string_key(start_key);
+        const std::string encoded_end = encode_string_key(end_key);
+        std::shared_lock<std::shared_mutex> lock(state_mutex_);
+        for (auto it = state_.lower_bound(encoded_start); it != state_.end(); ++it) {
+            if (!is_string_key(it->first) || it->first > encoded_end) {
+                break;
+            }
+            result.emplace_back(decode_string_key(it->first), it->second);
+        }
+        return result;
     }
 
     void Compact() {
@@ -462,7 +526,7 @@ private:
 
     struct Request {
         RequestType type {};
-        int key = 0;
+        std::string key;
         Value value;
         std::chrono::steady_clock::time_point enqueue_time = std::chrono::steady_clock::now();
         std::mutex done_mutex;
@@ -527,7 +591,7 @@ private:
     std::string wal_file_path_;
     KVStoreOptions options_;
 
-    std::map<int, Value> state_;
+    std::map<std::string, Value> state_;
     mutable std::shared_mutex state_mutex_;
 
     std::mutex queue_mutex_;
@@ -541,7 +605,7 @@ private:
     bool stop_;
     std::atomic<bool> has_fatal_error_;
     std::string fatal_error_message_;
-    std::map<int, uint64_t> latest_wal_record_bytes_;
+    std::map<std::string, uint64_t> latest_wal_record_bytes_;
 
     std::atomic<uint64_t> enqueued_write_requests_ {0};
     std::atomic<uint64_t> committed_write_requests_ {0};
@@ -1172,7 +1236,7 @@ private:
     }
 
     void process_compaction_request(const std::shared_ptr<Request>& request, bool is_auto_compaction) {
-        std::map<int, Value> snapshot_state;
+        std::map<std::string, Value> snapshot_state;
         {
             std::shared_lock<std::shared_mutex> lock(state_mutex_);
             snapshot_state = state_;
@@ -1182,8 +1246,7 @@ private:
         const std::string temp_wal_path = wal_file_path_ + ".tmp";
         uint64_t snapshot_bytes_written = sizeof(SnapshotHeader);
         for (const auto& [key, value] : snapshot_state) {
-            (void)key;
-            snapshot_bytes_written += sizeof(SnapshotEntryHeader) + value.bytes.size();
+            snapshot_bytes_written += sizeof(SnapshotEntryHeader) + key.size() + value.bytes.size();
         }
         const uint64_t reclaimed_wal_bytes = wal_bytes_since_compaction_.load(std::memory_order_relaxed);
 
@@ -1196,10 +1259,13 @@ private:
             for (const auto& [key, value] : snapshot_state) {
                 const SnapshotEntryHeader entry = {
                     kSnapshotEntryMagic,
-                    key,
+                    static_cast<uint32_t>(key.size()),
                     static_cast<uint32_t>(value.bytes.size()),
                 };
                 write_all(snapshot_fd, &entry, sizeof(entry));
+                if (!key.empty()) {
+                    write_all(snapshot_fd, key.data(), key.size());
+                }
                 if (!value.bytes.empty()) {
                     write_all(snapshot_fd, value.bytes.data(), value.bytes.size());
                 }
@@ -1308,7 +1374,7 @@ private:
         }
     }
 
-    void note_latest_wal_record(int key, uint64_t record_size) {
+    void note_latest_wal_record(const std::string& key, uint64_t record_size) {
         const auto it = latest_wal_record_bytes_.find(key);
         if (it != latest_wal_record_bytes_.end()) {
             live_wal_bytes_since_compaction_.fetch_sub(it->second, std::memory_order_relaxed);
@@ -1340,9 +1406,9 @@ private:
     uint64_t wal_record_size_for_request(const Request& request) const {
         switch (request.type) {
             case RequestType::kPut:
-                return sizeof(WalRecordHeader) + request.value.bytes.size();
+                return sizeof(WalRecordHeader) + request.key.size() + request.value.bytes.size();
             case RequestType::kDelete:
-                return sizeof(WalRecordHeader);
+                return sizeof(WalRecordHeader) + request.key.size();
             case RequestType::kCompact:
                 return 0;
         }
@@ -1417,7 +1483,7 @@ private:
             ::close(fd);
             throw KVStoreError("Snapshot magic mismatch: " + db_file_path_);
         }
-        if (header.version != kSnapshotVersion) {
+        if (header.version != 1 && header.version != kSnapshotVersion) {
             ::close(fd);
             throw KVStoreError("Unsupported snapshot version: " + std::to_string(header.version));
         }
@@ -1437,7 +1503,22 @@ private:
                 throw KVStoreError("Snapshot entry magic mismatch: " + db_file_path_);
             }
 
-            std::vector<uint8_t> data(entry.value_size);
+            std::string key;
+            uint32_t value_size = entry.value_size;
+            if (header.version == 1) {
+                key = encode_int_key(static_cast<int32_t>(entry.key_size));
+            } else {
+                key.resize(entry.key_size);
+                if (!key.empty()) {
+                    const size_t key_bytes = read_up_to(fd, key.data(), key.size());
+                    if (key_bytes != key.size()) {
+                        ::close(fd);
+                        throw KVStoreError("Snapshot key is truncated: " + db_file_path_);
+                    }
+                }
+            }
+
+            std::vector<uint8_t> data(value_size);
             if (!data.empty()) {
                 const size_t value_bytes = read_up_to(fd, data.data(), data.size());
                 if (value_bytes != data.size()) {
@@ -1445,7 +1526,7 @@ private:
                     throw KVStoreError("Snapshot value is truncated: " + db_file_path_);
                 }
             }
-            state_[entry.key] = Value(std::move(data));
+            state_[key] = Value(std::move(data));
         }
 
         ::close(fd);
@@ -1479,7 +1560,7 @@ private:
                 ::close(fd);
                 throw KVStoreError("WAL magic mismatch at offset " + std::to_string(offset - sizeof(header)));
             }
-            if (header.version != kWalVersion) {
+            if (header.version != 1 && header.version != kWalVersion) {
                 ::close(fd);
                 throw KVStoreError("Unsupported WAL version: " + std::to_string(header.version));
             }
@@ -1493,8 +1574,25 @@ private:
                 throw KVStoreError("Delete WAL record has payload at offset " + std::to_string(offset - sizeof(header)));
             }
 
-            if (offset + header.value_size > file_size) {
-                break;
+            std::string key;
+            if (header.version == 1) {
+                key = encode_int_key(static_cast<int32_t>(header.key_size));
+                if (offset + header.value_size > file_size) {
+                    break;
+                }
+            } else {
+                if (offset + header.key_size + header.value_size > file_size) {
+                    break;
+                }
+                key.resize(header.key_size);
+                if (!key.empty()) {
+                    const size_t key_bytes = read_up_to(fd, key.data(), key.size());
+                    if (key_bytes != key.size()) {
+                        ::close(fd);
+                        throw KVStoreError("WAL key truncated before EOF: " + wal_file_path_);
+                    }
+                }
+                offset += header.key_size;
             }
 
             Value value(std::vector<uint8_t>(header.value_size));
@@ -1508,40 +1606,43 @@ private:
             offset += header.value_size;
 
             const auto type = static_cast<WalRecordType>(header.type);
-            const uint32_t expected_checksum = checksum_record(type, header.key, value);
+            const uint32_t expected_checksum = checksum_record(type, key, value);
             if (expected_checksum != header.checksum) {
                 ::close(fd);
                 throw KVStoreError("WAL checksum mismatch at offset " + std::to_string(offset - sizeof(header) - header.value_size));
             }
 
             if (type == WalRecordType::kPut) {
-                state_[header.key] = std::move(value);
+                state_[key] = std::move(value);
             } else {
-                state_.erase(header.key);
+                state_.erase(key);
             }
 
-            note_latest_wal_record(header.key, sizeof(WalRecordHeader) + header.value_size);
+            note_latest_wal_record(key, sizeof(WalRecordHeader) + key.size() + header.value_size);
         }
 
         wal_bytes_since_compaction_.store(current_wal_file_size(), std::memory_order_relaxed);
         ::close(fd);
     }
 
-    uint64_t append_wal_record(WalRecordType type, int key, const Value& value) {
+    uint64_t append_wal_record(WalRecordType type, const std::string& key, const Value& value) {
         const WalRecordHeader header = {
             kWalMagic,
             kWalVersion,
             static_cast<uint8_t>(type),
             0,
-            key,
+            static_cast<uint32_t>(key.size()),
             static_cast<uint32_t>(value.bytes.size()),
             checksum_record(type, key, value),
         };
         write_all(wal_fd_, &header, sizeof(header));
+        if (!key.empty()) {
+            write_all(wal_fd_, key.data(), key.size());
+        }
         if (!value.bytes.empty()) {
             write_all(wal_fd_, value.bytes.data(), value.bytes.size());
         }
-        return sizeof(header) + value.bytes.size();
+        return sizeof(header) + key.size() + value.bytes.size();
     }
 };
 
@@ -1554,15 +1655,31 @@ KVStore::KVStore(const std::string& db_path, KVStoreOptions options)
 KVStore::~KVStore() = default;
 
 void KVStore::Put(int key, Value value) {
-    pimpl_->Put(key, std::move(value));
+    pimpl_->Put(encode_int_key(key), std::move(value));
+}
+
+void KVStore::Put(const std::string& key, Value value) {
+    pimpl_->Put(encode_string_key(key), std::move(value));
 }
 
 std::optional<Value> KVStore::Get(int key) {
-    return pimpl_->Get(key);
+    return pimpl_->Get(encode_int_key(key));
+}
+
+std::optional<Value> KVStore::Get(const std::string& key) {
+    return pimpl_->Get(encode_string_key(key));
 }
 
 void KVStore::Delete(int key) {
-    pimpl_->Delete(key);
+    pimpl_->Delete(encode_int_key(key));
+}
+
+void KVStore::Delete(const std::string& key) {
+    pimpl_->Delete(encode_string_key(key));
+}
+
+std::vector<std::pair<std::string, Value>> KVStore::Scan(const std::string& start_key, const std::string& end_key) {
+    return pimpl_->Scan(start_key, end_key);
 }
 
 void KVStore::Compact() {

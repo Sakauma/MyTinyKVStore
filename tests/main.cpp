@@ -36,7 +36,7 @@ struct WalRecordHeader {
     uint16_t version;
     uint8_t type;
     uint8_t reserved;
-    int32_t key;
+    uint32_t key_size;
     uint32_t value_size;
     uint32_t checksum;
 };
@@ -273,6 +273,47 @@ void test_basic_persistence() {
     require(value2.has_value(), "key 2 should exist after reopen");
     require(as_string(*value1) == "alpha", "key 1 should keep its value");
     require(as_string(*value2) == "beta", "key 2 should keep its value");
+}
+
+void test_string_keys_do_not_collide_with_int_keys() {
+    TestDir dir("string_keys");
+    const std::string db_path = dir.file("store.dat");
+
+    {
+        KVStore store(db_path);
+        store.Put(42, text("int-key"));
+        store.Put(std::string("42"), text("string-key"));
+        store.Put(std::string("alpha"), text("word"));
+    }
+
+    KVStore reopened(db_path);
+    const auto int_value = reopened.Get(42);
+    const auto string_value = reopened.Get(std::string("42"));
+    const auto alpha_value = reopened.Get(std::string("alpha"));
+    require(int_value.has_value(), "int key should persist");
+    require(string_value.has_value(), "string key should persist");
+    require(alpha_value.has_value(), "string word key should persist");
+    require(as_string(*int_value) == "int-key", "int key should keep its own namespace");
+    require(as_string(*string_value) == "string-key", "string key should not collide with int namespace");
+    require(as_string(*alpha_value) == "word", "string API should round-trip normal string keys");
+}
+
+void test_string_scan_returns_sorted_range() {
+    TestDir dir("string_scan");
+    const std::string db_path = dir.file("store.dat");
+    KVStore store(db_path);
+
+    store.Put(std::string("apple"), text("a"));
+    store.Put(std::string("banana"), text("b"));
+    store.Put(std::string("carrot"), text("c"));
+    store.Put(std::string("date"), text("d"));
+    store.Put(7, text("int-should-not-appear"));
+
+    const auto results = store.Scan("banana", "date");
+    require(results.size() == 3, "scan should return all string keys in the requested inclusive range");
+    require(results[0].first == "banana" && as_string(results[0].second) == "b", "scan should start at banana");
+    require(results[1].first == "carrot" && as_string(results[1].second) == "c", "scan should keep lexical order");
+    require(results[2].first == "date" && as_string(results[2].second) == "d", "scan should include the upper bound");
 }
 
 void test_put_copies_input_value() {
@@ -940,7 +981,7 @@ void test_adaptive_flush_shortens_batch_delay() {
     }
     start_signal.store(true, std::memory_order_release);
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(8));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
     std::thread writer3([&store]() {
         store.Put(3, text("flush_3"));
     });
@@ -1011,7 +1052,7 @@ void test_latency_target_adaptive_flush_kicks_in() {
     }
     start_signal.store(true, std::memory_order_release);
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(8));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
     std::thread writer3([&store]() {
         store.Put(12, text("latency_target_c"));
     });
@@ -1607,6 +1648,8 @@ int main(int argc, char* argv[]) {
 
     const std::vector<std::pair<std::string, std::function<void()>>> tests = {
         {"basic persistence", test_basic_persistence},
+        {"string keys do not collide with int keys", test_string_keys_do_not_collide_with_int_keys},
+        {"string scan returns sorted range", test_string_scan_returns_sorted_range},
         {"put copies input value", test_put_copies_input_value},
         {"recovery from WAL without compaction", test_recovery_from_wal_without_compaction},
         {"ordering and updates", test_ordering_and_updates},

@@ -137,8 +137,12 @@ public:
     ~KVStore();
 
     void Put(int key, Value value);
+    void Put(const std::string& key, Value value);
     std::optional<Value> Get(int key);
+    std::optional<Value> Get(const std::string& key);
     void Delete(int key);
+    void Delete(const std::string& key);
+    std::vector<std::pair<std::string, Value>> Scan(const std::string& start_key, const std::string& end_key);
     void Compact();
     KVStoreMetrics GetMetrics();
 

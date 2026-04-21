@@ -22,9 +22,15 @@
 每条快照记录按以下顺序编码：
 
 - `entry_magic`: 固定值 `0x4B565345`
-- `key`: `int32_t`
+- `key_size`: `uint32_t`
 - `value_size`: `uint32_t`
+- `key_bytes[key_size]`
 - `value_bytes[value_size]`
+
+`key_bytes` 是内部规范化键：
+
+- `0x01 + 4字节 big-endian int32`：兼容 `int` 键 API
+- `0x02 + 原始 UTF-8 / 字节串`：`std::string` 键 API
 
 ### Validation Rules
 
@@ -39,17 +45,17 @@
 每条 WAL 记录头按以下顺序编码：
 
 - `magic`: 固定值 `0x4B565741`
-- `version`: 当前为 `1`
+- `version`: 当前为 `2`
 - `type`: `1=Put`, `2=Delete`
 - `reserved`: 保留字段，当前写入 `0`
-- `key`: `int32_t`
+- `key_size`: `uint32_t`
 - `value_size`: `uint32_t`
 - `checksum`: 基于 `type + key + value_size + payload` 的 FNV-1a 校验
 
 ### Payload
 
-- `Put`: 追加 `value_size` 字节的 value payload
-- `Delete`: `value_size` 必须为 `0`
+- `Put`: 追加 `key_size` 字节的 key payload 和 `value_size` 字节的 value payload
+- `Delete`: 追加 `key_size` 字节的 key payload，`value_size` 必须为 `0`
 
 ### Validation Rules
 
@@ -59,7 +65,8 @@
 
 ## Compatibility Policy
 
-- 当前支持的 snapshot / WAL 版本均为 `1`。
+- 当前写入的 snapshot / WAL 版本均为 `2`。
+- 运行时保留对版本 `1` 整型键格式的读取兼容，重写或 compact 后会升级到版本 `2`。
 - 不支持的版本会直接抛出 `KVStoreError`，不会尝试静默兼容。
 - 推荐的升级流程是先用当前程序检查格式，再执行一次 `Compact()` 以重写快照和清空 WAL。
 
