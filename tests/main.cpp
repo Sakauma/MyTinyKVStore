@@ -81,6 +81,7 @@ struct FormatKeyStats {
 };
 
 int run_inspect_format(const std::string& db_path);
+int run_verify_format(const std::string& db_path);
 
 Value text(const std::string& input) {
     return Value(std::vector<uint8_t>(input.begin(), input.end()));
@@ -187,6 +188,14 @@ std::map<std::string, std::string> capture_inspect_format(const std::string& db_
     std::cout.rdbuf(original);
     require(status == expected_status, "inspect-format should return the expected status");
     return parse_kv_line(out.str());
+}
+
+std::pair<int, std::string> capture_verify_format(const std::string& db_path) {
+    std::ostringstream out;
+    auto* original = std::cout.rdbuf(out.rdbuf());
+    const int status = run_verify_format(db_path);
+    std::cout.rdbuf(original);
+    return {status, out.str()};
 }
 
 uint64_t histogram_total(const std::array<uint64_t, kWriteLatencyBucketCount>& histogram) {
@@ -591,6 +600,32 @@ int run_rewrite_format(const std::string& db_path) {
     return 0;
 }
 
+int run_verify_format(const std::string& db_path) {
+    std::ostringstream out;
+    auto* original = std::cout.rdbuf(out.rdbuf());
+    const int inspect_status = run_inspect_format(db_path);
+    std::cout.rdbuf(original);
+
+    if (inspect_status != 0) {
+        std::cout << out.str();
+        return inspect_status;
+    }
+
+    const auto values = parse_kv_line(out.str());
+    const bool rewrite_recommended = values.count("rewrite_recommended") != 0 && values.at("rewrite_recommended") == "1";
+    const bool snapshot_magic_ok = values.count("snapshot_magic_ok") == 0 || values.at("snapshot_magic_ok") == "1";
+    const bool snapshot_entry_magic_ok =
+        values.count("snapshot_entry_magic_ok") == 0 || values.at("snapshot_entry_magic_ok") == "1";
+    const bool snapshot_truncated = values.count("snapshot_truncated") != 0 && values.at("snapshot_truncated") == "1";
+    const bool wal_truncated = values.count("wal_truncated") != 0 && values.at("wal_truncated") == "1";
+
+    std::cout << out.str();
+    if (!snapshot_magic_ok || !snapshot_entry_magic_ok || snapshot_truncated || wal_truncated || rewrite_recommended) {
+        return 2;
+    }
+    return 0;
+}
+
 std::optional<KVStoreProfile> parse_profile_name(const std::string& name) {
     if (name == "balanced") {
         return KVStoreProfile::kBalanced;
@@ -917,6 +952,40 @@ void test_inspect_format_recommends_rewrite_for_legacy_v1() {
     require(values.at("wal_records") == "2", "inspect-format should count legacy WAL records");
     require(values.at("wal_int_keys") == "2", "legacy WAL records should be recognized as int keys");
     require(values.at("rewrite_recommended") == "1", "legacy data should recommend rewrite");
+}
+
+void test_verify_format_accepts_current_layout() {
+    TestDir dir("verify_current");
+    const std::string db_path = dir.file("store.dat");
+
+    {
+        KVStore store(db_path);
+        store.Put(1, text("one"));
+        store.Put(std::string("alpha"), text("two"));
+        store.Put(std::vector<uint8_t> {0xAA, 0xBB}, text("three"));
+        store.Compact();
+    }
+
+    const auto [status, output] = capture_verify_format(db_path);
+    require(status == 0, "verify-format should accept current layout");
+    require(output.find("rewrite_recommended=0") != std::string::npos,
+            "verify-format should print inspect output for current layout");
+}
+
+void test_verify_format_rejects_legacy_layout() {
+    TestDir dir("verify_legacy");
+    const std::string db_path = dir.file("store.dat");
+    const std::string wal_path = db_path + ".wal";
+
+    write_legacy_snapshot_v1(db_path, {
+        {7, text("seven")},
+    });
+    append_legacy_wal_record_v1(wal_path, 1, 9, text("nine"));
+
+    const auto [status, output] = capture_verify_format(db_path);
+    require(status == 2, "verify-format should reject legacy layout and request rewrite");
+    require(output.find("rewrite_recommended=1") != std::string::npos,
+            "verify-format should expose the rewrite recommendation");
 }
 
 void test_ordering_and_updates() {
@@ -2295,6 +2364,13 @@ int main(int argc, char* argv[]) {
             }
             return run_rewrite_format(argv[2]);
         }
+        if (command == "verify-format") {
+            if (argc != 3) {
+                std::cerr << "Usage: kv_test verify-format <db_path>" << std::endl;
+                return 1;
+            }
+            return run_verify_format(argv[2]);
+        }
         if (command == "fault-inject") {
             if (argc != 4) {
                 std::cerr << "Usage: kv_test fault-inject <scenario> <db_path>" << std::endl;
@@ -2303,7 +2379,7 @@ int main(int argc, char* argv[]) {
             return run_fault_injection_scenario(argv[2], argv[3]);
         }
         std::cerr << "Unknown command: " << command << '\n';
-        std::cerr << "Usage: kv_test [bench|bench-json|profile-json|soak|inspect-format|rewrite-format|fault-inject]" << std::endl;
+        std::cerr << "Usage: kv_test [bench|bench-json|profile-json|soak|inspect-format|rewrite-format|verify-format|fault-inject]" << std::endl;
         return 1;
     }
 
@@ -2321,6 +2397,8 @@ int main(int argc, char* argv[]) {
         {"legacy v1 rewrite upgrades snapshot to v2", test_legacy_v1_rewrite_upgrades_snapshot_to_v2},
         {"inspect format reports key type counts", test_inspect_format_reports_key_type_counts},
         {"inspect format recommends rewrite for legacy v1", test_inspect_format_recommends_rewrite_for_legacy_v1},
+        {"verify format accepts current layout", test_verify_format_accepts_current_layout},
+        {"verify format rejects legacy layout", test_verify_format_rejects_legacy_layout},
         {"ordering and updates", test_ordering_and_updates},
         {"compaction persists snapshot and resets WAL", test_compaction_persists_snapshot_and_resets_wal},
         {"truncated WAL tail is ignored", test_truncated_wal_tail_is_ignored},

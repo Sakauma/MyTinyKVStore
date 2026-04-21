@@ -74,6 +74,7 @@
 
 - `./build/target/bin/kv_test inspect-format <db_path>`：打印快照/WAL 的版本、记录数量、键类型分布，以及 `rewrite_recommended` 建议位。
 - `./build/target/bin/kv_test rewrite-format <db_path>`：加载数据库并执行一次 `Compact()`，将数据重写为当前格式。
+- `./build/target/bin/kv_test verify-format <db_path>`：执行检查并返回机器可判定的状态码；若仍建议重写或检测到截断/损坏信号则返回非零。
 
 ### `inspect-format` Output Highlights
 
@@ -81,3 +82,9 @@
 - `snapshot_int_keys` / `snapshot_string_keys` / `snapshot_binary_keys`：快照中的键类型分布。
 - `wal_int_keys` / `wal_string_keys` / `wal_binary_keys`：WAL 中的键类型分布。
 - `rewrite_recommended=1`：通常表示检测到旧版本格式、截断 WAL 或其它不属于当前稳定格式的情况，建议执行一次 `rewrite-format`。
+
+### `verify-format` Exit Codes
+
+- `0`：格式检查通过，当前数据已处于当前受支持布局。
+- `2`：格式仍建议重写，或检测到截断/损坏信号，不应视为当前稳定布局。
+- 其它非零值：底层 `inspect-format` 失败，例如文件不存在或头部无法读取。
