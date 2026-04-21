@@ -3579,7 +3579,9 @@ void test_objective_policy_prefers_short_delay_under_latency_pressure() {
     options.adaptive_objective_short_delay_score_threshold = 500;
     options.adaptive_objective_short_delay_divisor = 10;
     options.adaptive_flush_min_batch_delay_us = 500;
-    options.adaptive_latency_target_p95_us = 1000;
+    // The latency histogram rounds any completed write into at least the 50us bucket.
+    // Keep the target below that floor so this test remains deterministic across CI runners.
+    options.adaptive_latency_target_p95_us = 10;
     KVStore store(db_path, options);
 
     store.Put(1, text("objective_latency_a"));
