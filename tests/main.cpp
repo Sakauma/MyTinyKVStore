@@ -681,12 +681,17 @@ int run_verify_format(const std::string& db_path) {
     const int inspect_status = run_inspect_format(db_path);
     std::cout.rdbuf(original);
 
+    std::string inspect_output = out.str();
+    if (!inspect_output.empty() && inspect_output.back() == '\n') {
+        inspect_output.pop_back();
+    }
+
     if (inspect_status != 0) {
-        std::cout << out.str();
+        std::cout << inspect_output << " verify_reason=inspect_error" << std::endl;
         return inspect_status;
     }
 
-    const auto values = parse_kv_line(out.str());
+    const auto values = parse_kv_line(inspect_output);
     const bool rewrite_recommended = values.count("rewrite_recommended") != 0 && values.at("rewrite_recommended") == "1";
     const bool snapshot_magic_ok = values.count("snapshot_magic_ok") == 0 || values.at("snapshot_magic_ok") == "1";
     const bool snapshot_entry_magic_ok =
@@ -694,11 +699,27 @@ int run_verify_format(const std::string& db_path) {
     const bool snapshot_truncated = values.count("snapshot_truncated") != 0 && values.at("snapshot_truncated") == "1";
     const bool wal_truncated = values.count("wal_truncated") != 0 && values.at("wal_truncated") == "1";
 
-    std::cout << out.str();
-    if (!snapshot_magic_ok || !snapshot_entry_magic_ok || snapshot_truncated || wal_truncated || rewrite_recommended) {
-        return 2;
+    std::string verify_reason = "current_layout";
+    int status = 0;
+    if (!snapshot_magic_ok) {
+        verify_reason = "snapshot_magic";
+        status = 2;
+    } else if (!snapshot_entry_magic_ok) {
+        verify_reason = "snapshot_entry_magic";
+        status = 2;
+    } else if (snapshot_truncated) {
+        verify_reason = "snapshot_truncated";
+        status = 2;
+    } else if (wal_truncated) {
+        verify_reason = "wal_truncated";
+        status = 2;
+    } else if (rewrite_recommended) {
+        verify_reason = "migration_required";
+        status = 2;
     }
-    return 0;
+
+    std::cout << inspect_output << " verify_reason=" << verify_reason << std::endl;
+    return status;
 }
 
 int run_compatibility_matrix() {
@@ -721,9 +742,12 @@ int run_compatibility_matrix() {
 
     const auto current_inspect = capture_inspect_format(current_db_path);
     const auto [current_verify_status, current_verify_output] = capture_verify_format(current_db_path);
+    const auto current_verify_values = parse_kv_line(current_verify_output);
     require(current_verify_status == 0, "current compatibility matrix case should verify cleanly");
     require(current_inspect.at("snapshot_version") == "2", "current case should report snapshot v2");
     require(current_inspect.at("rewrite_recommended") == "0", "current case should not recommend rewrite");
+    require(current_verify_values.at("verify_reason") == "current_layout",
+            "current compatibility matrix case should report a clean-layout reason");
 
     const std::string live_wal_db_path = dir.file("current_v2_live_wal.dat");
     {
@@ -736,12 +760,15 @@ int run_compatibility_matrix() {
 
     const auto live_wal_inspect = capture_inspect_format(live_wal_db_path);
     const auto [live_wal_verify_status, live_wal_verify_output] = capture_verify_format(live_wal_db_path);
+    const auto live_wal_verify_values = parse_kv_line(live_wal_verify_output);
     require(live_wal_verify_status == 0, "current v2 layout with live WAL should verify cleanly");
     require(live_wal_inspect.at("snapshot_version") == "2", "live WAL case should keep snapshot v2");
     require(live_wal_inspect.at("wal_version") == "2", "live WAL case should report WAL v2");
     require(live_wal_inspect.at("wal_records") == "2", "live WAL case should retain post-snapshot WAL records");
     require(live_wal_inspect.at("rewrite_recommended") == "0",
             "live WAL case should not recommend rewrite");
+    require(live_wal_verify_values.at("verify_reason") == "current_layout",
+            "live WAL case should remain a clean current layout");
 
     const std::string truncated_db_path = dir.file("current_v2_truncated_wal.dat");
     const std::string truncated_wal_path = truncated_db_path + ".wal";
@@ -755,23 +782,29 @@ int run_compatibility_matrix() {
 
     const auto truncated_inspect = capture_inspect_format(truncated_db_path);
     const auto [truncated_verify_status, truncated_verify_output] = capture_verify_format(truncated_db_path);
+    const auto truncated_verify_values = parse_kv_line(truncated_verify_output);
     require(truncated_verify_status == 2, "truncated WAL case should require rewrite");
     require(truncated_inspect.at("snapshot_version") == "2", "truncated WAL case should keep snapshot v2");
     require(truncated_inspect.at("wal_truncated") == "1", "truncated WAL case should report WAL truncation");
     require(truncated_inspect.at("rewrite_recommended") == "1",
             "truncated WAL case should explicitly recommend rewrite");
+    require(truncated_verify_values.at("verify_reason") == "wal_truncated",
+            "truncated WAL case should expose the wal_truncated migration reason");
 
     require(run_rewrite_format(truncated_db_path) == 0,
             "truncated WAL compatibility matrix case should rewrite successfully");
     const auto rewritten_truncated_inspect = capture_inspect_format(truncated_db_path);
     const auto [rewritten_truncated_verify_status, rewritten_truncated_verify_output] =
         capture_verify_format(truncated_db_path);
+    const auto rewritten_truncated_verify_values = parse_kv_line(rewritten_truncated_verify_output);
     require(rewritten_truncated_verify_status == 0,
             "rewritten truncated WAL case should verify cleanly");
     require(rewritten_truncated_inspect.at("wal_truncated") == "0",
             "rewritten truncated WAL case should clear the truncation signal");
     require(rewritten_truncated_inspect.at("rewrite_recommended") == "0",
             "rewritten truncated WAL case should stop recommending rewrite");
+    require(rewritten_truncated_verify_values.at("verify_reason") == "current_layout",
+            "rewritten truncated WAL case should return to a clean-layout reason");
 
     const std::string legacy_db_path = dir.file("legacy_v1.dat");
     const std::string legacy_wal_path = legacy_db_path + ".wal";
@@ -783,21 +816,28 @@ int run_compatibility_matrix() {
 
     const auto legacy_inspect = capture_inspect_format(legacy_db_path);
     const auto [legacy_verify_status, legacy_verify_output] = capture_verify_format(legacy_db_path);
+    const auto legacy_verify_values = parse_kv_line(legacy_verify_output);
     require(legacy_verify_status == 2, "legacy compatibility matrix case should require rewrite");
     require(legacy_inspect.at("snapshot_version") == "1", "legacy case should report snapshot v1");
     require(legacy_inspect.at("rewrite_recommended") == "1", "legacy case should recommend rewrite");
+    require(legacy_verify_values.at("verify_reason") == "migration_required",
+            "legacy case should expose a migration-required reason");
 
     require(run_rewrite_format(legacy_db_path) == 0, "legacy compatibility matrix case should rewrite successfully");
     const auto rewritten_inspect = capture_inspect_format(legacy_db_path);
     const auto [rewritten_verify_status, rewritten_verify_output] = capture_verify_format(legacy_db_path);
+    const auto rewritten_verify_values = parse_kv_line(rewritten_verify_output);
     require(rewritten_verify_status == 0, "rewritten legacy case should verify cleanly");
     require(rewritten_inspect.at("snapshot_version") == "2", "rewritten legacy case should upgrade to snapshot v2");
     require(rewritten_inspect.at("rewrite_recommended") == "0", "rewritten legacy case should stop recommending rewrite");
+    require(rewritten_verify_values.at("verify_reason") == "current_layout",
+            "rewritten legacy case should return to a clean-layout reason");
 
     std::cout << "case=current_v2"
               << " snapshot_version=" << current_inspect.at("snapshot_version")
               << " wal_version=" << value_or(current_inspect, "wal_version", "empty")
               << " verify_status=" << current_verify_status
+              << " verify_reason=" << current_verify_values.at("verify_reason")
               << " rewrite_recommended=" << current_inspect.at("rewrite_recommended")
               << " current_verify_output_bytes=" << current_verify_output.size()
               << '\n';
@@ -805,6 +845,7 @@ int run_compatibility_matrix() {
               << " snapshot_version=" << legacy_inspect.at("snapshot_version")
               << " wal_version=" << value_or(legacy_inspect, "wal_version", "missing")
               << " verify_status=" << legacy_verify_status
+              << " verify_reason=" << legacy_verify_values.at("verify_reason")
               << " rewrite_recommended=" << legacy_inspect.at("rewrite_recommended")
               << " legacy_verify_output_bytes=" << legacy_verify_output.size()
               << '\n';
@@ -812,6 +853,7 @@ int run_compatibility_matrix() {
               << " snapshot_version=" << rewritten_inspect.at("snapshot_version")
               << " wal_exists=" << rewritten_inspect.at("wal_exists")
               << " verify_status=" << rewritten_verify_status
+              << " verify_reason=" << rewritten_verify_values.at("verify_reason")
               << " rewrite_recommended=" << rewritten_inspect.at("rewrite_recommended")
               << " rewritten_verify_output_bytes=" << rewritten_verify_output.size()
               << '\n';
@@ -820,6 +862,7 @@ int run_compatibility_matrix() {
               << " wal_version=" << value_or(live_wal_inspect, "wal_version", "missing")
               << " wal_records=" << live_wal_inspect.at("wal_records")
               << " verify_status=" << live_wal_verify_status
+              << " verify_reason=" << live_wal_verify_values.at("verify_reason")
               << " rewrite_recommended=" << live_wal_inspect.at("rewrite_recommended")
               << " live_wal_verify_output_bytes=" << live_wal_verify_output.size()
               << '\n';
@@ -827,6 +870,7 @@ int run_compatibility_matrix() {
               << " snapshot_version=" << truncated_inspect.at("snapshot_version")
               << " wal_truncated=" << truncated_inspect.at("wal_truncated")
               << " verify_status=" << truncated_verify_status
+              << " verify_reason=" << truncated_verify_values.at("verify_reason")
               << " rewrite_recommended=" << truncated_inspect.at("rewrite_recommended")
               << " truncated_verify_output_bytes=" << truncated_verify_output.size()
               << '\n';
@@ -834,6 +878,7 @@ int run_compatibility_matrix() {
               << " snapshot_version=" << rewritten_truncated_inspect.at("snapshot_version")
               << " wal_truncated=" << rewritten_truncated_inspect.at("wal_truncated")
               << " verify_status=" << rewritten_truncated_verify_status
+              << " verify_reason=" << rewritten_truncated_verify_values.at("verify_reason")
               << " rewrite_recommended=" << rewritten_truncated_inspect.at("rewrite_recommended")
               << " rewritten_truncated_verify_output_bytes=" << rewritten_truncated_verify_output.size()
               << '\n';
@@ -1656,6 +1701,8 @@ void test_verify_format_accepts_current_layout() {
     require(status == 0, "verify-format should accept current layout");
     require(output.find("rewrite_recommended=0") != std::string::npos,
             "verify-format should print inspect output for current layout");
+    require(output.find("verify_reason=current_layout") != std::string::npos,
+            "verify-format should expose the clean-layout reason for current data");
 }
 
 void test_verify_format_rejects_legacy_layout() {
@@ -1672,6 +1719,8 @@ void test_verify_format_rejects_legacy_layout() {
     require(status == 2, "verify-format should reject legacy layout and request rewrite");
     require(output.find("rewrite_recommended=1") != std::string::npos,
             "verify-format should expose the rewrite recommendation");
+    require(output.find("verify_reason=migration_required") != std::string::npos,
+            "verify-format should expose the migration-required reason for legacy data");
 }
 
 void test_rewrite_format_recovers_truncated_current_wal() {
@@ -1692,6 +1741,8 @@ void test_rewrite_format_recovers_truncated_current_wal() {
     require(before_status == 2, "verify-format should reject a truncated current WAL layout");
     require(before_output.find("wal_truncated=1") != std::string::npos,
             "verify-format should surface the truncated WAL signal");
+    require(before_output.find("verify_reason=wal_truncated") != std::string::npos,
+            "verify-format should expose the wal_truncated reason");
 
     require(run_rewrite_format(db_path) == 0, "rewrite-format should recover a truncated WAL layout");
 
@@ -1699,6 +1750,8 @@ void test_rewrite_format_recovers_truncated_current_wal() {
     require(after_status == 0, "rewrite-format should restore a clean current layout");
     require(after_output.find("wal_truncated=0") != std::string::npos,
             "rewritten layout should no longer report WAL truncation");
+    require(after_output.find("verify_reason=current_layout") != std::string::npos,
+            "rewritten layout should return to the clean-layout reason");
 
     KVStore reopened(db_path);
     const auto stable = reopened.Get(1);

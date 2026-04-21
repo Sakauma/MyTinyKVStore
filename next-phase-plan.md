@@ -62,6 +62,9 @@ Current status:
 - 写清未来格式升级时允许和不允许的兼容策略。
 - 明确何时必须 rewrite，何时允许只读兼容。
 
+Current status:
+- 已完成。
+
 Exit criteria:
 - 兼容矩阵和迁移策略都有文档与自动回归。
 

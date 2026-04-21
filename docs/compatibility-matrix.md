@@ -23,6 +23,7 @@
 - `verify_status=0`：这份数据已经处于当前受支持格式。
 - `verify_status=2`：这份数据仍建议重写，通常是旧格式或带有不稳定布局信号。
 - `rewrite_recommended=1`：建议执行 `rewrite-format`，把数据重写到当前布局。
+- `verify_reason=*`：`verify-format` 输出的机器可解析原因，用于区分 `migration_required`、`wal_truncated` 和快照结构问题。
 - `wal_truncated=1`：说明 WAL 带有崩溃尾部或截断痕迹；当前策略会把它视为“可恢复但仍建议立即 rewrite”的状态。
 
 ## Update Rule

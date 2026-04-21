@@ -175,6 +175,7 @@ cd build && ctest --output-on-failure
 
 磁盘格式说明见 [docs/file-format.md](/home/sakauma/code/lpue/docs/file-format.md)。当前程序会写入版本 `2` 的 snapshot / WAL，同时保留对版本 `1` 整型键格式的读取兼容。
 兼容矩阵说明见 [docs/compatibility-matrix.md](/home/sakauma/code/lpue/docs/compatibility-matrix.md)。
+迁移与 rewrite 策略见 [docs/migration-policy.md](/home/sakauma/code/lpue/docs/migration-policy.md)。
 性能基线工作流见 [docs/performance-baseline.md](/home/sakauma/code/lpue/docs/performance-baseline.md)。
 运维建议和调参说明见 [docs/runbook.md](/home/sakauma/code/lpue/docs/runbook.md)。
 持久化、可见性和 `WriteBatch` 原子性语义见 [docs/semantics.md](/home/sakauma/code/lpue/docs/semantics.md)。
