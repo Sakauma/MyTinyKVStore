@@ -230,6 +230,19 @@ uint32_t checksum_record(WalRecordType type, const std::string& key, const Value
     return hash;
 }
 
+uint32_t checksum_record_v1(WalRecordType type, int32_t key, const Value& value) {
+    uint32_t hash = 2166136261u;
+    const uint8_t type_byte = static_cast<uint8_t>(type);
+    const uint32_t size = static_cast<uint32_t>(value.bytes.size());
+    hash = fnv1a_append(hash, &type_byte, sizeof(type_byte));
+    hash = fnv1a_append(hash, &key, sizeof(key));
+    hash = fnv1a_append(hash, &size, sizeof(size));
+    if (!value.bytes.empty()) {
+        hash = fnv1a_append(hash, value.bytes.data(), value.bytes.size());
+    }
+    return hash;
+}
+
 KVStoreError io_error(const std::string& action, const std::string& path) {
     return KVStoreError(action + " failed for " + path + ": " + std::strerror(errno));
 }
@@ -1575,8 +1588,10 @@ private:
             }
 
             std::string key;
+            int32_t legacy_key = 0;
             if (header.version == 1) {
-                key = encode_int_key(static_cast<int32_t>(header.key_size));
+                legacy_key = static_cast<int32_t>(header.key_size);
+                key = encode_int_key(legacy_key);
                 if (offset + header.value_size > file_size) {
                     break;
                 }
@@ -1606,7 +1621,9 @@ private:
             offset += header.value_size;
 
             const auto type = static_cast<WalRecordType>(header.type);
-            const uint32_t expected_checksum = checksum_record(type, key, value);
+            const uint32_t expected_checksum =
+                header.version == 1 ? checksum_record_v1(type, legacy_key, value)
+                                    : checksum_record(type, key, value);
             if (expected_checksum != header.checksum) {
                 ::close(fd);
                 throw KVStoreError("WAL checksum mismatch at offset " + std::to_string(offset - sizeof(header) - header.value_size));

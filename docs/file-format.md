@@ -14,7 +14,7 @@
 ### Header
 
 - `magic[8]`: 固定为 `KVSNAP01`
-- `version`: 当前为 `1`
+- `version`: 当前为 `2`
 - `reserved`: 保留字段，当前写入 `0`
 
 ### Entry Layout

@@ -31,6 +31,12 @@ struct SnapshotHeader {
     uint32_t reserved;
 };
 
+struct SnapshotEntryHeaderV1 {
+    uint32_t magic;
+    int32_t key;
+    uint32_t value_size;
+};
+
 struct WalRecordHeader {
     uint32_t magic;
     uint16_t version;
@@ -40,9 +46,21 @@ struct WalRecordHeader {
     uint32_t value_size;
     uint32_t checksum;
 };
+
+struct WalRecordHeaderV1 {
+    uint32_t magic;
+    uint16_t version;
+    uint8_t type;
+    uint8_t reserved;
+    int32_t key;
+    uint32_t value_size;
+    uint32_t checksum;
+};
 #pragma pack(pop)
 
 constexpr char kSnapshotMagic[8] = {'K', 'V', 'S', 'N', 'A', 'P', '0', '1'};
+constexpr uint32_t kWalMagic = 0x4B565741;
+constexpr uint32_t kSnapshotEntryMagic = 0x4B565345;
 
 Value text(const std::string& input) {
     return Value(std::vector<uint8_t>(input.begin(), input.end()));
@@ -113,6 +131,69 @@ uint64_t histogram_total(const std::array<uint64_t, kWriteLatencyBucketCount>& h
         total += value;
     }
     return total;
+}
+
+uint32_t fnv1a_append(uint32_t seed, const void* data, size_t size) {
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    uint32_t hash = seed;
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+uint32_t legacy_checksum(uint8_t type, int32_t key, const Value& value) {
+    uint32_t hash = 2166136261u;
+    const uint32_t value_size = static_cast<uint32_t>(value.bytes.size());
+    hash = fnv1a_append(hash, &type, sizeof(type));
+    hash = fnv1a_append(hash, &key, sizeof(key));
+    hash = fnv1a_append(hash, &value_size, sizeof(value_size));
+    if (!value.bytes.empty()) {
+        hash = fnv1a_append(hash, value.bytes.data(), value.bytes.size());
+    }
+    return hash;
+}
+
+void write_legacy_snapshot_v1(const std::string& path, const std::vector<std::pair<int32_t, Value>>& entries) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    SnapshotHeader header {};
+    std::memcpy(header.magic, kSnapshotMagic, sizeof(kSnapshotMagic));
+    header.version = 1;
+    header.reserved = 0;
+    out.write(reinterpret_cast<const char*>(&header), sizeof(header));
+    for (const auto& [key, value] : entries) {
+        const SnapshotEntryHeaderV1 entry {
+            kSnapshotEntryMagic,
+            key,
+            static_cast<uint32_t>(value.bytes.size()),
+        };
+        out.write(reinterpret_cast<const char*>(&entry), sizeof(entry));
+        if (!value.bytes.empty()) {
+            out.write(reinterpret_cast<const char*>(value.bytes.data()), static_cast<std::streamsize>(value.bytes.size()));
+        }
+    }
+}
+
+void append_legacy_wal_record_v1(
+    const std::string& path,
+    uint8_t type,
+    int32_t key,
+    const Value& value) {
+    std::ofstream out(path, std::ios::binary | std::ios::app);
+    const WalRecordHeaderV1 header {
+        kWalMagic,
+        1,
+        type,
+        0,
+        key,
+        static_cast<uint32_t>(value.bytes.size()),
+        legacy_checksum(type, key, value),
+    };
+    out.write(reinterpret_cast<const char*>(&header), sizeof(header));
+    if (!value.bytes.empty()) {
+        out.write(reinterpret_cast<const char*>(value.bytes.data()), static_cast<std::streamsize>(value.bytes.size()));
+    }
 }
 
 void wait_for_start(std::atomic<int>& ready, std::atomic<bool>& start_signal, int target_count) {
@@ -350,6 +431,53 @@ void test_recovery_from_wal_without_compaction() {
     const auto value = reopened.Get(11);
     require(value.has_value(), "remaining key should survive WAL replay");
     require(as_string(*value) == "second", "WAL replay should restore the latest value");
+}
+
+void test_legacy_v1_snapshot_and_wal_are_readable() {
+    TestDir dir("legacy_v1_read");
+    const std::string db_path = dir.file("store.dat");
+    const std::string wal_path = db_path + ".wal";
+
+    write_legacy_snapshot_v1(db_path, {
+        {1, text("legacy-one")},
+        {2, text("legacy-two")},
+    });
+    append_legacy_wal_record_v1(wal_path, 1, 3, text("legacy-three"));
+    append_legacy_wal_record_v1(wal_path, 2, 2, Value {});
+
+    KVStore store(db_path);
+    const auto one = store.Get(1);
+    const auto two = store.Get(2);
+    const auto three = store.Get(3);
+    require(one.has_value() && as_string(*one) == "legacy-one", "v1 snapshot key 1 should load");
+    require(!two.has_value(), "v1 WAL delete should apply on top of snapshot state");
+    require(three.has_value() && as_string(*three) == "legacy-three", "v1 WAL put should replay");
+}
+
+void test_legacy_v1_rewrite_upgrades_snapshot_to_v2() {
+    TestDir dir("legacy_v1_upgrade");
+    const std::string db_path = dir.file("store.dat");
+    const std::string wal_path = db_path + ".wal";
+
+    write_legacy_snapshot_v1(db_path, {
+        {7, text("seven")},
+    });
+    append_legacy_wal_record_v1(wal_path, 1, 9, text("nine"));
+
+    require(run_rewrite_format(db_path) == 0, "rewrite-format should succeed on legacy data");
+
+    std::ifstream snapshot(db_path, std::ios::binary);
+    SnapshotHeader header {};
+    snapshot.read(reinterpret_cast<char*>(&header), sizeof(header));
+    require(snapshot.gcount() == static_cast<std::streamsize>(sizeof(header)), "rewritten snapshot should contain a full header");
+    require(header.version == 2, "rewrite-format should upgrade legacy snapshot files to version 2");
+    require(file_size_or_zero(wal_path) == 0, "rewrite-format should rotate WAL back to empty");
+
+    KVStore reopened(db_path);
+    const auto seven = reopened.Get(7);
+    const auto nine = reopened.Get(9);
+    require(seven.has_value() && as_string(*seven) == "seven", "rewritten data should preserve snapshot value");
+    require(nine.has_value() && as_string(*nine) == "nine", "rewritten data should preserve WAL value");
 }
 
 void test_ordering_and_updates() {
@@ -1652,6 +1780,8 @@ int main(int argc, char* argv[]) {
         {"string scan returns sorted range", test_string_scan_returns_sorted_range},
         {"put copies input value", test_put_copies_input_value},
         {"recovery from WAL without compaction", test_recovery_from_wal_without_compaction},
+        {"legacy v1 snapshot and wal are readable", test_legacy_v1_snapshot_and_wal_are_readable},
+        {"legacy v1 rewrite upgrades snapshot to v2", test_legacy_v1_rewrite_upgrades_snapshot_to_v2},
         {"ordering and updates", test_ordering_and_updates},
         {"compaction persists snapshot and resets WAL", test_compaction_persists_snapshot_and_resets_wal},
         {"truncated WAL tail is ignored", test_truncated_wal_tail_is_ignored},
