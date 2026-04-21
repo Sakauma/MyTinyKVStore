@@ -181,6 +181,7 @@ cd build && ctest --output-on-failure
 运维建议和调参说明见 [docs/runbook.md](/home/sakauma/code/lpue/docs/runbook.md)。
 持久化、可见性和 `WriteBatch` 原子性语义见 [docs/semantics.md](/home/sakauma/code/lpue/docs/semantics.md)。
 事务与快照读的设计边界见 [docs/transaction-boundary.md](/home/sakauma/code/lpue/docs/transaction-boundary.md)。
+当前对事务 / 快照读的正式结论见 [docs/advanced-semantics-decision.md](/home/sakauma/code/lpue/docs/advanced-semantics-decision.md)。
 
 ### 可选 Sanitizer
 

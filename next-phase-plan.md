@@ -78,9 +78,15 @@ Exit criteria:
 - 在现有单 writer 内核下，重新评估是否值得进入事务实现。
 - 若不进入实现，至少明确“为什么继续停留在 `WriteBatch`”。
 
+Current status:
+- 已完成。
+
 ### D2. Snapshot Read Review
 
 - 评估快照读是否真的有用户价值，以及它与 compaction / 内存占用的权衡。
+
+Current status:
+- 已完成。
 
 Exit criteria:
 - 给出进入或暂缓事务 / 快照读实现的明确结论。
