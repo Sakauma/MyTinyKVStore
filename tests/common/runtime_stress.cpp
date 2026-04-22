@@ -116,6 +116,11 @@ StressSummary run_concurrency_stress_capture(int duration_seconds, ConcurrencySt
     std::vector<std::vector<std::optional<std::string>>> expected_by_writer(
         static_cast<size_t>(config.writer_count),
         std::vector<std::optional<std::string>>(static_cast<size_t>(config.keys_per_writer)));
+    std::atomic<uint64_t> put_operations {0};
+    std::atomic<uint64_t> delete_operations {0};
+    std::atomic<uint64_t> batch_requests {0};
+    std::atomic<uint64_t> batch_put_operations {0};
+    std::atomic<uint64_t> batch_delete_operations {0};
 
     KVStoreMetrics final_metrics;
     {
@@ -124,7 +129,16 @@ StressSummary run_concurrency_stress_capture(int duration_seconds, ConcurrencySt
         std::vector<std::thread> threads;
 
         for (int writer_id = 0; writer_id < config.writer_count; ++writer_id) {
-            threads.emplace_back([&store, &stop, &config, &expected_by_writer, writer_id]() {
+            threads.emplace_back([&store,
+                                  &stop,
+                                  &config,
+                                  &expected_by_writer,
+                                  &put_operations,
+                                  &delete_operations,
+                                  &batch_requests,
+                                  &batch_put_operations,
+                                  &batch_delete_operations,
+                                  writer_id]() {
                 std::mt19937 gen(15000 + writer_id);
                 std::uniform_int_distribution<int> key_dist(0, config.keys_per_writer - 1);
                 std::uniform_int_distribution<int> op_dist(0, 9);
@@ -137,6 +151,7 @@ StressSummary run_concurrency_stress_capture(int duration_seconds, ConcurrencySt
                         const int local_key = key_dist(gen);
                         const int global_key = writer_id * config.keys_per_writer + local_key;
                         store.Delete(global_key);
+                        delete_operations.fetch_add(1, std::memory_order_relaxed);
                         expected[static_cast<size_t>(local_key)] = std::nullopt;
                         continue;
                     }
@@ -148,6 +163,7 @@ StressSummary run_concurrency_stress_capture(int duration_seconds, ConcurrencySt
                             "stress_" + std::to_string(writer_id) + "_" +
                             std::to_string(local_key) + "_" + std::to_string(version++);
                         store.Put(global_key, text(payload));
+                        put_operations.fetch_add(1, std::memory_order_relaxed);
                         expected[static_cast<size_t>(local_key)] = payload;
                         continue;
                     }
@@ -156,6 +172,8 @@ StressSummary run_concurrency_stress_capture(int duration_seconds, ConcurrencySt
                     std::vector<std::pair<int, std::optional<std::string>>> applied;
                     operations.reserve(static_cast<size_t>(config.batch_width));
                     applied.reserve(static_cast<size_t>(config.batch_width));
+                    uint64_t local_batch_puts = 0;
+                    uint64_t local_batch_deletes = 0;
                     for (int batch_index = 0; batch_index < config.batch_width; ++batch_index) {
                         const int local_key = key_dist(gen);
                         const int global_key = writer_id * config.keys_per_writer + local_key;
@@ -163,6 +181,7 @@ StressSummary run_concurrency_stress_capture(int duration_seconds, ConcurrencySt
                         if (do_delete) {
                             operations.push_back(BatchWriteOperation::DeleteInt(global_key));
                             applied.push_back({local_key, std::nullopt});
+                            ++local_batch_deletes;
                             continue;
                         }
                         const std::string payload =
@@ -170,8 +189,12 @@ StressSummary run_concurrency_stress_capture(int duration_seconds, ConcurrencySt
                             std::to_string(local_key) + "_" + std::to_string(version++);
                         operations.push_back(BatchWriteOperation::PutInt(global_key, text(payload)));
                         applied.push_back({local_key, payload});
+                        ++local_batch_puts;
                     }
                     store.WriteBatch(operations);
+                    batch_requests.fetch_add(1, std::memory_order_relaxed);
+                    batch_put_operations.fetch_add(local_batch_puts, std::memory_order_relaxed);
+                    batch_delete_operations.fetch_add(local_batch_deletes, std::memory_order_relaxed);
                     for (const auto& [local_key, value] : applied) {
                         expected[static_cast<size_t>(local_key)] = value;
                     }
@@ -263,6 +286,14 @@ StressSummary run_concurrency_stress_capture(int duration_seconds, ConcurrencySt
     }
 
     StressSummary summary;
+    uint64_t final_live_objects = 0;
+    for (const auto& by_writer : expected_by_writer) {
+        for (const auto& value : by_writer) {
+            if (value.has_value()) {
+                ++final_live_objects;
+            }
+        }
+    }
     summary.profile = concurrency_stress_profile_name(profile);
     summary.duration_seconds = duration_seconds;
     summary.writer_count = config.writer_count;
@@ -270,6 +301,12 @@ StressSummary run_concurrency_stress_capture(int duration_seconds, ConcurrencySt
     summary.compactor_count = config.compactor_count;
     summary.recovery_reopen_cycles = config.recovery_reopen_cycles;
     summary.committed_write_requests = final_metrics.committed_write_requests;
+    summary.put_operations = put_operations.load(std::memory_order_relaxed);
+    summary.delete_operations = delete_operations.load(std::memory_order_relaxed);
+    summary.batch_requests = batch_requests.load(std::memory_order_relaxed);
+    summary.batch_put_operations = batch_put_operations.load(std::memory_order_relaxed);
+    summary.batch_delete_operations = batch_delete_operations.load(std::memory_order_relaxed);
+    summary.final_live_objects = final_live_objects;
     summary.max_pending_queue_depth = final_metrics.max_pending_queue_depth;
     summary.manual_compactions_completed = final_metrics.manual_compactions_completed;
     summary.auto_compactions_completed = final_metrics.auto_compactions_completed;
@@ -285,6 +322,12 @@ void run_concurrency_stress_test(int duration_seconds, ConcurrencyStressProfile 
               << " duration_seconds=" << summary.duration_seconds
               << " recovery_reopen_cycles=" << summary.recovery_reopen_cycles
               << " committed_write_requests=" << summary.committed_write_requests
+              << " put_operations=" << summary.put_operations
+              << " delete_operations=" << summary.delete_operations
+              << " batch_requests=" << summary.batch_requests
+              << " batch_put_operations=" << summary.batch_put_operations
+              << " batch_delete_operations=" << summary.batch_delete_operations
+              << " final_live_objects=" << summary.final_live_objects
               << " max_pending_queue_depth=" << summary.max_pending_queue_depth
               << " manual_compactions_completed=" << summary.manual_compactions_completed
               << " auto_compactions_completed=" << summary.auto_compactions_completed
@@ -442,6 +485,12 @@ std::string stress_summary_json_fixture_entrypoint() {
     summary.compactor_count = 1;
     summary.recovery_reopen_cycles = 6;
     summary.committed_write_requests = 123;
+    summary.put_operations = 99;
+    summary.delete_operations = 24;
+    summary.batch_requests = 17;
+    summary.batch_put_operations = 60;
+    summary.batch_delete_operations = 11;
+    summary.final_live_objects = 33;
     summary.max_pending_queue_depth = 7;
     return stress_summary_to_json(summary);
 }

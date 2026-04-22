@@ -15,6 +15,12 @@ struct StressSummary {
     int compactor_count = 0;
     int recovery_reopen_cycles = 0;
     uint64_t committed_write_requests = 0;
+    uint64_t put_operations = 0;
+    uint64_t delete_operations = 0;
+    uint64_t batch_requests = 0;
+    uint64_t batch_put_operations = 0;
+    uint64_t batch_delete_operations = 0;
+    uint64_t final_live_objects = 0;
     uint64_t max_pending_queue_depth = 0;
     uint64_t manual_compactions_completed = 0;
     uint64_t auto_compactions_completed = 0;

@@ -25,6 +25,12 @@ std::string stress_summary_to_json(const StressSummary& summary) {
         << ",\"compactor_count\":" << summary.compactor_count
         << ",\"recovery_reopen_cycles\":" << summary.recovery_reopen_cycles
         << ",\"committed_write_requests\":" << summary.committed_write_requests
+        << ",\"put_operations\":" << summary.put_operations
+        << ",\"delete_operations\":" << summary.delete_operations
+        << ",\"batch_requests\":" << summary.batch_requests
+        << ",\"batch_put_operations\":" << summary.batch_put_operations
+        << ",\"batch_delete_operations\":" << summary.batch_delete_operations
+        << ",\"final_live_objects\":" << summary.final_live_objects
         << ",\"max_pending_queue_depth\":" << summary.max_pending_queue_depth
         << ",\"manual_compactions_completed\":" << summary.manual_compactions_completed
         << ",\"auto_compactions_completed\":" << summary.auto_compactions_completed

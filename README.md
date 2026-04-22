@@ -167,6 +167,7 @@ cd build && ctest --output-on-failure
 - `bash scripts/soak.sh 10 [balanced|write-heavy|read-heavy]`：运行带 compaction 的 soak test，并在结束后重启校验数据一致性。
 - `bash scripts/concurrency-stress.sh 10 [balanced|write-heavy|compaction-heavy|recovery-heavy]`：运行更激进的并发 stress，混合 `Put`、`Delete`、`WriteBatch`、并发 `Get`、metrics 观测和多轮 compaction，并在结束后重启校验；`recovery-heavy` 会额外重复 reopen 验证。
 - `bash scripts/multi-profile-stress.sh [output_dir] [duration_seconds]`：批量运行 `balanced`、`write-heavy`、`compaction-heavy`、`recovery-heavy` 四个标准 stress profile，并把 JSON 摘要落盘。
+- `bash scripts/qualification-run.sh [output_dir] [duration_seconds] [required_puts] [profile] [bin_path]`：运行一轮可归档的达标压测脚手架，固定输出环境、命令和 stress JSON 摘要，并按给定的最小 `put` 次数阈值判定是否通过。
 - `bash scripts/inspect-format.sh <db_path>`：检查快照和 WAL 的格式版本、记录数量、键类型分布，以及是否建议重写迁移。
 - `bash scripts/rewrite-format.sh <db_path>`：加载数据库并执行一次 `Compact()`，把数据重写到当前格式。
 - `bash scripts/verify-format.sh <db_path>`：检查一份数据是否已经处于当前受支持格式；若仍建议重写则返回非零状态。
@@ -198,7 +199,10 @@ cd build && ctest --output-on-failure
 事务与快照读的设计边界见 [docs/transaction-boundary.md](/home/sakauma/code/lpue/docs/transaction-boundary.md)。
 当前对事务 / 快照读的正式结论见 [docs/advanced-semantics-decision.md](/home/sakauma/code/lpue/docs/advanced-semantics-decision.md)。
 后续以结构重构和持续性能治理为主的新路线图见 [post-production-plan.md](/home/sakauma/code/lpue/post-production-plan.md)。
+对照外部“单大文件 / 文件系统式布局 / MPMC / 12h-1000万插入”目标的达标改造清单见 [requirement-compliance-plan.md](/home/sakauma/code/lpue/requirement-compliance-plan.md)。
+对应的达标口径冻结文档见 [docs/qualification-contract.md](/home/sakauma/code/lpue/docs/qualification-contract.md)。
 内部模块设计说明见 [docs/internal/format-design.md](/home/sakauma/code/lpue/docs/internal/format-design.md)、[docs/internal/recovery-design.md](/home/sakauma/code/lpue/docs/internal/recovery-design.md)、[docs/internal/writer-design.md](/home/sakauma/code/lpue/docs/internal/writer-design.md)。
+单文件容器骨架设计见 [docs/internal/container-design.md](/home/sakauma/code/lpue/docs/internal/container-design.md)。
 控制器审计说明见 [docs/internal/controller-audit.md](/home/sakauma/code/lpue/docs/internal/controller-audit.md)。
 
 ### 可选 Sanitizer

@@ -5,3 +5,5 @@ build-*/
 *.dat
 *.dat.wal
 benchmarks/baselines/*.json
+artifacts/qualification/*
+!artifacts/qualification/.gitkeep

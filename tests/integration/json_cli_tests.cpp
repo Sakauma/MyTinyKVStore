@@ -56,6 +56,10 @@ void test_stress_summary_json_reports_profile() {
             "stress summary json should include the profile name");
     require(json.find("\"committed_write_requests\":") != std::string::npos,
             "stress summary json should include committed write counts");
+    require(json.find("\"put_operations\":") != std::string::npos,
+            "stress summary json should include put operation counts");
+    require(json.find("\"final_live_objects\":") != std::string::npos,
+            "stress summary json should include final live object counts");
     require(json.find("\"max_pending_queue_depth\":") != std::string::npos,
             "stress summary json should include queue metrics");
     require(json.find("\"recovery_reopen_cycles\":") != std::string::npos,
