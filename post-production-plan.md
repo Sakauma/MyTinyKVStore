@@ -79,6 +79,7 @@ Current status:
 - 已将原来的 `tests/common/runtime_cli.cpp` 继续拆成 `tests/common/runtime_profiles.cpp` 与 `tests/common/runtime_stress.cpp`，把 profile/config 逻辑与 stress/fault-inject 执行路径分离。
 - 已将 benchmark 共享模型、采集逻辑与 JSON 序列化提炼到 `tests/common/benchmark_shared.*`，`benchmark_runtime.cpp` 现只保留 CLI/fixture 包装。
 - 已将 benchmark baseline/microbench 的 JSON 解析、比较与趋势汇总提炼到 `tests/common/benchmark_analysis.*`，`benchmark_cli.cpp` 进一步收缩为命令输出包装。
+- 已将磁盘格式检查、verify、rewrite 支撑逻辑与 compatibility matrix 分析提炼到 `tests/common/format_analysis.*`，`format_cli.cpp` 进一步收缩为薄 CLI 包装。
 
 ## Phase 3: Continuous Performance Governance
 
