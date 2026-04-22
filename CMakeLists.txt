@@ -70,7 +70,8 @@ add_executable(kv_test
     tests/common/benchmark_cli.cpp
     tests/common/benchmark_runtime.cpp
     tests/common/format_cli.cpp
-    tests/common/runtime_cli.cpp
+    tests/common/runtime_profiles.cpp
+    tests/common/runtime_stress.cpp
     tests/common/test_driver.cpp
     tests/common/test_support.cpp
     tests/integration/all_tests.cpp
