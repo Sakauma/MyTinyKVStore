@@ -16,6 +16,7 @@ void register_json_cli_tests(TestCases& tests);
 void register_metrics_controller_tests(TestCases& tests);
 void register_recovery_format_tests(TestCases& tests);
 void register_runtime_concurrency_tests(TestCases& tests);
+void register_all_integration_tests(TestCases& tests);
 
 }  // namespace kvstore::tests::integration
 

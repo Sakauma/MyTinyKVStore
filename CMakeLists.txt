@@ -71,7 +71,9 @@ add_executable(kv_test
     tests/common/benchmark_runtime.cpp
     tests/common/format_cli.cpp
     tests/common/runtime_cli.cpp
+    tests/common/test_driver.cpp
     tests/common/test_support.cpp
+    tests/integration/all_tests.cpp
     tests/integration/basic_kv_tests.cpp
     tests/integration/benchmark_trend_tests.cpp
     tests/integration/durability_smoke_tests.cpp
