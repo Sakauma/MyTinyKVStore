@@ -69,6 +69,7 @@ kvstore_apply_coverage(kvstore)
 add_executable(kv_test
     tests/common/benchmark_cli.cpp
     tests/common/benchmark_runtime.cpp
+    tests/common/benchmark_shared.cpp
     tests/common/format_cli.cpp
     tests/common/runtime_profiles.cpp
     tests/common/runtime_stress.cpp

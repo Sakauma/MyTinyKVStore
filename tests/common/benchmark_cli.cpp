@@ -1,5 +1,6 @@
 #include "tests/common/benchmark_entrypoints.h"
 
+#include "tests/common/benchmark_shared.h"
 #include "tests/common/test_support.h"
 
 #include <algorithm>
@@ -16,14 +17,6 @@
 namespace {
 
 using test_support::require;
-
-struct MicrobenchCaseResult {
-    std::string name;
-    double duration_s = 0.0;
-    double ops_per_s = 0.0;
-    uint64_t operations = 0;
-    uint64_t bytes = 0;
-};
 
 struct MicrobenchComparisonResult {
     std::string name;
