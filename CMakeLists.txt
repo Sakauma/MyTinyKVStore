@@ -46,6 +46,7 @@ endfunction()
 add_library(kvstore SHARED
     src/kvstore.cpp
     src/internal/compaction.cpp
+    src/internal/container_format.cpp
     src/internal/format.cpp
     src/internal/latency_metrics.cpp
     src/internal/io.cpp
@@ -95,6 +96,7 @@ kvstore_apply_coverage(kv_test)
 
 add_executable(kv_unit_test
     tests/common/test_support.cpp
+    tests/unit/container_format_test.cpp
     tests/unit/internal_helpers_test.cpp
     tests/unit/request_runtime_test.cpp
     tests/unit/unit_main.cpp

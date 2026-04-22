@@ -2,6 +2,7 @@
 
 int main() {
     kvstore::tests::unit::TestCases tests;
+    kvstore::tests::unit::register_container_format_tests(tests);
     kvstore::tests::unit::register_internal_helpers_tests(tests);
     kvstore::tests::unit::register_request_runtime_tests(tests);
     kvstore::tests::unit::register_writer_wait_tests(tests);
