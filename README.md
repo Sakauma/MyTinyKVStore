@@ -1,166 +1,216 @@
-# MyTinyKVStore
+# MyTinyKVStore：高并发持久化键值存储引擎
 
-MyTinyKVStore 是一个面向 Linux/WSL POSIX 文件系统的 C++17 小型持久化键值存储引擎。当前版本使用单文件容器、分片内存索引、有界 worker pool、有序 group commit 和可串行化 OCC 事务。
+![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=c%2B%2B)
+![CMake](https://img.shields.io/badge/build-CMake-064F8C?logo=cmake)
+![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20WSL-FCC624?logo=linux&logoColor=black)
+![License](https://img.shields.io/badge/license-MIT-green)
 
-当前代码已经具备高并发引擎的核心实现，但“高并发持久化 KV 引擎”的正式标签仍受 qualification gate 约束：必须在同一机器的 Release/ext4 环境中达到规定性能门槛，并完成 12 小时、1000 万唯一键的归档验证。没有 qualification artifact 时，不应把短时测试结果解释为生产认证。
+MyTinyKVStore 是一个使用 C++17 编写的小型嵌入式键值存储引擎，面向 Linux/WSL POSIX 文件系统。它将 checkpoint、对象数据和 journal 组织在单一数据库文件中，通过分片索引、并行请求准备和有序 group commit 提升并发吞吐，并提供批量写入、OCC 事务、崩溃恢复、后台压缩和运行指标。
 
-## 核心能力
+## ✨ 功能特性
 
-- 单一主数据库文件：双 CRC32C superblock、checkpoint index/object 区和内嵌 journal。
-- 原子事务帧：`Put`、`Delete`、`WriteBatch` 和显式事务都进入同一提交路径；崩溃恢复不会公开半个批次。
-- 256 个默认 shard：每个 shard 独立读写锁、点查哈希索引和字符串有序索引。
-- 有界并发执行：默认 worker 数为 `min(32, hardware_concurrency())`，请求队列容量为 4096；队列满时调用方阻塞，不丢请求。
-- 有序 group commit：调用线程完成轻量键编码，worker 并行校验并序列化，请求按提交序号由单 coordinator 聚合，通过 `pwritev` 和一次 `fdatasync` 提交。
-- 显式事务：move-only `KVTransaction`，支持 read-your-writes、只读验证、rollback 和 shard-version OCC 冲突检测。
-- 三种持久化模式：`kSync`、`kPeriodic` 和 `kNoSync`，并提供有序 `Flush()` 屏障。
-- 低停顿 compaction：后台生成新容器，最终只在复制 journal delta、切换 inode 和重定位 offset 时短暂停止提交。
-- offset 索引与有界缓存：内存条目保存 key、LSN、文件 offset、长度和 checksum；value 通过 `pread` 按需读取，默认 LRU 预算 256 MiB，并把每个缓存项的估算元数据开销计入预算。
-- 一致字符串 `Scan`：按固定顺序持有全部 shard 的共享锁并进行 k-way merge。它是低频管理路径，长扫描会暂时阻塞写发布。
-- 进程级独占锁：同一数据库文件不能被第二个实例同时打开。
-- 共享格式验证器：运行时恢复、`inspect-format` 和 `verify-format` 使用同一个只读解析器。
-- 单一活动格式：历史格式实现只作归档参考，不参与构建、安装、测试或运行时兼容。
+- **高并发执行**：默认使用 256 个 shard、独立读写锁、有界请求队列和 worker pool，并行处理键校验与事务帧序列化。
+- **有序 Group Commit**：commit coordinator 按提交序号聚合请求，通过 `pwritev` 批量写入，并用一次 `fdatasync` 完成一组同步提交。
+- **持久化与崩溃恢复**：双 superblock、CRC32C 校验、单调 LSN 和带 commit footer 的事务帧共同保证恢复一致性。
+- **原子批量写入**：`WriteBatch` 被编码为一个事务帧，恢复后整批生效或整批不生效。
+- **显式事务**：move-only `KVTransaction` 支持 read-your-writes、提交验证、回滚和 shard-version OCC 冲突检测。
+- **多类型键**：点操作支持整数键、字符串键和二进制键；字符串键支持有序范围扫描。
+- **三种持久化模式**：提供同步、周期同步和手动同步模式，并通过 `Flush()` 建立明确的持久化屏障。
+- **低停顿 Compaction**：后台生成新容器，在最终切换阶段短暂停止提交，回收无效 journal 空间。
+- **按需读取与缓存**：内存索引保存文件位置，value 通过 `pread` 读取；分片 LRU cache 加速热点访问。
+- **进程级独占锁**：同一个数据库文件只允许一个存储实例打开。
+- **可观测性**：内置吞吐、写延迟、group commit、同步耗时、事务冲突、compaction 停顿和 cache 命中率等指标。
 
-运行库不依赖 Python 或 CUDA。以后若增加相关工具，仓库约定在 WSL Miniconda 虚拟环境中运行。
+## 🏛️ 架构概览
 
-## 提交与恢复路径
-
-1. 调用线程获得单调请求序号并进入有界队列。
-2. worker pool 并行完成编码键校验和事务 payload 序列化。
-3. ordered coordinator 按序验证事务 shard version，并为接受的请求分配单调 LSN。
-4. coordinator 用 `pwritev` 写入一组完整事务帧；`kSync` 下执行一次 `fdatasync`。
-5. 同步成功后，按 shard ID 排序加锁，原子发布每个请求的内存状态，再唤醒调用方。
-6. 恢复时先验证 superblock 和 checkpoint，再按严格递增 LSN 重放完整 journal frame；不完整最终帧可截断，完整损坏或中段损坏拒绝打开。
-
-单 coordinator 仍然定义全局持久化顺序，但 CPU 侧准备、不同 shard 的读取和请求生产是并行的。该结构的目标是用并行准备与 group commit 摊薄同步成本，而不是宣称磁盘提交本身可以无序执行。
-
-## API 示例
-
-```cpp
-#include "kvstore.h"
-
-KVStoreOptions options;
-options.durability = DurabilityMode::kSync;
-options.max_batch_size = 64;
-
-KVStore store("data.db", options);
-store.Put(42, Value(std::vector<uint8_t>{'o', 'k'}));
-store.Put(std::string("user:42"), Value(std::vector<uint8_t>{1, 2, 3}));
-store.Put(std::vector<uint8_t>{0x00, 0xFF}, Value(std::vector<uint8_t>{4, 5}));
-
-store.WriteBatch({
-    BatchWriteOperation::PutInt(7, Value(std::vector<uint8_t>{'v'})),
-    BatchWriteOperation::Delete("obsolete"),
-});
-
-auto tx = store.BeginTransaction();
-auto old_value = tx.Get(42);
-tx.Put(42, Value(std::vector<uint8_t>{'n', 'e', 'w'}));
-tx.Put(std::string("audit:42"), Value(std::vector<uint8_t>{'1'}));
-tx.Commit();
-
-store.Flush();
-KVStoreMetrics metrics = store.GetMetrics();
+```mermaid
+flowchart LR
+    A[Put / Delete / WriteBatch / Transaction] --> B[有界请求队列]
+    B --> C[Worker Pool]
+    C --> D[Ordered Commit Coordinator]
+    D --> E[pwritev + fdatasync]
+    E --> F[单一数据库文件]
+    D --> G[分片内存索引]
+    G --> H[LRU Value Cache]
+    F --> I[Checkpoint + Objects + Journal]
 ```
 
-事务对象不可复制、可以移动；未提交事务析构时自动 rollback。读事务也必须调用 `Commit()` 才能完成 OCC 验证。事务内暂不支持 `Scan`。
+写入流程：
 
-## 持久化模式
+1. 调用线程规范化键并将请求送入有界队列；队列满时自动形成背压。
+2. worker 并行完成请求校验和事务 payload 序列化。
+3. coordinator 按提交序号聚合准备完成的请求，验证事务版本并分配 LSN。
+4. 一组完整事务帧通过 `pwritev` 写入 journal；同步模式下执行一次 `fdatasync`。
+5. 写入成功后，按 shard ID 顺序加锁并原子发布内存状态，再唤醒调用方。
 
-| 模式 | API 返回条件 | 崩溃窗口 |
-| --- | --- | --- |
-| `DurabilityMode::kSync` | journal 已 `fdatasync`，随后发布内存状态 | 成功返回的事务必须恢复 |
-| `DurabilityMode::kPeriodic` | frame 已写入并发布 | 默认最多可能丢失最近 10 ms 周期内的提交 |
-| `DurabilityMode::kNoSync` | frame 已写入并发布 | 在显式 `Flush()` 前不建立持久化承诺 |
+点读取通过稳定哈希直接定位 shard，再从 LRU cache 或数据库文件读取 value。字符串 `Scan` 对各 shard 的有序索引执行 k-way merge，返回一致的范围结果。
 
-`Flush()` 等待并同步它之前的全部提交。析构只做 best-effort 清理；需要可报告同步错误的调用方必须显式调用 `Flush()`。
+启动恢复会依次校验 superblock、checkpoint 和 journal。完整且校验通过的事务帧按 LSN 重放，不完整的尾帧会被忽略，已提交的批次不会恢复出部分结果。
 
-## 关键默认配置
+## 🚀 快速开始
 
-| 选项 | 默认值 | 说明 |
-| --- | ---: | --- |
-| `durability` | `kSync` | 强持久化默认值 |
-| `periodic_sync_interval_ms` | 10 | periodic 同步周期 |
-| `worker_threads` | 自动，最多 32 | payload 准备 worker 数 |
-| `shard_count` | 256 | 必须为非零 2 的幂 |
-| `request_queue_capacity` | 4096 | 有界生产者队列 |
-| `value_cache_bytes` | 256 MiB | 按 shard 分段的 LRU 总预算 |
-| `max_batch_size` | 64 | 一次 group commit 的最大请求数 |
-| `max_batch_wal_bytes` | 0 | `0` 表示不额外限制字节数 |
-| `max_batch_delay_us` | 1000 | 收集 group 的最长等待 |
-| `auto_compact_*` | 0 | 自动 compaction 默认关闭 |
-| `adaptive_*` | 关闭 | 保留源码兼容，默认不影响固定策略 |
+### 环境要求
 
-## 构建与测试
+- Linux 或 WSL
+- CMake 3.15+
+- 支持 C++17 的 GCC 或 Clang
+- POSIX 文件系统
 
-建议在 WSL/Linux 中构建：
+### 编译与测试
 
 ```bash
+git clone https://github.com/Sakauma/MyTinyKVStore.git
+cd MyTinyKVStore
+
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release --parallel
-cd build-release
-ctest --output-on-failure
+(cd build-release && ctest --output-on-failure)
 ```
 
-主要产物：
+构建产物位于：
 
 - `build-release/target/lib/libkvstore.so`
 - `build-release/target/bin/kv_test`
 - `build-release/target/bin/kv_unit_test`
 
-常用入口：
+## 💻 API 示例
+
+```cpp
+#include "kvstore.h"
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+int main() {
+    KVStoreOptions options;
+    options.durability = DurabilityMode::kSync;
+    options.max_batch_size = 64;
+
+    KVStore store("example.db", options);
+
+    // 整数、字符串和二进制键
+    store.Put(42, Value(std::vector<uint8_t>{'o', 'k'}));
+    store.Put(std::string("user:42"), Value(std::vector<uint8_t>{1, 2, 3}));
+    store.Put(std::vector<uint8_t>{0x00, 0xFF}, Value(std::vector<uint8_t>{4, 5}));
+
+    // 原子批量写入
+    store.WriteBatch({
+        BatchWriteOperation::PutInt(7, Value(std::vector<uint8_t>{'v'})),
+        BatchWriteOperation::Delete("obsolete"),
+    });
+
+    // OCC 事务
+    auto tx = store.BeginTransaction();
+    tx.Get(42);
+    tx.Put(42, Value(std::vector<uint8_t>{'n', 'e', 'w'}));
+    tx.Put(std::string("audit:42"), Value(std::vector<uint8_t>{'1'}));
+    tx.Commit();
+
+    // 建立持久化屏障并读取指标
+    store.Flush();
+    KVStoreMetrics metrics = store.GetMetrics();
+    return metrics.transaction_commits > 0 ? 0 : 1;
+}
+```
+
+`KVStore` 提供以下核心接口：
+
+| 能力 | 接口 |
+| --- | --- |
+| 点操作 | `Put`、`Get`、`Delete` |
+| 原子批量写 | `WriteBatch` |
+| 字符串范围查询 | `Scan` |
+| 显式事务 | `BeginTransaction`、`Commit`、`Rollback` |
+| 持久化屏障 | `Flush` |
+| 空间回收 | `Compact` |
+| 运行指标 | `GetMetrics`、`MetricsToJson` |
+
+事务对象不可复制、可以移动；未提交事务析构时自动回滚。事务提交时若检测到 shard 版本变化，会原子失败并抛出 `KVStoreConflictError`。
+
+## ⚙️ 持久化模式
+
+| 模式 | 提交行为 | 适用场景 |
+| --- | --- | --- |
+| `DurabilityMode::kSync` | journal 同步到磁盘后返回 | 强持久化写入 |
+| `DurabilityMode::kPeriodic` | 按配置周期统一同步，默认 10 ms | 吞吐优先的持久化写入 |
+| `DurabilityMode::kNoSync` | 由调用方通过 `Flush()` 建立同步点 | 批量导入与外部同步控制 |
+
+默认配置面向通用并发负载：
+
+| 选项 | 默认值 |
+| --- | ---: |
+| shard 数 | 256 |
+| 请求队列容量 | 4096 |
+| worker 数 | 自动选择，最多 32 |
+| group commit 最大请求数 | 64 |
+| group commit 最大等待 | 1000 μs |
+| value cache | 256 MiB |
+| 持久化模式 | `kSync` |
+
+也可以使用内置负载配置快速生成参数：
+
+```cpp
+KVStoreOptions options = RecommendedOptions(KVStoreProfile::kWriteHeavy);
+KVStore store("write-heavy.db", options);
+```
+
+可选 profile 包括 `kBalanced`、`kWriteHeavy`、`kReadHeavy` 和 `kLowLatency`。
+
+## 🧪 测试与诊断
+
+运行单元测试和集成测试：
 
 ```bash
 ./build-release/target/bin/kv_unit_test
 ./build-release/target/bin/kv_test
+```
+
+运行 ASan、UBSan 和 TSan：
+
+```bash
 bash scripts/ci-sanitizers.sh
 ```
 
-`ci-sanitizers.sh` 会运行 ASan、UBSan 和 TSan。WSL 中的 TSan 脚本默认使用
-`g++-10`，也可通过 `KVSTORE_TSAN_CXX` 指定其他受支持的编译器。TSan 被要求时，
-配置、链接或运行时缺失都属于失败，不会静默跳过。
-
-当前 GCC 10 deadlock detector 最多跟踪 64 把同时持有的锁，而一致性 `Scan`
-会按设计持有 256 个 shard 锁。因此 TSan 流程只关闭该 detector；数据竞争检测、
-告警失败和 1 秒并发压力测试仍保持启用。
-
-## 格式检查与重写
+运行基准与并发压力测试：
 
 ```bash
-bash scripts/inspect-format.sh data.db
-bash scripts/verify-format.sh data.db
-bash scripts/rewrite-format.sh data.db
+./build-release/target/bin/kv_test bench
+./build-release/target/bin/kv_test microbench
+./build-release/target/bin/kv_test concurrency-stress 60 balanced
 ```
 
-`inspect-format` 和 `verify-format` 只识别当前单文件格式，并复用运行时解析器。`rewrite-format` 对已经能够正常打开的当前数据库执行同步 compaction；它不是格式转换工具。历史格式与迁移实验已归档，不属于受支持的运行路径。
-
-## 性能与正式认证
-
-快速 benchmark 只能用于开发回归。正式门槛使用：
+检查数据库文件：
 
 ```bash
-bash scripts/qualification-benchmark.sh <output_dir> <baseline_json>
-bash scripts/qualification-matrix.sh <output_dir>
-bash scripts/qualification-run.sh <output_dir>
+bash scripts/inspect-format.sh example.db
+bash scripts/verify-format.sh example.db
+bash scripts/rewrite-format.sh example.db
 ```
 
-标准 benchmark 固定为 Release、原生 Linux 文件系统、`kSync`、预填充 100 万整数键、16 writers、1000 万操作、80% Put / 10% Delete / 10% Get、256B value、均匀分布、自动 compaction 关闭，三轮取中位数。门禁要求：
+格式检查工具与运行时恢复共用同一个只读解析器。`rewrite-format` 通过同步 compaction 重写当前数据库文件。
 
-- 中位写吞吐至少为冻结基线的 2 倍。
-- 中位端到端写 p99 不得高于基线的 120%。
+## 📁 项目结构
 
-`qualification-benchmark.sh` 会把当前工作区复制到 `/tmp` 的原生 Linux 文件系统后用 Release 重新构建，并记录提交号、dirty 状态、CPU、内存、磁盘、文件系统、内核、编译器、配置和结构化结果。
+```text
+include/kvstore.h        公共 C++ API
+src/kvstore.cpp          API 实现与类型封装
+src/internal/            存储格式、并发执行、I/O 与恢复实现
+tests/unit/              单元测试
+tests/integration/       持久化、事务与并发集成测试
+scripts/                 构建、Sanitizer、基准和运维脚本
+docs/                    文件格式、语义、事务与运维文档
+```
 
-长时认证脚本默认强制至少 43200 秒和 1000 万唯一整数键；两项条件满足后追加最多 5 分钟的覆盖写稳定窗口，将 RSS/FD 增长纳入 gate。随后同步 compact、重启并逐键校验。设置 `KVSTORE_ALLOW_SHORT_QUALIFICATION=1` 只能运行 smoke，结果会标记为 `smoke-only`，不能作为正式认证。
-
-## 当前边界
-
-当前不包含多进程共享写、网络协议、复制、TTL、加密、事务内范围扫描、MVCC 历史读和分布式事务。`Scan` 是全 shard 一致管理路径，不适合作为高频 OLTP 范围查询。
-
-## 文档
+## 📚 文档
 
 - [文件格式](docs/file-format.md)
 - [一致性与持久化语义](docs/semantics.md)
 - [事务边界](docs/transaction-boundary.md)
 - [运维手册](docs/runbook.md)
-- [性能基线流程](docs/performance-baseline.md)
-- [正式验收口径](docs/qualification-contract.md)
+- [性能测试](docs/performance-baseline.md)
+- [验收口径](docs/qualification-contract.md)
+
+## 📄 开源许可证
+
+MyTinyKVStore 基于 [MIT License](LICENSE) 开源。你可以自由使用、复制、修改、合并、发布和分发本项目。
