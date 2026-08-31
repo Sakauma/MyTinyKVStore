@@ -10,6 +10,7 @@ namespace {
 
 using namespace kvstore::internal;
 using test_support::require;
+using test_support::ThreadFailureCollector;
 using test_support::wait_until;
 
 void test_enqueue_and_wait_completes() {
@@ -38,10 +39,11 @@ void test_enqueue_and_wait_completes() {
     request->value = test_support::text("one");
 
     std::atomic<bool> completed {false};
-    std::thread waiter([&]() {
+    ThreadFailureCollector thread_failures;
+    std::thread waiter(thread_failures.guard([&]() {
         enqueue_and_wait(state, request);
         completed.store(true, std::memory_order_release);
-    });
+    }));
 
     wait_until([&]() {
         std::lock_guard<std::mutex> lock(queue_mutex);
@@ -49,6 +51,7 @@ void test_enqueue_and_wait_completes() {
     }, "enqueue_and_wait should place the request in the queue");
     complete_request(request, "");
     waiter.join();
+    thread_failures.rethrow_first();
 
     require(completed.load(std::memory_order_acquire), "enqueue_and_wait should return after completion");
     require(enqueued_write_requests.load(std::memory_order_relaxed) == 1,

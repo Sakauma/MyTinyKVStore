@@ -1,231 +1,166 @@
 # MyTinyKVStore
 
-一个以正确性优先、并兼顾高并发吞吐的小型持久化键值存储引擎。当前实现采用“内存索引 + 快照文件 + WAL”模型，通过后台 writer 线程批量提交 WAL，在保证写入顺序和崩溃恢复的前提下减少并发写入争用。
+MyTinyKVStore 是一个面向 Linux/WSL POSIX 文件系统的 C++17 小型持久化键值存储引擎。当前版本使用单文件容器、分片内存索引、有界 worker pool、有序 group commit 和可串行化 OCC 事务。
 
-## 当前特性
+当前代码已经具备高并发引擎的核心实现，但“高并发持久化 KV 引擎”的正式标签仍受 qualification gate 约束：必须在同一机器的 Release/ext4 环境中达到规定性能门槛，并完成 12 小时、1000 万唯一键的归档验证。没有 qualification artifact 时，不应把短时测试结果解释为生产认证。
 
-- 批量提交 `Put` / `Delete`：调用线程提交请求后由后台 writer 按顺序写入 WAL，并对同一批请求执行一次 `fsync`。
-- 原子批量写入 `WriteBatch`：单个批量请求中的多条 `put/delete` 会按给定顺序写入 WAL，并作为一个公开 API 调用整体完成。
-- 多类型键支持：当前公开 API 已支持 `int`、`std::string` 和 `std::vector<uint8_t>` 三类键。
-- 可配置批量策略：可通过 `KVStoreOptions` 调整最大批次大小和批量等待时间。
-- 可配置批量体积：可通过 `max_batch_wal_bytes` 控制单批 WAL 最大字节数，避免只按请求条数聚合。
-- 自适应批量：队列积压达到阈值后，writer 会临时放大批次大小和 WAL 字节预算，在吞吐和 `fsync` 放大之间做动态折中。
-- 自适应 flush：队列压力升高时，writer 会缩短当前批次的等待时间，避免固定 `batch delay` 拉高拥塞时延。
-- 尾延迟/`fsync` 压力联动：writer 还会参考近期 `p95` 延迟和 `fsync` 压力，动态提前 flush 或放宽聚合等待。
-- 短窗口观测：近期 `p95`、近期队列峰值和近期平均 batch size 都基于短窗口统计，能更快反映突发负载。
-- 更多负载信号：策略还会识别 read-heavy 负载、WAL 增长速率和 compaction 压力，分别调整 batch delay。
-- 组合目标函数：可把队列压力、尾延迟、读占比、`fsync` 压力、WAL 增长和 compaction 成本收敛成同一组 score，在“更快 flush”和“更大批量”之间做统一权衡。
-- 吞吐导向控制：组合目标函数还会跟踪近期平均 batch size 与目标 batch size 的缺口，把“吞吐效率不足”显式纳入长 delay 决策。
-- 可配置自动 Compaction：可按 WAL 累积字节阈值或无效 WAL 比例自动触发快照重写和 WAL 轮转。
-- 启动恢复：先加载快照文件，再顺序重放 WAL，恢复到最近一次已提交状态。
-- 显式 Compaction：将当前内存状态写成新快照，并原子替换旧快照，同时轮转为空 WAL。
-- 并发读取：`Get` 通过读写锁直接读取内存态，不与普通读取互相阻塞。
-- 运行指标：可通过 `GetMetrics()` 查看批次数、`fsync` 次数、WAL 写入字节数和当前队列深度。
-- 后台线程指标：可观察 writer 的累计等待次数、累计等待时间、队列高水位和批量 WAL 字节数。
-- 维护指标：可区分手动与自动 compaction 次数，并观察当前距离上次 compaction 的 WAL 累积字节数、有效字节数和无效字节数。
-- 延迟统计：固定桶统计每个写请求从入队到完成的延迟分布，并给出近似 `p50/p95/p99`，便于观察尾延迟而不只看平均值。
-- 明确错误模型：I/O、文件损坏和格式不兼容会抛出 `KVStoreError`，而不是静默打印错误。
-- 确定性测试：覆盖持久化、WAL 恢复、顺序一致性、损坏检测、并发写入和 compaction。
+## 核心能力
 
-## 架构概览
+- 单一主数据库文件：双 CRC32C superblock、checkpoint index/object 区和内嵌 journal。
+- 原子事务帧：`Put`、`Delete`、`WriteBatch` 和显式事务都进入同一提交路径；崩溃恢复不会公开半个批次。
+- 256 个默认 shard：每个 shard 独立读写锁、点查哈希索引和字符串有序索引。
+- 有界并发执行：默认 worker 数为 `min(32, hardware_concurrency())`，请求队列容量为 4096；队列满时调用方阻塞，不丢请求。
+- 有序 group commit：调用线程完成轻量键编码，worker 并行校验并序列化，请求按提交序号由单 coordinator 聚合，通过 `pwritev` 和一次 `fdatasync` 提交。
+- 显式事务：move-only `KVTransaction`，支持 read-your-writes、只读验证、rollback 和 shard-version OCC 冲突检测。
+- 三种持久化模式：`kSync`、`kPeriodic` 和 `kNoSync`，并提供有序 `Flush()` 屏障。
+- 低停顿 compaction：后台生成新容器，最终只在复制 journal delta、切换 inode 和重定位 offset 时短暂停止提交。
+- offset 索引与有界缓存：内存条目保存 key、LSN、文件 offset、长度和 checksum；value 通过 `pread` 按需读取，默认 LRU 预算 256 MiB，并把每个缓存项的估算元数据开销计入预算。
+- 一致字符串 `Scan`：按固定顺序持有全部 shard 的共享锁并进行 k-way merge。它是低频管理路径，长扫描会暂时阻塞写发布。
+- 进程级独占锁：同一数据库文件不能被第二个实例同时打开。
+- 共享格式验证器：运行时恢复、`inspect-format` 和 `verify-format` 使用同一个只读解析器。
+- 单一活动格式：历史格式实现只作归档参考，不参与构建、安装、测试或运行时兼容。
 
-1. 快照文件保存最近一次 compact 后的完整键空间。
-2. 公共写接口只负责入队和等待确认；后台 writer 线程串行消费请求，保证全局提交顺序。
-3. writer 会尽量收集当前队列中的写请求，顺序写入 WAL，并对整个批次执行一次 `fsync`。
-4. 当前批次会同时受“最大请求数”“最大 WAL 字节数”“最大等待时间”三种条件约束。
-5. WAL 持久化完成后，writer 再把该批次更新应用到内存中的有序 `std::map<std::string, Value>`。
-6. 每个写请求完成时都会更新延迟直方图，用于观测批量策略对尾延迟的影响。
-7. `Get` 使用读写锁直接读取内存态，多个读线程可以并发执行。
-8. writer 会跟踪“当前 WAL 中仍代表最新状态的记录字节数”，从而估算自上次 compaction 以来的无效 WAL 字节。
-9. 当 WAL 自上次 compaction 以来的累计字节数超过阈值，或无效 WAL 比例超过阈值时，writer 会在同一串行路径上自动执行 compaction。
-10. 重启时按“快照 -> WAL”顺序恢复，因此即使快照落后，最近已提交操作也不会丢失。
+运行库不依赖 Python 或 CUDA。以后若增加相关工具，仓库约定在 WSL Miniconda 虚拟环境中运行。
 
-## API 摘要
+## 提交与恢复路径
+
+1. 调用线程获得单调请求序号并进入有界队列。
+2. worker pool 并行完成编码键校验和事务 payload 序列化。
+3. ordered coordinator 按序验证事务 shard version，并为接受的请求分配单调 LSN。
+4. coordinator 用 `pwritev` 写入一组完整事务帧；`kSync` 下执行一次 `fdatasync`。
+5. 同步成功后，按 shard ID 排序加锁，原子发布每个请求的内存状态，再唤醒调用方。
+6. 恢复时先验证 superblock 和 checkpoint，再按严格递增 LSN 重放完整 journal frame；不完整最终帧可截断，完整损坏或中段损坏拒绝打开。
+
+单 coordinator 仍然定义全局持久化顺序，但 CPU 侧准备、不同 shard 的读取和请求生产是并行的。该结构的目标是用并行准备与 group commit 摊薄同步成本，而不是宣称磁盘提交本身可以无序执行。
+
+## API 示例
 
 ```cpp
-KVStore store("data.db");
-KVStore tuned_store("data.db", KVStoreOptions{});
+#include "kvstore.h"
 
+KVStoreOptions options;
+options.durability = DurabilityMode::kSync;
+options.max_batch_size = 64;
+
+KVStore store("data.db", options);
 store.Put(42, Value(std::vector<uint8_t>{'o', 'k'}));
-store.Put(std::string("user:42"), Value(std::vector<uint8_t>{'a', 'b'}));
-auto value = store.Get(42);
-auto string_value = store.Get(std::string("user:42"));
-auto range = store.Scan("user:00", "user:99");
+store.Put(std::string("user:42"), Value(std::vector<uint8_t>{1, 2, 3}));
+store.Put(std::vector<uint8_t>{0x00, 0xFF}, Value(std::vector<uint8_t>{4, 5}));
+
+store.WriteBatch({
+    BatchWriteOperation::PutInt(7, Value(std::vector<uint8_t>{'v'})),
+    BatchWriteOperation::Delete("obsolete"),
+});
+
+auto tx = store.BeginTransaction();
+auto old_value = tx.Get(42);
+tx.Put(42, Value(std::vector<uint8_t>{'n', 'e', 'w'}));
+tx.Put(std::string("audit:42"), Value(std::vector<uint8_t>{'1'}));
+tx.Commit();
+
+store.Flush();
 KVStoreMetrics metrics = store.GetMetrics();
 ```
 
-当前公开 API 同时支持：
+事务对象不可复制、可以移动；未提交事务析构时自动 rollback。读事务也必须调用 `Commit()` 才能完成 OCC 验证。事务内暂不支持 `Scan`。
 
-- `int` 键：保留兼容旧接口
-- `std::string` 键：用于新的持久化格式与范围扫描
+## 持久化模式
 
-可调参数：
+| 模式 | API 返回条件 | 崩溃窗口 |
+| --- | --- | --- |
+| `DurabilityMode::kSync` | journal 已 `fdatasync`，随后发布内存状态 | 成功返回的事务必须恢复 |
+| `DurabilityMode::kPeriodic` | frame 已写入并发布 | 默认最多可能丢失最近 10 ms 周期内的提交 |
+| `DurabilityMode::kNoSync` | frame 已写入并发布 | 在显式 `Flush()` 前不建立持久化承诺 |
 
-- `max_batch_size`：writer 一次最多合并多少个写请求。
-- `max_batch_wal_bytes`：writer 一次最多合并多少字节的 WAL 记录，`0` 表示仅受条数限制。
-- `max_batch_delay_us`：writer 在取到首个写请求后，最多等待多久来扩展当前批次。
-- `adaptive_recent_window_batches`：近期批次窗口大小，用于估算近期队列峰值、近期平均 batch size 和近期 `fsync` 压力。
-- `adaptive_recent_write_sample_limit`：近期写延迟样本窗口大小，用于估算近期 `p95`。
-- `adaptive_objective_enabled`：是否启用组合目标函数策略；开启后，writer 会按压力 score 与成本 score 的差值统一决定是缩短还是放宽 batch delay。
-- `adaptive_objective_*_weight`：分别控制队列、尾延迟、读占比、`fsync` 压力、compaction 压力和 WAL 增长信号在目标函数中的权重。
-- `adaptive_objective_throughput_weight` / `adaptive_objective_target_batch_size`：控制“近期平均 batch size 低于目标值”时的吞吐效率缺口权重与目标 batch size。
-- `adaptive_objective_short_delay_score_threshold` / `adaptive_objective_long_delay_score_threshold`：压力 score 或成本 score 需要领先多少，才会触发缩短或放宽 batch delay。
-- `adaptive_objective_short_delay_divisor` / `adaptive_objective_long_delay_multiplier` / `adaptive_objective_max_batch_delay_us`：目标函数触发后，对 batch delay 的缩放方式和上限。
-- `adaptive_read_heavy_read_per_1000_ops_threshold`：近期每 1000 个操作里读请求达到多少时，视为 read-heavy 负载，`0` 表示关闭。
-- `adaptive_read_heavy_delay_divisor` / `adaptive_read_heavy_batch_size_divisor`：read-heavy 负载下，对 batch delay 和 batch size 收缩的除数。
-- `adaptive_flush_enabled`：是否在队列压力升高时动态缩短批次等待时间。
-- `adaptive_flush_queue_depth_threshold`：待处理队列达到多少条时开始缩短 batch delay。
-- `adaptive_flush_delay_divisor`：每一级队列压力下，对 batch delay 缩短的除数。
-- `adaptive_flush_min_batch_delay_us`：自适应 flush 允许缩短到的最小 batch delay。
-- `adaptive_latency_target_p95_us`：当近期近似 `p95` 写延迟超过该目标时，writer 会进一步缩短 batch delay，`0` 表示关闭。
-- `adaptive_fsync_pressure_per_1000_writes_threshold`：当观察到每 1000 次写入对应的 `fsync` 压力超过该阈值时，writer 会放宽 batch delay，`0` 表示关闭。
-- `adaptive_fsync_pressure_delay_multiplier`：触发 `fsync` 压力调节时，对 batch delay 放大的倍数。
-- `adaptive_fsync_pressure_max_batch_delay_us`：`fsync` 压力调节允许放大到的最大 batch delay，`0` 表示仅受乘数约束。
-- `adaptive_compaction_pressure_obsolete_ratio_percent_threshold`：当当前无效 WAL 比例达到该阈值时，认为 compaction 压力升高，`0` 表示关闭。
-- `adaptive_compaction_pressure_delay_multiplier`：触发 compaction 压力调节时，对 batch delay 放大的倍数。
-- `adaptive_wal_growth_bytes_per_batch_threshold`：近期平均每批 WAL 字节达到该阈值时，认为 WAL 增长速率较高，`0` 表示关闭。
-- `adaptive_wal_growth_delay_multiplier` / `adaptive_wal_growth_max_batch_delay_us`：WAL 增长速率调节下，对 batch delay 放大的倍数和上限。
-- `adaptive_batching_enabled`：是否在队列积压时启用自适应批量。
-- `adaptive_queue_depth_threshold`：待处理队列达到多少条时切换到自适应批量策略。
-- `adaptive_batch_size_multiplier`：自适应模式下，对 `max_batch_size` 放大的倍数。
-- `adaptive_batch_wal_bytes_multiplier`：自适应模式下，对 `max_batch_wal_bytes` 放大的倍数。
-- `auto_compact_wal_bytes_threshold`：当 WAL 自上次 compaction 以来累计达到该字节数时自动 compact，`0` 表示关闭。
-- `auto_compact_invalid_wal_ratio_percent`：当无效 WAL 字节占比达到该百分比时自动 compact，`0` 表示关闭。
+`Flush()` 等待并同步它之前的全部提交。析构只做 best-effort 清理；需要可报告同步错误的调用方必须显式调用 `Flush()`。
 
-常用指标：
+## 关键默认配置
 
-- `wal_bytes_since_compaction`：当前 WAL 自上次 compaction 以来累计了多少字节。
-- `live_wal_bytes_since_compaction` / `obsolete_wal_bytes_since_compaction`：当前 WAL 中仍代表最新状态的字节数，以及已经被覆盖/删除淘汰的字节数。
-- `manual_compactions_completed` / `auto_compactions_completed`：手动和自动 compaction 的完成次数。
-- `adaptive_batches_completed`：在队列压力下按自适应策略提交的批次数。
-- `adaptive_flush_batches_completed`：以缩短后的 batch delay 提交的批次数。
-- `adaptive_latency_target_batches_completed` / `adaptive_fsync_pressure_batches_completed`：分别统计由尾延迟目标和 `fsync` 压力驱动的自适应批次数。
-- `adaptive_read_heavy_batches_completed` / `adaptive_compaction_pressure_batches_completed` / `adaptive_wal_growth_batches_completed`：分别统计 read-heavy、compaction 压力和 WAL 增长速率触发的批次数。
-- `adaptive_objective_short_delay_batches_completed` / `adaptive_objective_long_delay_batches_completed`：分别统计组合目标函数偏向更短或更长 batch delay 的批次数。
-- `adaptive_objective_throughput_batches_completed`：统计组合目标函数检测到吞吐效率缺口的批次数。
-- `last_committed_batch_wal_bytes` / `max_committed_batch_wal_bytes`：最近一次批量提交和历史最大批量提交各写入了多少 WAL 字节。
-- `pending_queue_depth` / `max_pending_queue_depth`：当前待处理队列深度和历史高水位。
-- `writer_wait_events` / `writer_wait_time_us`：writer 等待新请求或等待批次扩展的次数，以及累计等待时间。
-- `last_effective_batch_delay_us` / `min_effective_batch_delay_us` / `max_effective_batch_delay_us`：最近一次、历史最小和历史最大的实际 batch delay 预算。
-- `observed_fsync_pressure_per_1000_writes`：基于近期批量大小估算的 `fsync` 压力，值越高表示越接近“每次写都要 fsync”。
-- `last_objective_pressure_score` / `last_objective_cost_score` / `last_objective_throughput_score` / `last_objective_balance_score`：最近一次组合目标函数计算出的压力分、成本分、吞吐效率分和二者差值。
-- `last_objective_mode`：最近一次 objective 决策模式，`1` 表示偏向更短 delay，`-1` 表示偏向更长 delay，`0` 表示保持中性。
-- `recent_read_ratio_per_1000_ops` / `recent_avg_batch_wal_bytes` / `observed_obsolete_wal_ratio_percent`：近期读占比、近期平均每批 WAL 字节和当前无效 WAL 比例。
-- `recent_batch_fill_per_1000`：近期平均 batch size 相对目标 batch size 的填充比例，`1000` 表示达到或超过目标吞吐填充。
-- `total_snapshot_bytes_written` / `total_wal_bytes_reclaimed_by_compaction`：长期累计写入快照的字节数，以及被 compaction 回收的 WAL 字节数。
-- `approx_write_latency_p50_us` / `approx_write_latency_p95_us` / `approx_write_latency_p99_us`：基于延迟直方图计算的近似分位数。
-- `recent_observed_write_latency_p95_us` / `recent_peak_queue_depth` / `recent_avg_batch_size`：短窗口下观测到的近期 `p95`、近期队列峰值和近期平均 batch size。
-- `write_latency_histogram`：12 个固定桶的写入延迟分布，桶上界依次为 `50us`、`100us`、`250us`、`500us`、`1ms`、`2.5ms`、`5ms`、`10ms`、`25ms`、`50ms`、`100ms`、`>100ms`。
+| 选项 | 默认值 | 说明 |
+| --- | ---: | --- |
+| `durability` | `kSync` | 强持久化默认值 |
+| `periodic_sync_interval_ms` | 10 | periodic 同步周期 |
+| `worker_threads` | 自动，最多 32 | payload 准备 worker 数 |
+| `shard_count` | 256 | 必须为非零 2 的幂 |
+| `request_queue_capacity` | 4096 | 有界生产者队列 |
+| `value_cache_bytes` | 256 MiB | 按 shard 分段的 LRU 总预算 |
+| `max_batch_size` | 64 | 一次 group commit 的最大请求数 |
+| `max_batch_wal_bytes` | 0 | `0` 表示不额外限制字节数 |
+| `max_batch_delay_us` | 1000 | 收集 group 的最长等待 |
+| `auto_compact_*` | 0 | 自动 compaction 默认关闭 |
+| `adaptive_*` | 关闭 | 保留源码兼容，默认不影响固定策略 |
 
 ## 构建与测试
 
-### 依赖
-
-- CMake >= 3.15
-- 支持 C++17 的编译器
-
-### 构建
+建议在 WSL/Linux 中构建：
 
 ```bash
-cmake -S . -B build
-cmake --build build
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release --parallel
+cd build-release
+ctest --output-on-failure
 ```
 
-产物会输出到：
+主要产物：
 
-- `build/target/bin/kv_test`
-- `build/target/lib/libkvstore.so`
+- `build-release/target/lib/libkvstore.so`
+- `build-release/target/bin/kv_test`
+- `build-release/target/bin/kv_unit_test`
 
-### 运行测试
+常用入口：
 
 ```bash
-./build/target/bin/kv_unit_test
-./build/target/bin/kv_test
-cd build && ctest --output-on-failure
-./target/bin/kv_test bench
+./build-release/target/bin/kv_unit_test
+./build-release/target/bin/kv_test
+bash scripts/ci-sanitizers.sh
 ```
 
-`bench` 会打印基础吞吐、全局与近期的延迟/队列指标、读占比、WAL 增长/无效比例、`fsync` 压力、组合目标函数 score、吞吐填充比例、自适应策略命中次数、writer 等待指标、长期 compaction 字节统计和写入延迟直方图，便于快速观察瞬时突发和长期趋势。
+`ci-sanitizers.sh` 会运行 ASan、UBSan 和 TSan。WSL 中的 TSan 脚本默认使用
+`g++-10`，也可通过 `KVSTORE_TSAN_CXX` 指定其他受支持的编译器。TSan 被要求时，
+配置、链接或运行时缺失都属于失败，不会静默跳过。
 
-仓库内还提供了几个标准化脚本：
+当前 GCC 10 deadlock detector 最多跟踪 64 把同时持有的锁，而一致性 `Scan`
+会按设计持有 256 个 shard 锁。因此 TSan 流程只关闭该 detector；数据竞争检测、
+告警失败和 1 秒并发压力测试仍保持启用。
 
-- `build/target/bin/kv_unit_test`：运行 internal/module 级 unit tests。
-- `build/target/bin/kv_test`：运行 integration suite，或使用下方 CLI 子命令。
-- `bash scripts/ci-build.sh`：执行常规构建、测试和 `ctest`。
-- `bash scripts/ci-sanitizers.sh`：分别执行 ASan 和 UBSan 构建与测试。
-- `bash scripts/coverage.sh`：执行 coverage 构建与测试；若本地安装了 `gcovr`，会直接打印 coverage 摘要。
-- `bash scripts/bench.sh`：构建并运行混合负载 `stressbench`。
-- `bash scripts/microbench.sh`：构建并运行按单项能力拆分的 `microbench`。
-- `bash scripts/bench-baseline.sh`：运行 benchmark，并把结构化 baseline JSON 落到 `benchmarks/baselines/`。
-- `bash scripts/bench-regression-check.sh <baseline_json>`：生成新的 candidate baseline，并按默认阈值与参考基线比较。
-- `bash scripts/ci-bench-regression.sh`：使用仓库内的 CI 参考 baseline 执行回归门槛检查。
-- `bash scripts/microbench-regression-check.sh <baseline_json>`：生成新的 candidate microbench，并按各 case 的默认阈值执行回归检查。
-- `bash scripts/ci-microbench-regression.sh`：使用仓库内的 microbench floor 执行单项能力回归检查。
-- `bash scripts/microbench-trend.sh [baseline_dir] [recent_window]`：汇总一组历史 microbench baseline，输出各 case 的长期趋势摘要。
-- `bash scripts/bench-trend.sh [baseline_dir] [recent_window]`：汇总一组历史 baseline，输出 oldest/latest 和 recent-window 两种视角的趋势摘要。
-- `bash scripts/collect-artifacts.sh [output_dir] [baseline_dir] [recent_window]`：统一落盘 `microbench`、`stressbench baseline`、`trend summary`、`compatibility matrix`，以及全部标准 stress profile 的 artifact。
-- `bash scripts/soak.sh 10 [balanced|write-heavy|read-heavy]`：运行带 compaction 的 soak test，并在结束后重启校验数据一致性。
-- `bash scripts/concurrency-stress.sh 10 [balanced|write-heavy|compaction-heavy|recovery-heavy]`：运行更激进的并发 stress，混合 `Put`、`Delete`、`WriteBatch`、并发 `Get`、metrics 观测和多轮 compaction，并在结束后重启校验；`recovery-heavy` 会额外重复 reopen 验证。
-- `bash scripts/multi-profile-stress.sh [output_dir] [duration_seconds]`：批量运行 `balanced`、`write-heavy`、`compaction-heavy`、`recovery-heavy` 四个标准 stress profile，并把 JSON 摘要落盘。
-- `bash scripts/qualification-run.sh [output_dir] [duration_seconds] [required_puts] [profile] [bin_path]`：运行一轮可归档的达标压测脚手架，固定输出环境、命令和 stress JSON 摘要，并按给定的最小 `put` 次数阈值判定是否通过。
-- `bash scripts/inspect-format.sh <db_path>`：检查快照和 WAL 的格式版本、记录数量、键类型分布，以及是否建议重写迁移。
-- `bash scripts/rewrite-format.sh <db_path>`：加载数据库并执行一次 `Compact()`，把数据重写到当前格式。
-- `bash scripts/verify-format.sh <db_path>`：检查一份数据是否已经处于当前受支持格式；若仍建议重写则返回非零状态。
-- `bash scripts/compatibility-matrix.sh`：运行当前格式与 legacy v1 的兼容矩阵检查。
-- `bash scripts/profile.sh <balanced|write-heavy|read-heavy|low-latency>`：打印推荐配置模板的 JSON。
-- `bash scripts/tsan.sh`：若工具链支持 ThreadSanitizer，则执行 TSan 构建、完整测试和一轮 `balanced` 并发 stress；若运行时缺失则打印 `SKIP`。
-
-当前测试程序还内置了故障注入入口 `kv_test fault-inject <scenario> <db_path>`，用于在 WAL `fsync` 之后、快照 rename 前后、WAL 轮转后等关键持久化点模拟进程崩溃。常规测试会自动通过子进程调用这些场景来验证重启恢复。
-若需要结构化指标，可调用 `kv_test bench-json` 或直接使用库函数 `MetricsToJson(store.GetMetrics())`。
-若需要按单项能力拆开的 benchmark，可调用 `kv_test microbench` 或 `kv_test microbench-json`。
-当前 `microbench` 已覆盖 `wal_append`、`scan`、`recovery`、`compaction`、`rewrite` 五类单项能力。
-若需要可归档的 benchmark 基线，可调用 `kv_test bench-baseline-json` 或 `bash scripts/bench-baseline.sh`。
-若需要自动判断是否出现明显退化，可调用 `kv_test compare-baseline ...` 或 `bash scripts/bench-regression-check.sh ...`。
-若需要自动判断单项能力是否退化，可调用 `kv_test compare-microbench ...` 或 `bash scripts/microbench-regression-check.sh ...`。
-若需要查看单项能力的长期趋势，可调用 `kv_test trend-microbench <dir> [recent_window]` 或 `bash scripts/microbench-trend.sh ...`。
-若需要查看一段时间内的趋势，可调用 `kv_test trend-baselines <dir> [recent_window]` 或 `bash scripts/bench-trend.sh ...`。
-若需要结构化趋势 artifact，可调用 `kv_test trend-baselines-json <dir> [recent_window]`。
-若需要结构化 stress artifact，可调用 `kv_test concurrency-stress-json <seconds> <profile>` 或 `bash scripts/multi-profile-stress.sh ...`。
-趋势摘要现在会同时输出 oldest/latest 和 recent-window 两种视角，并带上 `write_trend` / `read_trend` / `latency_trend` 与对应的 `recent_*_trend`，方便直接归档“改善 / 持平 / 退化”结论。
-当前 regression gate 除了 `write/read throughput` 和平均写延迟外，也会检查 `p95/p99`、`fsync` 压力和 batch fill。
-若需要推荐配置模板，可调用 `kv_test profile-json <name>` 或 `RecommendedOptions(...)`。
-
-磁盘格式说明见 [docs/file-format.md](/home/sakauma/code/lpue/docs/file-format.md)。当前程序会写入版本 `2` 的 snapshot / WAL，同时保留对版本 `1` 整型键格式的读取兼容。
-兼容矩阵说明见 [docs/compatibility-matrix.md](/home/sakauma/code/lpue/docs/compatibility-matrix.md)。
-迁移与 rewrite 策略见 [docs/migration-policy.md](/home/sakauma/code/lpue/docs/migration-policy.md)。
-性能基线与 microbench/stressbench 工作流见 [docs/performance-baseline.md](/home/sakauma/code/lpue/docs/performance-baseline.md)。
-运维建议和调参说明见 [docs/runbook.md](/home/sakauma/code/lpue/docs/runbook.md)。
-持久化、可见性和 `WriteBatch` 原子性语义见 [docs/semantics.md](/home/sakauma/code/lpue/docs/semantics.md)。
-事务与快照读的设计边界见 [docs/transaction-boundary.md](/home/sakauma/code/lpue/docs/transaction-boundary.md)。
-当前对事务 / 快照读的正式结论见 [docs/advanced-semantics-decision.md](/home/sakauma/code/lpue/docs/advanced-semantics-decision.md)。
-后续以结构重构和持续性能治理为主的新路线图见 [post-production-plan.md](/home/sakauma/code/lpue/post-production-plan.md)。
-对照外部“单大文件 / 文件系统式布局 / MPMC / 12h-1000万插入”目标的达标改造清单见 [requirement-compliance-plan.md](/home/sakauma/code/lpue/requirement-compliance-plan.md)。
-对应的达标口径冻结文档见 [docs/qualification-contract.md](/home/sakauma/code/lpue/docs/qualification-contract.md)。
-内部模块设计说明见 [docs/internal/format-design.md](/home/sakauma/code/lpue/docs/internal/format-design.md)、[docs/internal/recovery-design.md](/home/sakauma/code/lpue/docs/internal/recovery-design.md)、[docs/internal/writer-design.md](/home/sakauma/code/lpue/docs/internal/writer-design.md)。
-单文件容器骨架设计见 [docs/internal/container-design.md](/home/sakauma/code/lpue/docs/internal/container-design.md)。
-控制器审计说明见 [docs/internal/controller-audit.md](/home/sakauma/code/lpue/docs/internal/controller-audit.md)。
-
-### 可选 Sanitizer
+## 格式检查与重写
 
 ```bash
-cmake -S . -B build-asan -DKVSTORE_ENABLE_ASAN=ON
-cmake --build build-asan
+bash scripts/inspect-format.sh data.db
+bash scripts/verify-format.sh data.db
+bash scripts/rewrite-format.sh data.db
 ```
 
-也可以启用 `-DKVSTORE_ENABLE_UBSAN=ON` 进行未定义行为检查。
-若需要并发专向检查，也可以启用 `-DKVSTORE_ENABLE_TSAN=ON` 或直接运行 `bash scripts/tsan.sh`；若本机工具链缺少 TSan 运行时，脚本会自动跳过。
+`inspect-format` 和 `verify-format` 只识别当前单文件格式，并复用运行时解析器。`rewrite-format` 对已经能够正常打开的当前数据库执行同步 compaction；它不是格式转换工具。历史格式与迁移实验已归档，不属于受支持的运行路径。
 
-### Coverage
+## 性能与正式认证
+
+快速 benchmark 只能用于开发回归。正式门槛使用：
 
 ```bash
-cmake -S . -B build-coverage -DKVSTORE_ENABLE_COVERAGE=ON
-cmake --build build-coverage
-ctest --test-dir build-coverage --output-on-failure
+bash scripts/qualification-benchmark.sh <output_dir> <baseline_json>
+bash scripts/qualification-matrix.sh <output_dir>
+bash scripts/qualification-run.sh <output_dir>
 ```
 
-## 后续改进
+标准 benchmark 固定为 Release、原生 Linux 文件系统、`kSync`、预填充 100 万整数键、16 writers、1000 万操作、80% Put / 10% Delete / 10% Get、256B value、均匀分布、自动 compaction 关闭，三轮取中位数。门禁要求：
 
-- 增加更完整的键类型迁移和跨类型比较策略
-- 将多目标控制器继续扩展为带反馈学习的自调参策略
-- 增加更完整的格式迁移与跨版本兼容策略
-- 在批量原子写稳定后再评估事务支持与快照读语义
+- 中位写吞吐至少为冻结基线的 2 倍。
+- 中位端到端写 p99 不得高于基线的 120%。
+
+`qualification-benchmark.sh` 会把当前工作区复制到 `/tmp` 的原生 Linux 文件系统后用 Release 重新构建，并记录提交号、dirty 状态、CPU、内存、磁盘、文件系统、内核、编译器、配置和结构化结果。
+
+长时认证脚本默认强制至少 43200 秒和 1000 万唯一整数键；两项条件满足后追加最多 5 分钟的覆盖写稳定窗口，将 RSS/FD 增长纳入 gate。随后同步 compact、重启并逐键校验。设置 `KVSTORE_ALLOW_SHORT_QUALIFICATION=1` 只能运行 smoke，结果会标记为 `smoke-only`，不能作为正式认证。
+
+## 当前边界
+
+当前不包含多进程共享写、网络协议、复制、TTL、加密、事务内范围扫描、MVCC 历史读和分布式事务。`Scan` 是全 shard 一致管理路径，不适合作为高频 OLTP 范围查询。
+
+## 文档
+
+- [文件格式](docs/file-format.md)
+- [一致性与持久化语义](docs/semantics.md)
+- [事务边界](docs/transaction-boundary.md)
+- [运维手册](docs/runbook.md)
+- [性能基线流程](docs/performance-baseline.md)
+- [正式验收口径](docs/qualification-contract.md)

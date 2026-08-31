@@ -17,6 +17,7 @@ namespace {
 using test_support::require;
 using test_support::TestDir;
 using test_support::text;
+using test_support::ThreadFailureCollector;
 
 }  // namespace
 
@@ -91,8 +92,10 @@ BenchmarkResult run_benchmark_capture(const BenchmarkConfig& config) {
     std::atomic<uint64_t> write_latency_ns {0};
 
     std::vector<std::thread> threads;
+    ThreadFailureCollector thread_failures;
     for (int writer_id = 0; writer_id < config.writer_count; ++writer_id) {
-        threads.emplace_back([&store, &stop, &write_ops, &write_latency_ns, &config, writer_id]() {
+        threads.emplace_back(thread_failures.guard(
+            [&store, &stop, &write_ops, &write_latency_ns, &config, writer_id]() {
             std::mt19937 gen(1337 + writer_id);
             std::uniform_int_distribution<int> key_dist(writer_id * 100000, writer_id * 100000 + config.key_space - 1);
             while (!stop.load(std::memory_order_acquire)) {
@@ -105,18 +108,18 @@ BenchmarkResult run_benchmark_capture(const BenchmarkConfig& config) {
                     std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count(),
                     std::memory_order_relaxed);
             }
-        });
+            }));
     }
 
     for (int reader_id = 0; reader_id < config.reader_count; ++reader_id) {
-        threads.emplace_back([&store, &stop, &read_ops, &config, reader_id]() {
+        threads.emplace_back(thread_failures.guard([&store, &stop, &read_ops, &config, reader_id]() {
             std::mt19937 gen(4242 + reader_id);
             std::uniform_int_distribution<int> key_dist(0, config.writer_count * 100000 + config.key_space - 1);
             while (!stop.load(std::memory_order_acquire)) {
                 (void)store.Get(key_dist(gen));
                 read_ops.fetch_add(1, std::memory_order_relaxed);
             }
-        });
+        }));
     }
 
     const auto start = std::chrono::steady_clock::now();
@@ -126,6 +129,7 @@ BenchmarkResult run_benchmark_capture(const BenchmarkConfig& config) {
     for (auto& thread : threads) {
         thread.join();
     }
+    thread_failures.rethrow_first();
 
     const auto end = std::chrono::steady_clock::now();
     BenchmarkResult result;

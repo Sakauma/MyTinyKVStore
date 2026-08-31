@@ -8,11 +8,11 @@ duration_seconds="${2:-1}"
 
 mkdir -p "$output_dir"
 
-cmake -S "$repo_root" -B "$repo_root/build"
-cmake --build "$repo_root/build"
+cmake -S "$repo_root" -B "$repo_root/build-release" -DCMAKE_BUILD_TYPE=Release
+cmake --build "$repo_root/build-release" --parallel
 
 profiles=(balanced write-heavy compaction-heavy recovery-heavy)
 for profile in "${profiles[@]}"; do
-  "$repo_root/build/target/bin/kv_test" concurrency-stress-json "$duration_seconds" "$profile" \
+  "$repo_root/build-release/target/bin/kv_test" concurrency-stress-json "$duration_seconds" "$profile" \
     > "$output_dir/$profile.json"
 done

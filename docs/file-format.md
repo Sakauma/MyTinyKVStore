@@ -1,90 +1,131 @@
-# Disk Format Specification
+# 单文件格式
 
-## Overview
+## 适用范围
 
-当前磁盘布局由两部分组成：
+运行库只创建和读取当前单文件格式。历史格式实现已经归档；运行库不会读取、隐式迁移或原地覆盖历史数据。
 
-- 快照文件：`<db_path>`
-- 预写日志：`<db_path>.wal`
+当前格式面向 Linux/WSL POSIX 文件系统。实现把 packed C++ 结构按本机小端序写盘，因此正式支持范围是常见的 little-endian Linux ABI；它不是跨大端机器的交换格式。
 
-启动时按“快照 -> WAL”顺序恢复。快照代表最近一次 compaction 后的完整状态，WAL 代表其后的增量更新。
+## 文件布局
 
-## Snapshot File
+```text
+0                 4096              8192
++-----------------+-----------------+-------------------------+
+| superblock A    | superblock B    | checkpoint index        |
++-----------------+-----------------+-------------------------+
+                                    | checkpoint objects      |
+                                    +-------------------------+
+                                    | journal frame 1         |
+                                    | journal frame 2 ...     |
+                                    +-------------------------+
+```
 
-### Header
+- 两个 superblock 各占 4096 字节，结构内容带 CRC32C。
+- `index_offset/index_length` 指向 checkpoint index。
+- `object_offset/object_length` 指向连续 value 对象区。
+- `journal_offset` 指向追加事务日志的起点。
+- 稳态恢复只依赖这一个主文件。Compaction 可以短暂创建临时文件。
 
-- `magic[8]`: 固定为 `KVSNAP01`
-- `version`: 当前为 `2`
-- `reserved`: 保留字段，当前写入 `0`
+## Superblock
 
-### Entry Layout
+`Superblock` 的有效结构为 120 字节，其余 block 字节清零。主要字段：
 
-每条快照记录按以下顺序编码：
+| 字段 | 含义 |
+| --- | --- |
+| `magic` | `MTKV0003` |
+| `version` | `3` |
+| `generation` | 每次成功 compaction 递增 |
+| `checkpoint_lsn` | checkpoint 对应的切点 LSN |
+| `index_*` / `object_*` / `journal_offset` | 区域边界 |
+| `checkpoint_checksum` | index 与 object 区串联计算的 CRC32C |
+| `checksum` | superblock 结构自身 CRC32C |
 
-- `entry_magic`: 固定值 `0x4B565345`
-- `key_size`: `uint32_t`
-- `value_size`: `uint32_t`
-- `key_bytes[key_size]`
-- `value_bytes[value_size]`
+打开文件时分别校验两个副本，选择有效副本中 generation 最大者。两个副本都无效时拒绝打开；只有一个有效时运行时可以恢复，但 `verify-format` 返回 degraded 状态。
 
-`key_bytes` 是内部规范化键：
+所有区域边界在任何读取和分配之前检查：文件范围、加法溢出、平台 `off_t` 上限和格式上限都必须成立。
 
-- `0x01 + 4字节 big-endian int32`：兼容 `int` 键 API
-- `0x02 + 原始 UTF-8 / 字节串`：`std::string` 键 API
+## Checkpoint index 与对象区
 
-### Validation Rules
+Index 以 32 字节 `IndexHeader` 开始：
 
-- `magic` 不匹配时拒绝加载。
-- `version` 不支持时拒绝加载。
-- entry header 或 value 数据截断时拒绝加载。
+- magic/version
+- entry count
+- entry bytes
+- 全部 entry bytes 的 CRC32C
+- header CRC32C
 
-## WAL File
+每个 index entry 使用 32 字节 `IndexEntryHeader`，随后紧跟规范化 key 字节。Header 记录：
 
-### Record Header
+- key 长度
+- value 在 object 区内的相对 offset
+- value 长度
+- value CRC32C
+- entry header + key CRC32C
 
-每条 WAL 记录头按以下顺序编码：
+对象区只连续保存 value 字节。内存索引恢复后保存绝对文件 offset、长度和 checksum；value 不要求常驻内存。
 
-- `magic`: 固定值 `0x4B565741`
-- `version`: 当前为 `2`
-- `type`: `1=Put`, `2=Delete`
-- `reserved`: 保留字段，当前写入 `0`
-- `key_size`: `uint32_t`
-- `value_size`: `uint32_t`
-- `checksum`: 基于 `type + key + value_size + payload` 的 FNV-1a 校验
+恢复 checkpoint 时，解析器按 entry 流式读取并校验对象，不把整个 object 区一次性分配进内存。Compaction 同样只快照 key 和 backing reference，再按块从旧 inode 流式复制 value。
 
-### Payload
+## Journal transaction frame
 
-- `Put`: 追加 `key_size` 字节的 key payload 和 `value_size` 字节的 value payload
-- `Delete`: 追加 `key_size` 字节的 key payload，`value_size` 必须为 `0`
+每次隐式或显式事务编码成一个 frame：
 
-### Validation Rules
+```text
++----------------------+----------------------+----------------------+
+| FrameHeader (44B)    | mutation payload     | FrameFooter (32B)    |
++----------------------+----------------------+----------------------+
+```
 
-- `magic`、`version`、`type` 非法时拒绝加载。
-- payload 截断且位于文件尾部时按崩溃尾巴忽略。
-- checksum 不匹配时拒绝加载。
+Frame header 包含：
 
-## Compatibility Policy
+- magic/version/header size
+- frame 总长度
+- 严格递增 LSN
+- operation count
+- payload CRC32C
+- header CRC32C
 
-- 当前写入的 snapshot / WAL 版本均为 `2`。
-- 运行时保留对版本 `1` 整型键格式的读取兼容，重写或 compact 后会升级到版本 `2`。
-- 不支持的版本会直接抛出 `KVStoreError`，不会尝试静默兼容。
-- 推荐的升级流程是先用当前程序检查格式，再执行一次 `Compact()` 以重写快照和清空 WAL。
+Payload 由 `MutationHeader (20B) + key + value` 顺序组成。Mutation 支持 `put` 和 `delete`，每条记录也有独立 CRC32C。Delete 的 value 长度必须为零。
 
-## Operational Tools
+Commit footer 重复 LSN、frame 总长度和 payload checksum，并带自身 CRC32C。只有 header、payload、全部 mutation 和 footer 都完整且匹配的 frame 才会被应用。
 
-- `./build/target/bin/kv_test inspect-format <db_path>`：打印快照/WAL 的版本、记录数量、键类型分布，以及 `rewrite_recommended` 建议位。
-- `./build/target/bin/kv_test rewrite-format <db_path>`：加载数据库并执行一次 `Compact()`，将数据重写为当前格式。
-- `./build/target/bin/kv_test verify-format <db_path>`：执行检查并返回机器可判定的状态码；若仍建议重写或检测到截断/损坏信号则返回非零。
+`WriteBatch` 与显式事务只产生一个 frame，因此恢复结果只能是全部操作出现或全部消失。一个 group commit 可以在同一次 `pwritev/fdatasync` 中写多个 frame，但 frame 仍保持独立事务边界和严格 LSN 顺序。
 
-### `inspect-format` Output Highlights
+## 恢复规则
 
-- `snapshot_entries` / `wal_records`：分别表示快照和 WAL 中可解析到的记录数量。
-- `snapshot_int_keys` / `snapshot_string_keys` / `snapshot_binary_keys`：快照中的键类型分布。
-- `wal_int_keys` / `wal_string_keys` / `wal_binary_keys`：WAL 中的键类型分布。
-- `rewrite_recommended=1`：通常表示检测到旧版本格式、截断 WAL 或其它不属于当前稳定格式的情况，建议执行一次 `rewrite-format`。
+1. 读取并选择 superblock。
+2. 验证全部 checkpoint checksum 和 index/object 边界。
+3. 把 checkpoint 条目应用为 `checkpoint_lsn` 状态。
+4. 从 `journal_offset` 起按严格递增 LSN 解析 frame。
+5. 文件末尾不足一个完整 frame 时视为未确认尾帧；读写打开会把文件截断到最后一个完整 frame。
+6. 完整 frame checksum 失败、commit footer 失败、中段损坏、重复或倒退 LSN 时拒绝打开。
 
-### `verify-format` Exit Codes
+`inspect-format` 只读且不会修复尾部；`verify-format` 因截断尾部、单 superblock 或任意损坏返回非零。运行时读写打开允许修复可识别的不完整最终尾帧。
 
-- `0`：格式检查通过，当前数据已处于当前受支持布局。
-- `2`：格式仍建议重写，或检测到截断/损坏信号，不应视为当前稳定布局。
-- 其它非零值：底层 `inspect-format` 失败，例如文件不存在或头部无法读取。
+## 格式上限
+
+| 项目 | 上限 |
+| --- | ---: |
+| 编码 key | 1 MiB |
+| 单 value | 64 MiB |
+| 单事务 payload | 256 MiB |
+| checkpoint index | 4 GiB |
+
+Operation count 还必须能够由实际 payload 容纳，禁止先按伪造 count 执行巨量 `reserve`。所有 value 分配都发生在长度和文件范围验证之后。
+
+## Compaction 切换
+
+1. 在 commit mutex 下记录 `start_lsn` 和旧文件 `start_offset`。
+2. 逐 shard 捕获 live key 的 backing reference，并在临时文件中流式生成 checkpoint。
+3. 对复制的每个 value 再算 CRC32C，生成并校验新 checkpoint checksum。
+4. 最终持有 commit mutex，复制 `[start_offset, end_offset)` journal delta，`fdatasync` 临时文件。
+5. 临时文件先持有独占锁，再 `rename` 到主路径；运行时立即切换到新 fd 并重定位全部 live offset。
+6. 同步父目录后释放提交暂停。
+
+临时文件不参与恢复。任意崩溃点只能留下旧主文件或已经自包含的新主文件。
+
+## 相关实现
+
+- [storage_format.h](../src/internal/storage_format.h)
+- [storage_format.cpp](../src/internal/storage_format.cpp)
+- [storage_engine.cpp](../src/internal/storage_engine.cpp)

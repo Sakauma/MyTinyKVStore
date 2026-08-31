@@ -173,6 +173,28 @@ BenchmarkBaselineComparison compare_benchmark_baseline(
     return result;
 }
 
+QualificationBenchmarkComparison compare_qualification_benchmark(
+    const std::string& baseline_path,
+    const std::string& candidate_path,
+    double min_write_throughput_ratio_pct,
+    double max_write_p99_ratio_pct) {
+    const std::string baseline_json = read_text_file(baseline_path);
+    const std::string candidate_json = read_text_file(candidate_path);
+    const double baseline_write_ops = extract_json_number(baseline_json, "median_write_ops_per_s");
+    const double candidate_write_ops = extract_json_number(candidate_json, "median_write_ops_per_s");
+    const double baseline_p99 = extract_json_number(baseline_json, "median_write_p99_us");
+    const double candidate_p99 = extract_json_number(candidate_json, "median_write_p99_us");
+    require(baseline_write_ops > 0.0, "qualification baseline write throughput must be positive");
+    require(baseline_p99 > 0.0, "qualification baseline p99 must be positive");
+
+    QualificationBenchmarkComparison result;
+    result.write_throughput_ratio_pct = (candidate_write_ops / baseline_write_ops) * 100.0;
+    result.write_p99_ratio_pct = (candidate_p99 / baseline_p99) * 100.0;
+    result.pass = result.write_throughput_ratio_pct >= min_write_throughput_ratio_pct &&
+                  result.write_p99_ratio_pct <= max_write_p99_ratio_pct;
+    return result;
+}
+
 std::vector<MicrobenchComparisonResult> compare_microbench(
     const std::string& baseline_path,
     const std::string& candidate_path,

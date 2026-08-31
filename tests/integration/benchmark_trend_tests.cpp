@@ -80,6 +80,15 @@ std::string benchmark_summary_json(
     return out.str();
 }
 
+std::string qualification_summary_json(double write_ops_per_s, double write_p99_us) {
+    std::ostringstream out;
+    out << '{'
+        << "\"median_write_ops_per_s\":" << write_ops_per_s
+        << ",\"median_write_p99_us\":" << write_p99_us
+        << '}';
+    return out.str();
+}
+
 std::string microbench_results_json(
     std::initializer_list<std::tuple<const char*, double, uint64_t, uint64_t>> cases) {
     std::ostringstream out;
@@ -176,6 +185,25 @@ void test_compare_benchmark_baseline_rejects_regression() {
 
     const int status = run_compare_benchmark_baseline_entrypoint(baseline_path, candidate_path);
     require(status == 2, "compare-baseline should reject throughput/latency regressions beyond thresholds");
+}
+
+void test_qualification_gate_enforces_throughput_and_p99() {
+    TestDir dir("qualification_gate");
+    const std::string baseline_path = dir.file("baseline.json");
+    const std::string passing_path = dir.file("passing.json");
+    const std::string slow_path = dir.file("slow.json");
+    const std::string latent_path = dir.file("latent.json");
+    write_text_file(baseline_path, qualification_summary_json(1000.0, 1000.0));
+    write_text_file(passing_path, qualification_summary_json(2100.0, 1150.0));
+    write_text_file(slow_path, qualification_summary_json(1900.0, 1100.0));
+    write_text_file(latent_path, qualification_summary_json(2200.0, 1250.0));
+
+    require(run_compare_qualification_benchmark_entrypoint(baseline_path, passing_path) == 0,
+            "qualification gate should accept at least 2x throughput with bounded p99");
+    require(run_compare_qualification_benchmark_entrypoint(baseline_path, slow_path) == 2,
+            "qualification gate should reject less than 2x write throughput");
+    require(run_compare_qualification_benchmark_entrypoint(baseline_path, latent_path) == 2,
+            "qualification gate should reject p99 degradation above 20 percent");
 }
 
 void test_compare_microbench_passes_within_thresholds() {
@@ -331,6 +359,8 @@ void register_benchmark_trend_tests(TestCases& tests) {
                      test_compare_benchmark_baseline_passes_within_thresholds});
     tests.push_back({"compare benchmark baseline rejects regression",
                      test_compare_benchmark_baseline_rejects_regression});
+    tests.push_back({"qualification gate enforces throughput and p99",
+                     test_qualification_gate_enforces_throughput_and_p99});
     tests.push_back({"benchmark trend summarizes history", test_benchmark_trend_summarizes_history});
     tests.push_back({"microbench trend summarizes history", test_microbench_trend_summarizes_history});
 }

@@ -10,6 +10,7 @@ namespace {
 
 using namespace kvstore::internal;
 using test_support::require;
+using test_support::ThreadFailureCollector;
 
 void test_wait_for_queue_activity_records_metrics() {
     std::mutex mutex;
@@ -17,20 +18,22 @@ void test_wait_for_queue_activity_records_metrics() {
     std::atomic<uint64_t> wait_events {0};
     std::atomic<uint64_t> wait_time_us {0};
     bool ready = false;
+    ThreadFailureCollector thread_failures;
 
-    std::thread notifier([&]() {
+    std::thread notifier(thread_failures.guard([&]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         {
             std::lock_guard<std::mutex> lock(mutex);
             ready = true;
         }
         cv.notify_one();
-    });
+    }));
 
     std::unique_lock<std::mutex> lock(mutex);
     wait_for_queue_activity(cv, wait_events, wait_time_us, lock, [&]() { return ready; });
     lock.unlock();
     notifier.join();
+    thread_failures.rethrow_first();
 
     require(wait_events.load(std::memory_order_relaxed) == 1, "writer wait should count wait events");
     require(wait_time_us.load(std::memory_order_relaxed) > 0, "writer wait should accumulate wait time");

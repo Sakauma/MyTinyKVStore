@@ -6,6 +6,6 @@ if [[ $# -ne 1 ]]; then
   exit 1
 fi
 
-cmake -S . -B build
-cmake --build build
-./build/target/bin/kv_test inspect-format "$1"
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release --parallel
+./build-release/target/bin/kv_test inspect-format "$1"

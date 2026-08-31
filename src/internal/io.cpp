@@ -1,4 +1,3 @@
-#include "format.h"
 #include "io.h"
 
 #include <cerrno>
@@ -52,12 +51,19 @@ void write_all(int fd, const void* buffer, size_t size) {
         if (nwritten < 0) {
             throw KVStoreError("Write failed: " + std::string(std::strerror(errno)));
         }
+        if (nwritten == 0) {
+            throw KVStoreError("Write made no progress");
+        }
         total += static_cast<size_t>(nwritten);
     }
 }
 
 void fsync_file(int fd, const std::string& path) {
-    if (::fsync(fd) != 0) {
+    int result;
+    do {
+        result = ::fsync(fd);
+    } while (result != 0 && errno == EINTR);
+    if (result != 0) {
         throw io_error("fsync", path);
     }
 }
@@ -66,11 +72,18 @@ void fsync_directory(const std::string& path) {
     const std::filesystem::path file_path(path);
     const std::filesystem::path parent =
         file_path.has_parent_path() ? file_path.parent_path() : std::filesystem::current_path();
-    const int dir_fd = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY);
+    int dir_fd;
+    do {
+        dir_fd = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    } while (dir_fd < 0 && errno == EINTR);
     if (dir_fd < 0) {
         throw io_error("open directory", parent.string());
     }
-    if (::fsync(dir_fd) != 0) {
+    int sync_result;
+    do {
+        sync_result = ::fsync(dir_fd);
+    } while (sync_result != 0 && errno == EINTR);
+    if (sync_result != 0) {
         const int saved_errno = errno;
         ::close(dir_fd);
         errno = saved_errno;
@@ -80,7 +93,10 @@ void fsync_directory(const std::string& path) {
 }
 
 int open_or_throw(const std::string& path, int flags, mode_t mode) {
-    const int fd = ::open(path.c_str(), flags, mode);
+    int fd;
+    do {
+        fd = ::open(path.c_str(), flags, mode);
+    } while (fd < 0 && errno == EINTR);
     if (fd < 0) {
         throw io_error("open", path);
     }
@@ -93,15 +109,23 @@ void close_if_open(int fd) {
     }
 }
 
-void maybe_trigger_failpoint(const char* name) {
+bool failpoint_is_configured(const char* name) {
     const char* configured = std::getenv("KVSTORE_FAILPOINT");
-    if (configured == nullptr || std::strcmp(configured, name) != 0) {
+    return configured != nullptr && std::strcmp(configured, name) == 0;
+}
+
+void maybe_trigger_failpoint(const char* name) {
+    if (!failpoint_is_configured(name)) {
         return;
     }
 
     const char* action = std::getenv("KVSTORE_FAIL_ACTION");
     if (action != nullptr && std::strcmp(action, "throw") == 0) {
         throw KVStoreError(std::string("Injected failpoint: ") + name);
+    }
+    if (action != nullptr && std::strcmp(action, "enospc") == 0) {
+        errno = ENOSPC;
+        throw io_error(std::string("Injected I/O failure at ") + name, "database");
     }
 
     ::_exit(86);

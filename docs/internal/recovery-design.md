@@ -1,37 +1,27 @@
-# Recovery Design
+# 恢复设计
 
-## Scope
+## 入口
 
-恢复层负责把“快照 + WAL”重新组装成内存状态，并为 rewrite / compatibility 提供稳定基础。
+- [storage_format.cpp](../../src/internal/storage_format.cpp)：共享只读解析器和尾部修复。
+- [storage_engine.cpp](../../src/internal/storage_engine.cpp)：把解析结果装入 shard index。
+- [format_analysis.cpp](../../tests/common/format_analysis.cpp)：CLI inspect/verify 直接消费同一解析器。
 
-当前核心入口仍在 [src/kvstore.cpp](/home/sakauma/code/lpue/src/kvstore.cpp)：
+## 顺序
 
-- `ensure_snapshot_exists`
-- `load_snapshot`
-- `replay_wal`
-- `current_wal_file_size`
+1. `fstat` 文件大小。
+2. 校验双 superblock，选择最高有效 generation。
+3. 验证所有区域边界和 checkpoint CRC32C。
+4. 流式读取 index/object 条目，建立 offset index。
+5. 从 `journal_offset` 起解析严格递增 LSN frame。
+6. 只应用 header/payload/mutation/footer 全部通过的事务。
+7. 读写打开时截断可识别的不完整最终 frame。
 
-## Recovery Order
+## 不变量
 
-1. 确保 snapshot 文件存在
-2. 加载 snapshot 到内存状态
-3. 顺序重放 WAL
-4. 重新打开 WAL append 句柄
+- 任何磁盘长度都先验证再分配。
+- Operation count 必须能由 payload 的最小 mutation 尺寸容纳。
+- 完整损坏与不完整尾部严格区分；完整损坏不能跳过。
+- `WriteBatch` 和显式事务按 frame 原子重放。
+- Runtime 与 verifier 不维护两套校验规则。
 
-## Owned Responsibilities
-
-- 检查 snapshot / WAL 版本与 magic
-- 识别截断尾部与 checksum 错误
-- 将 legacy v1 数据映射到当前内存 key 编码
-- 在 rewrite 后收敛回当前布局
-
-## Invariants
-
-- 快照始终被视为“较旧但完整”的基线。
-- WAL 是最近已提交状态的补丁层。
-- 截断 WAL 尾部可以在恢复时忽略，但 `verify-format` 仍会要求 rewrite。
-
-## Design Rule
-
-- 恢复层只能重建状态，不能擅自调整 writer 策略。
-- 任何新增格式版本都必须先补恢复路径，再开放写入。
+恢复路径只识别当前格式；历史恢复实现已经归档，不参与运行库构造路径。

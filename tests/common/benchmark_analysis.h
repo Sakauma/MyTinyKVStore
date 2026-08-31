@@ -18,6 +18,12 @@ struct BenchmarkBaselineComparison {
     bool pass = false;
 };
 
+struct QualificationBenchmarkComparison {
+    double write_throughput_ratio_pct = 0.0;
+    double write_p99_ratio_pct = 0.0;
+    bool pass = false;
+};
+
 struct MicrobenchComparisonResult {
     std::string name;
     double ops_ratio_pct = 0.0;
@@ -77,6 +83,12 @@ BenchmarkBaselineComparison compare_benchmark_baseline(
     double max_p99_latency_ratio_pct,
     double max_fsync_pressure_ratio_pct,
     double min_batch_fill_ratio_pct);
+
+QualificationBenchmarkComparison compare_qualification_benchmark(
+    const std::string& baseline_path,
+    const std::string& candidate_path,
+    double min_write_throughput_ratio_pct,
+    double max_write_p99_ratio_pct);
 
 std::vector<MicrobenchComparisonResult> compare_microbench(
     const std::string& baseline_path,

@@ -2,6 +2,8 @@
 
 #include "tests/common/benchmark_entrypoints.h"
 #include "tests/common/cli_entrypoints.h"
+#include "tests/common/qualification_benchmark.h"
+#include "tests/common/qualification_soak.h"
 #include "tests/common/runtime_entrypoints.h"
 #include "tests/integration/test_registry.h"
 
@@ -16,8 +18,8 @@ void print_usage() {
         << "Usage: kv_test "
         << "[bench|microbench|microbench-json|bench-json|bench-baseline-json|compare-microbench|compare-baseline|"
         << "trend-baselines|trend-baselines-json|trend-microbench|trend-microbench-json|profile-json|soak|"
-        << "concurrency-stress|concurrency-stress-json|inspect-format|rewrite-format|verify-format|compat-matrix|"
-        << "fault-inject]"
+        << "concurrency-stress|concurrency-stress-json|inspect-format|rewrite-format|verify-format|"
+        << "qualification-bench-json|qualification-soak-json|compare-qualification|fault-inject]"
         << std::endl;
 }
 
@@ -41,6 +43,52 @@ int run_cli_command(int argc, char* argv[]) {
     if (command == "bench-baseline-json") {
         run_benchmark_baseline_json_command();
         return 0;
+    }
+    if (command == "qualification-bench-json") {
+        if (argc > 9) {
+            std::cerr << "Usage: kv_test qualification-bench-json "
+                      << "[prefill_keys operations writers value_bytes rounds uniform|hotspot compaction_on|off]"
+                      << std::endl;
+            return 1;
+        }
+        const uint64_t prefill_keys = argc > 2 ? std::stoull(argv[2]) : 1000000ULL;
+        const uint64_t operations = argc > 3 ? std::stoull(argv[3]) : 10000000ULL;
+        const size_t writers = argc > 4 ? static_cast<size_t>(std::stoull(argv[4])) : 16;
+        const size_t value_bytes = argc > 5 ? static_cast<size_t>(std::stoull(argv[5])) : 256;
+        const size_t rounds = argc > 6 ? static_cast<size_t>(std::stoull(argv[6])) : 3;
+        const std::string distribution = argc > 7 ? argv[7] : "uniform";
+        const std::string compaction = argc > 8 ? argv[8] : "off";
+        if (compaction != "on" && compaction != "off") {
+            std::cerr << "compaction must be on or off" << std::endl;
+            return 1;
+        }
+        return run_qualification_benchmark_json_entrypoint(
+            prefill_keys, operations, writers, value_bytes, rounds, distribution, compaction == "on");
+    }
+    if (command == "compare-qualification") {
+        if (argc < 4 || argc > 6) {
+            std::cerr << "Usage: kv_test compare-qualification <baseline_json> <candidate_json> "
+                      << "[min_write_throughput_ratio_pct max_write_p99_ratio_pct]" << std::endl;
+            return 1;
+        }
+        return run_compare_qualification_benchmark_entrypoint(
+            argv[2],
+            argv[3],
+            argc > 4 ? std::stod(argv[4]) : 200.0,
+            argc > 5 ? std::stod(argv[5]) : 120.0);
+    }
+    if (command == "qualification-soak-json") {
+        if (argc < 3 || argc > 7) {
+            std::cerr << "Usage: kv_test qualification-soak-json <db_path> "
+                      << "[minimum_duration_seconds required_unique_keys writers value_bytes]" << std::endl;
+            return 1;
+        }
+        return run_qualification_soak_json_entrypoint(
+            argv[2],
+            argc > 3 ? std::stoull(argv[3]) : 43200ULL,
+            argc > 4 ? std::stoull(argv[4]) : 10000000ULL,
+            argc > 5 ? static_cast<size_t>(std::stoull(argv[5])) : 16,
+            argc > 6 ? static_cast<size_t>(std::stoull(argv[6])) : 256);
     }
     if (command == "compare-microbench") {
         if (argc < 4 || argc > 8) {
@@ -151,9 +199,6 @@ int run_cli_command(int argc, char* argv[]) {
             return 1;
         }
         return run_verify_format(argv[2]);
-    }
-    if (command == "compat-matrix") {
-        return run_compatibility_matrix();
     }
     if (command == "fault-inject") {
         if (argc != 4) {

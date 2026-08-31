@@ -1,43 +1,24 @@
-# Advanced Semantics Decision
+# 高级语义决策
 
-## Conclusion
+## 当前结论
 
-当前阶段不进入事务实现，也不进入快照读实现。
+早期“暂缓事务”的决定已经被当前实现取代。当前正式语义是：
 
-## D1: Transaction Readiness Review
+- 提供显式 move-only `KVTransaction`。
+- 使用 shard-version OCC，提交时提供可串行化验证。
+- 支持 read-your-writes、只读 commit 验证和 rollback。
+- 不提供 MVCC snapshot read，也不提供事务内 `Scan`。
 
-结论：继续停留在 `WriteBatch`，暂缓事务。
+## 为什么实现事务
 
-原因：
+单靠 `WriteBatch` 无法表达“先读、根据结果写、提交时检测冲突”的场景。当前 transaction frame 已具备明确事务边界，ordered coordinator 也能在分配 LSN 和写盘前完成版本验证，因此最小 OCC 事务可以复用同一持久化路径，而不引入第二套日志协议。
 
-- 当前内核已经有单 writer 串行提交和 `WriteBatch` 原子边界，足以覆盖“多操作一起提交”的主要需求。
-- 一旦引入事务，就会把 WAL 格式、恢复语义、错误模型和内存版本管理一起复杂化。
-- 目前更值得投入的方向仍然是控制器稳定性、长期负载验证和后续性能治理。
+## 为什么仍不实现 MVCC
 
-进入事务实现前，至少应额外满足：
+- 当前 entry 只保留最新 LSN 和 value offset，不保留历史版本链。
+- 长期 snapshot 会要求 compaction 保留被引用的旧对象或增加版本重写协议。
+- 当前字符串 `Scan` 通过全 shard 共享锁提供短期一致视图，适合管理操作，但不是长期 snapshot 句柄。
 
-- 明确的用户场景，必须依赖 `Commit/Abort`
-- 事务日志格式和恢复语义单独成文
-- compaction 与事务边界的交互方案明确
+只有明确出现历史时点查询、长期非阻塞范围读或跨 compaction snapshot 生命周期需求时，才重新评估 MVCC。
 
-## D2: Snapshot Read Review
-
-结论：暂缓快照读。
-
-原因：
-
-- 当前 `Get` / `Scan` 已能提供已提交状态读取，但不保留历史版本。
-- 真正的快照读会引入版本保留、内存放大和 compaction 协调成本。
-- 现阶段仓库的主要价值仍然在“可靠单 writer + 可观测高并发写路径”，不是 MVCC 能力。
-
-只有在下面场景明确出现时，才值得重新评估：
-
-- 需要长时间稳定读视图
-- 需要读写隔离而不阻塞后台写入
-- 范围扫描必须绑定某个已提交版本
-
-## Current Guidance
-
-- 需要原子多操作提交：用 `WriteBatch`
-- 需要格式或恢复稳定性：优先继续补格式治理和长期验证
-- 需要更复杂读写语义：先补场景说明，再决定是否进入事务 / 快照读实现
+详细规则见[事务边界](transaction-boundary.md)。

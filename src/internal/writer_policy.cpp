@@ -1,7 +1,7 @@
 #include "writer_policy.h"
 
-#include "format.h"
 #include "metrics_helpers.h"
+#include "storage_format.h"
 
 #include <algorithm>
 
@@ -147,7 +147,7 @@ BatchPolicy compute_batch_policy(const KVStoreOptions& options, const WriterPoli
         policy.max_batch_size = std::max<size_t>(1, policy.max_batch_size / options.adaptive_read_heavy_batch_size_divisor);
         if (policy.max_batch_wal_bytes > 0) {
             policy.max_batch_wal_bytes =
-                std::max<uint64_t>(sizeof(WalRecordHeader), policy.max_batch_wal_bytes / options.adaptive_read_heavy_batch_size_divisor);
+                std::max<uint64_t>(sizeof(MutationHeader), policy.max_batch_wal_bytes / options.adaptive_read_heavy_batch_size_divisor);
         }
     }
 

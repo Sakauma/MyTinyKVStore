@@ -1,41 +1,31 @@
-# Writer Design
+# 写路径设计
 
-## Scope
+## 模块
 
-writer 层负责运行时写入调度，是当前内核里唯一能串行修改持久化状态的路径。
+主要实现位于 [storage_engine.cpp](../../src/internal/storage_engine.cpp)：
 
-当前 writer 主入口仍在 [src/kvstore.cpp](/home/sakauma/code/lpue/src/kvstore.cpp)，但运行时职责已经拆成四块：
+- bounded raw queue：生产者背压和请求序号。
+- worker pool：并行 payload 校验与序列化。
+- prepared map：容纳乱序完成的准备结果。
+- ordered coordinator：OCC 验证、LSN、group write/sync、状态发布。
+- shard state：点查哈希索引、字符串有序索引、LRU 和版本。
 
-- `writer_policy`：基于 queue / latency / fsync / recent-window 信号计算 `BatchPolicy`
-- `writer_wait`：统一记录 queue wait event 和 wait time
-- `request_runtime`：负责请求入队、完成、fatal-state 传播
-- `writer_execution`：负责 batch 收集、WAL append、apply、compaction 执行
+活动运行时所有权集中在 `StorageEngine::Impl`。历史 writer 原型已经归档，不参与默认构建或测试。
 
-## Ownership
+## 不变量
 
-- `KVStore::Impl`
-  - 拥有 queue、writer thread、state、WAL fd 和所有 metrics/state atomics
-  - 负责线程启动/收尾、public API glue、异常分派
-- `request_runtime`
-  - 只处理请求生命周期，不拥有持久化状态
-- `writer_execution`
-  - 只执行串行写路径，不拥有 queue 生命周期
+- 公开写 API 不直接修改文件或内存索引。
+- 请求序号决定 coordinator 处理顺序。
+- LSN 只分配给通过验证且实际写 journal 的事务。
+- `fdatasync` 成功先于 `kSync` 状态发布。
+- 多 shard 锁按 ID 排序。
+- Group commit 聚合多个 frame，不合并事务边界。
+- Compaction 与 coordinator 通过 `commit_mutex_` 协调最终 delta 和 inode 切换。
 
-## State Boundaries
+## 背压
 
-- `queue_mutex_`：保护请求队列和 writer 唤醒
-- `state_mutex_`：保护内存态 `state_`
-- writer 线程：唯一允许顺序修改 WAL / snapshot 的执行点
+Raw queue 默认容量 4096。队列满时 `submit_and_wait` 等待 `raw_not_full_`，不会丢弃或返回伪成功。Worker 数默认由硬件并发确定并限制为 32。
 
-## Invariants
+## 错误
 
-- 公开写 API 不直接改磁盘，只入队并等待结果
-- WAL 持久化先于内存提交可见
-- compaction 仍然在 writer 串行路径中执行，不能绕开全局提交顺序
-
-## Design Rule
-
-- 任何新写语义都必须先判断是否需要进入 writer 队列
-- 不允许在 reader 路径上直接触发磁盘写入
-- 若后续继续拆模块，优先继续把 `writer_loop` 中的分支编排抽成 helper，而不是把执行细节重新塞回主循环
-- request lifecycle、wait metrics、execution 三层都必须保持无状态 helper 形态，避免制造第二层内部状态所有权
+Worker 的单请求序列化错误只完成该请求；journal write/sync、状态不变量、读 backing 或 compaction I/O 错误进入全局 sticky fatal。第一条根因在发布 fatal 标志前写入，避免并发调用看到空错误。

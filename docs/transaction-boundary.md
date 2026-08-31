@@ -1,50 +1,93 @@
-# Transaction and Snapshot Read Boundary
+# 显式事务与 OCC 边界
 
-## Current Baseline
+## 接口
 
-- 当前提交单元是单次公开 API 调用：`Put`、`Delete`、`WriteBatch`。
-- `WriteBatch` 已经提供“单调用内多操作原子提交”，但不跨多个调用扩展。
-- 当前读取模型是“已提交内存状态视图”，不是 MVCC，也不是可长期持有的快照。
+```cpp
+auto tx = store.BeginTransaction();
+auto value = tx.Get(1);
+tx.Put(1, new_value);
+tx.Delete(std::string("old"));
+tx.Commit();
+```
 
-## Transaction Scope Candidates
+`KVTransaction`：
 
-若后续实现事务，建议只评估下面这个最小范围：
+- 不可复制、可以移动。
+- 支持 int、string 和 binary `Get/Put/Delete`。
+- 支持 read-your-writes；同一 key 的最新暂存 mutation 优先于已提交状态。
+- `Rollback()` 丢弃全部暂存 mutation，且不写 journal。
+- 活动事务析构时自动 rollback。
+- `Commit()` 后事务失效，无论提交成功还是抛出冲突。
+- 暂不支持事务内 `Scan`。
 
-- 单 writer 内核上的显式事务边界：`Begin -> Put/Delete... -> Commit/Abort`
-- 事务提交仍以 WAL 持久化成功为准
-- 首版只支持一个活动写事务，不引入并发写事务调度
+## Shard-version OCC
 
-不建议第一版直接实现：
+事务第一次访问某个 shard 时记录该 shard 的版本：
 
-- 多写事务并发
-- 可配置隔离级别
-- 分布式事务
-- 长事务与后台 compaction 协调
+- `Get` 记录读取时版本和 value。
+- 首次 `Put/Delete` 也会观察目标 shard 版本，因此 blind write 仍参与冲突检测。
+- 后续访问同一 shard 必须基于同一记录版本。
 
-## Snapshot Read Candidates
+提交请求进入 ordered coordinator 后，会在写 journal 之前重新验证全部记录版本。版本不匹配时：
 
-若后续实现快照读，建议只评估下面这个最小范围：
+- 原子失败并抛出 `KVStoreConflictError`。
+- 不分配 LSN。
+- 不写 journal。
+- 不发布任何 mutation。
 
-- 只读快照句柄在创建时绑定一个已提交状态版本
-- `Get` / `Scan` 可基于该版本读取稳定视图
-- 快照生命周期不跨进程，不承诺崩溃后恢复
+验证成功的事务被编码为一个 transaction frame。涉及多个 shard 时按 shard ID 排序加锁，全部 mutation 应用后再释放。
 
-不建议第一版直接实现：
+## 隔离级别
 
-- 基于 WAL 回放的历史时点查询
-- 长生命周期 MVCC 版本链
-- 跨 compaction 的历史版本保留
+该模型提供可串行化 OCC：事务提交点由 coordinator 的全局顺序定义，读集和写集涉及的每个 shard 都在提交前重新验证。
 
-## Required Prerequisites
+冲突粒度是 shard，不是 key。因此两个事务即使访问同一 shard 上不同 key，也可能发生保守冲突。默认 256 shard 用于在冲突精度、锁数量和索引管理之间取平衡。
 
-在真正进入事务或快照读实现前，至少应先满足：
+### Lost update
 
-- 当前格式迁移策略稳定
-- 读写语义文档稳定
-- 格式验证和恢复矩阵稳定
-- 针对 writer 控制器已有长期压测基线
+两个事务读取同一 shard 版本后都更新该 shard，先提交者递增版本；后提交者验证失败，不会覆盖先提交者。
 
-## Decision Rule
+### Write skew
 
-- 如果目标只是“把多个操作作为一个提交单元”，优先继续使用 `WriteBatch`，不要过早引入事务框架。
-- 只有当用户场景明确需要 `Commit/Abort` 或稳定读视图时，才进入事务或快照读实现阶段。
+如果事务读取多个 shard 再写其中一部分，它仍记录全部读 shard。任一相关事务先改变其中一个版本，后提交事务就会失败，因此典型跨 shard write skew 不会同时提交。
+
+### 只读事务
+
+只读事务不会写 frame，但仍必须显式 `Commit()`。Coordinator 验证它观察过的全部 shard；如果期间发生变化，抛出 `KVStoreConflictError`。
+
+## 与隐式事务的关系
+
+- 单条 `Put/Delete` 是一个没有外部读集的隐式事务。
+- `WriteBatch` 是一个包含多条 mutation 的隐式事务。
+- 显式事务、隐式事务和 `Flush()` 共用同一请求序号和 ordered coordinator。
+- 同一 group 中前面的隐式写会更新虚拟 shard version，因此后面的显式事务可以在落盘前直接判定冲突。
+
+## 重试规则
+
+`KVStoreConflictError` 是可重试的业务并发结果；调用方必须新建事务并重新读取。`KVStoreError` 表示格式、I/O、生命周期或 sticky fatal 等运行错误，不能按普通 OCC 冲突盲目重试。
+
+推荐模式：
+
+```cpp
+for (;;) {
+    auto tx = store.BeginTransaction();
+    try {
+        auto current = tx.Get(1);
+        tx.Put(1, compute_next(current));
+        tx.Commit();
+        break;
+    } catch (const KVStoreConflictError&) {
+        // backoff, then start a fresh transaction
+    }
+}
+```
+
+## 当前不支持
+
+- 事务内范围扫描。
+- 保存点和嵌套事务。
+- 跨进程或分布式事务。
+- 长期 MVCC snapshot。
+- 用户可选隔离级别。
+
+持久化返回条件见[一致性与持久化语义](semantics.md)。

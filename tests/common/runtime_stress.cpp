@@ -6,6 +6,7 @@
 
 #include "kvstore.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -55,6 +56,43 @@ void run_failpoint_child(const std::string& scenario, const std::string& db_path
 
 int run_fault_injection_scenario(const std::string& scenario, const std::string& db_path) {
     ::setenv("KVSTORE_FAIL_ACTION", "crash", 1);
+
+    const std::map<std::string, std::string> frame_failpoints {
+        {"frame_before_write", "before_journal_write"},
+        {"frame_after_header", "after_frame_header_write"},
+        {"frame_after_payload", "after_frame_payload_write"},
+        {"frame_after_footer", "after_frame_footer_write"},
+        {"frame_before_sync", "before_journal_sync"},
+        {"frame_after_sync", "after_wal_fsync_before_apply"},
+    };
+    const auto frame_failpoint = frame_failpoints.find(scenario);
+    if (frame_failpoint != frame_failpoints.end()) {
+        KVStore store(db_path);
+        store.Put(1, text("stable"));
+        ::setenv("KVSTORE_FAILPOINT", frame_failpoint->second.c_str(), 1);
+        store.WriteBatch({
+            BatchWriteOperation::PutInt(2, text("batch-int")),
+            BatchWriteOperation::Put("batch-string", text("batch-string-value")),
+        });
+        return 7;
+    }
+
+    const std::map<std::string, std::string> compaction_failpoints {
+        {"compaction_after_checkpoint", "after_checkpoint_write_before_sync"},
+        {"compaction_before_temp_sync", "before_compaction_temp_sync"},
+        {"compaction_after_temp_sync", "after_compaction_temp_sync_before_rename"},
+        {"compaction_after_rename", "after_compaction_rename_before_directory_sync"},
+        {"compaction_after_directory_sync", "after_compaction_directory_sync"},
+    };
+    const auto compaction_failpoint = compaction_failpoints.find(scenario);
+    if (compaction_failpoint != compaction_failpoints.end()) {
+        KVStore store(db_path);
+        store.Put(11, text("eleven"));
+        store.Put(22, text("twenty-two"));
+        ::setenv("KVSTORE_FAILPOINT", compaction_failpoint->second.c_str(), 1);
+        store.Compact();
+        return 8;
+    }
 
     if (scenario == "wal_after_fsync") {
         KVStore store(db_path);
@@ -127,9 +165,10 @@ StressSummary run_concurrency_stress_capture(int duration_seconds, ConcurrencySt
         KVStore store(db_path, config.options);
         std::atomic<bool> stop {false};
         std::vector<std::thread> threads;
+        test_support::ThreadFailureCollector thread_failures;
 
         for (int writer_id = 0; writer_id < config.writer_count; ++writer_id) {
-            threads.emplace_back([&store,
+            threads.emplace_back(thread_failures.guard([&store,
                                   &stop,
                                   &config,
                                   &expected_by_writer,
@@ -199,11 +238,11 @@ StressSummary run_concurrency_stress_capture(int duration_seconds, ConcurrencySt
                         expected[static_cast<size_t>(local_key)] = value;
                     }
                 }
-            });
+            }));
         }
 
         for (int reader_id = 0; reader_id < config.reader_count; ++reader_id) {
-            threads.emplace_back([&store, &stop, total_keys, reader_id]() {
+            threads.emplace_back(thread_failures.guard([&store, &stop, total_keys, reader_id]() {
                 std::mt19937 gen(25000 + reader_id);
                 std::uniform_int_distribution<int> key_dist(0, total_keys - 1);
                 while (!stop.load(std::memory_order_acquire)) {
@@ -214,11 +253,11 @@ StressSummary run_concurrency_stress_capture(int duration_seconds, ConcurrencySt
                                 "concurrency stress readers should only observe complete values");
                     }
                 }
-            });
+            }));
         }
 
         for (int observer_id = 0; observer_id < config.metrics_reader_count; ++observer_id) {
-            threads.emplace_back([&store, &stop]() {
+            threads.emplace_back(thread_failures.guard([&store, &stop]() {
                 uint64_t last_enqueued = 0;
                 uint64_t last_committed = 0;
                 while (!stop.load(std::memory_order_acquire)) {
@@ -235,16 +274,16 @@ StressSummary run_concurrency_stress_capture(int duration_seconds, ConcurrencySt
                     last_committed = metrics.committed_write_requests;
                     std::this_thread::sleep_for(std::chrono::milliseconds(2));
                 }
-            });
+            }));
         }
 
         for (int compactor_id = 0; compactor_id < config.compactor_count; ++compactor_id) {
-            threads.emplace_back([&store, &stop, &config]() {
+            threads.emplace_back(thread_failures.guard([&store, &stop, &config]() {
                 while (!stop.load(std::memory_order_acquire)) {
                     store.Compact();
                     std::this_thread::sleep_for(std::chrono::milliseconds(config.compaction_interval_ms));
                 }
-            });
+            }));
         }
 
         std::this_thread::sleep_for(std::chrono::seconds(duration_seconds));
@@ -253,6 +292,7 @@ StressSummary run_concurrency_stress_capture(int duration_seconds, ConcurrencySt
         for (auto& thread : threads) {
             thread.join();
         }
+        thread_failures.rethrow_first();
 
         store.Compact();
         final_metrics = store.GetMetrics();
@@ -347,10 +387,13 @@ void run_soak_test(int duration_seconds, SoakProfile profile) {
     std::atomic<uint64_t> operation_sequence {0};
     std::map<int, std::pair<uint64_t, std::optional<std::string>>> oracle;
     std::mutex oracle_mutex;
+    std::array<std::mutex, 256> key_mutexes;
     std::vector<std::thread> threads;
+    test_support::ThreadFailureCollector thread_failures;
 
     for (int writer_id = 0; writer_id < config.writer_count; ++writer_id) {
-        threads.emplace_back([&store, &stop, &oracle, &oracle_mutex, &config, &operation_sequence, writer_id]() {
+        threads.emplace_back(thread_failures.guard(
+            [&store, &stop, &oracle, &oracle_mutex, &key_mutexes, &config, &operation_sequence, writer_id]() {
             std::mt19937 gen(9000 + writer_id);
             std::uniform_int_distribution<int> key_dist(0, config.key_space - 1);
             std::uniform_int_distribution<int> op_dist(0, 9);
@@ -358,9 +401,11 @@ void run_soak_test(int duration_seconds, SoakProfile profile) {
             while (!stop.load(std::memory_order_acquire)) {
                 const int key = key_dist(gen);
                 const bool do_delete = op_dist(gen) < 3;
-                const uint64_t seq = operation_sequence.fetch_add(1, std::memory_order_relaxed);
+                std::lock_guard<std::mutex> key_lock(
+                    key_mutexes[static_cast<size_t>(key) % key_mutexes.size()]);
                 if (do_delete) {
                     store.Delete(key);
+                    const uint64_t seq = operation_sequence.fetch_add(1, std::memory_order_relaxed);
                     std::lock_guard<std::mutex> lock(oracle_mutex);
                     auto& slot = oracle[key];
                     if (seq >= slot.first) {
@@ -371,6 +416,7 @@ void run_soak_test(int duration_seconds, SoakProfile profile) {
                         "value_" + std::to_string(writer_id) + "_" + std::to_string(key) + "_" +
                         std::to_string(version++);
                     store.Put(key, text(payload));
+                    const uint64_t seq = operation_sequence.fetch_add(1, std::memory_order_relaxed);
                     std::lock_guard<std::mutex> lock(oracle_mutex);
                     auto& slot = oracle[key];
                     if (seq >= slot.first) {
@@ -378,11 +424,11 @@ void run_soak_test(int duration_seconds, SoakProfile profile) {
                     }
                 }
             }
-        });
+            }));
     }
 
     for (int reader_id = 0; reader_id < config.reader_count; ++reader_id) {
-        threads.emplace_back([&store, &stop, &config, reader_id]() {
+        threads.emplace_back(thread_failures.guard([&store, &stop, &config, reader_id]() {
             std::mt19937 gen(12000 + reader_id);
             std::uniform_int_distribution<int> key_dist(0, config.key_space - 1);
             while (!stop.load(std::memory_order_acquire)) {
@@ -392,22 +438,26 @@ void run_soak_test(int duration_seconds, SoakProfile profile) {
                             "soak readers should only observe complete values");
                 }
             }
-        });
+        }));
     }
 
-    threads.emplace_back([&store, &stop, &config]() {
+    threads.emplace_back(thread_failures.guard([&store, &stop, &config]() {
         while (!stop.load(std::memory_order_acquire)) {
             store.Compact();
             std::this_thread::sleep_for(std::chrono::milliseconds(config.compaction_interval_ms));
         }
-    });
+    }));
 
-    std::this_thread::sleep_for(std::chrono::seconds(duration_seconds));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(duration_seconds);
+    while (std::chrono::steady_clock::now() < deadline && !thread_failures.has_failure()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
     stop.store(true, std::memory_order_release);
 
     for (auto& thread : threads) {
         thread.join();
     }
+    thread_failures.rethrow_first();
 
     store.Compact();
 

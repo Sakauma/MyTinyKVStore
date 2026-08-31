@@ -2,6 +2,7 @@
 
 #include "format.h"
 #include "io.h"
+#include "v3_format.h"
 
 #include <cstring>
 #include <filesystem>
@@ -29,6 +30,12 @@ void ensure_snapshot_file_exists(const std::string& db_file_path) {
 void load_snapshot_into_state(const std::string& db_file_path, StateMap& state) {
     state.clear();
     const int fd = open_or_throw(db_file_path, O_RDONLY);
+    struct stat st {};
+    if (::fstat(fd, &st) != 0) {
+        ::close(fd);
+        throw io_error("fstat", db_file_path);
+    }
+    const uint64_t file_size = static_cast<uint64_t>(st.st_size);
     SnapshotHeader header {};
     const size_t header_bytes = read_up_to(fd, &header, sizeof(header));
     if (header_bytes != sizeof(header)) {
@@ -44,12 +51,17 @@ void load_snapshot_into_state(const std::string& db_file_path, StateMap& state) 
         throw KVStoreError("Unsupported snapshot version: " + std::to_string(header.version));
     }
 
+    uint64_t offset = sizeof(header);
     while (true) {
-        SnapshotEntryHeader entry {};
-        const size_t entry_bytes = read_up_to(fd, &entry, sizeof(entry));
-        if (entry_bytes == 0) {
+        if (offset == file_size) {
             break;
         }
+        if (file_size - offset < sizeof(SnapshotEntryHeader)) {
+            ::close(fd);
+            throw KVStoreError("Snapshot entry header is truncated: " + db_file_path);
+        }
+        SnapshotEntryHeader entry {};
+        const size_t entry_bytes = read_up_to(fd, &entry, sizeof(entry));
         if (entry_bytes != sizeof(entry)) {
             ::close(fd);
             throw KVStoreError("Snapshot entry header is truncated: " + db_file_path);
@@ -58,9 +70,17 @@ void load_snapshot_into_state(const std::string& db_file_path, StateMap& state) 
             ::close(fd);
             throw KVStoreError("Snapshot entry magic mismatch: " + db_file_path);
         }
+        offset += sizeof(entry);
+
+        const uint64_t key_size = header.version == 1 ? 0 : entry.key_size;
+        const uint64_t value_size = entry.value_size;
+        if (key_size > kV3MaxKeyBytes || value_size > kV3MaxValueBytes ||
+            key_size > file_size - offset || value_size > file_size - offset - key_size) {
+            ::close(fd);
+            throw KVStoreError("Snapshot entry length exceeds file or format bounds: " + db_file_path);
+        }
 
         std::string key;
-        const uint32_t value_size = entry.value_size;
         if (header.version == 1) {
             key = encode_int_key(static_cast<int32_t>(entry.key_size));
         } else {
@@ -72,9 +92,10 @@ void load_snapshot_into_state(const std::string& db_file_path, StateMap& state) 
                     throw KVStoreError("Snapshot key is truncated: " + db_file_path);
                 }
             }
+            offset += key.size();
         }
 
-        std::vector<uint8_t> data(value_size);
+        std::vector<uint8_t> data(static_cast<size_t>(value_size));
         if (!data.empty()) {
             const size_t value_bytes = read_up_to(fd, data.data(), data.size());
             if (value_bytes != data.size()) {
@@ -82,6 +103,7 @@ void load_snapshot_into_state(const std::string& db_file_path, StateMap& state) 
                 throw KVStoreError("Snapshot value is truncated: " + db_file_path);
             }
         }
+        offset += value_size;
         state[key] = Value(std::move(data));
     }
 
@@ -92,7 +114,10 @@ void replay_wal_into_state(
     const std::string& wal_file_path,
     StateMap& state,
     const WalReplayCallback& note_latest_wal_record) {
-    const int fd = open_or_throw(wal_file_path, O_RDONLY | O_CREAT, 0644);
+    if (!std::filesystem::exists(wal_file_path)) {
+        return;
+    }
+    const int fd = open_or_throw(wal_file_path, O_RDONLY);
     struct stat st {};
     if (::fstat(fd, &st) != 0) {
         ::close(fd);
@@ -131,17 +156,24 @@ void replay_wal_into_state(
             ::close(fd);
             throw KVStoreError("Delete WAL record has payload at offset " + std::to_string(offset - sizeof(header)));
         }
+        if ((header.version != 1 && header.key_size > kV3MaxKeyBytes) ||
+            header.value_size > kV3MaxValueBytes) {
+            ::close(fd);
+            throw KVStoreError("WAL record length exceeds format bounds at offset " +
+                               std::to_string(offset - sizeof(header)));
+        }
 
         std::string key;
         int32_t legacy_key = 0;
         if (header.version == 1) {
             legacy_key = static_cast<int32_t>(header.key_size);
             key = encode_int_key(legacy_key);
-            if (offset + header.value_size > file_size) {
+            if (header.value_size > static_cast<uint64_t>(file_size - offset)) {
                 break;
             }
         } else {
-            if (offset + header.key_size + header.value_size > file_size) {
+            const uint64_t remaining = static_cast<uint64_t>(file_size - offset);
+            if (header.key_size > remaining || header.value_size > remaining - header.key_size) {
                 break;
             }
             key.resize(header.key_size);

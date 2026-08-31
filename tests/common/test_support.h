@@ -5,12 +5,15 @@
 
 #include <atomic>
 #include <chrono>
+#include <exception>
 #include <filesystem>
 #include <functional>
 #include <initializer_list>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace test_support {
@@ -33,6 +36,43 @@ public:
 
 private:
     std::filesystem::path path_;
+};
+
+class ThreadFailureCollector {
+public:
+    template <typename Function>
+    auto guard(Function&& function) {
+        return [this, task = std::forward<Function>(function)]() mutable noexcept {
+            try {
+                task();
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!failure_) {
+                    failure_ = std::current_exception();
+                }
+            }
+        };
+    }
+
+    void rethrow_first() {
+        std::exception_ptr failure;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            failure = failure_;
+        }
+        if (failure) {
+            std::rethrow_exception(failure);
+        }
+    }
+
+    bool has_failure() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return static_cast<bool>(failure_);
+    }
+
+private:
+    std::mutex mutex_;
+    std::exception_ptr failure_;
 };
 
 void append_bytes(const std::string& path, std::initializer_list<uint8_t> data);

@@ -26,6 +26,17 @@ public:
     explicit KVStoreError(const std::string& message) : std::runtime_error(message) {}
 };
 
+class KVStoreConflictError : public KVStoreError {
+public:
+    explicit KVStoreConflictError(const std::string& message) : KVStoreError(message) {}
+};
+
+enum class DurabilityMode {
+    kSync,
+    kPeriodic,
+    kNoSync,
+};
+
 enum class KVStoreProfile {
     kBalanced,
     kWriteHeavy,
@@ -34,6 +45,12 @@ enum class KVStoreProfile {
 };
 
 struct KVStoreOptions {
+    DurabilityMode durability = DurabilityMode::kSync;
+    uint32_t periodic_sync_interval_ms = 10;
+    size_t worker_threads = 0;
+    size_t shard_count = 256;
+    size_t request_queue_capacity = 4096;
+    uint64_t value_cache_bytes = 256ULL * 1024ULL * 1024ULL;
     size_t max_batch_size = 64;
     uint64_t max_batch_wal_bytes = 0;
     uint32_t max_batch_delay_us = 1000;
@@ -134,6 +151,27 @@ struct KVStoreMetrics {
     uint64_t recent_avg_batch_wal_bytes = 0;
     uint64_t recent_window_batch_count = 0;
     uint64_t observed_obsolete_wal_ratio_percent = 0;
+    uint64_t prepared_write_requests = 0;
+    uint64_t worker_tasks_completed = 0;
+    uint64_t worker_busy_time_us = 0;
+    uint64_t active_workers = 0;
+    uint64_t max_active_workers = 0;
+    uint64_t worker_utilization_per_1000 = 0;
+    uint64_t group_commit_calls = 0;
+    uint64_t group_commit_requests = 0;
+    uint64_t max_group_commit_requests = 0;
+    uint64_t fdatasync_time_us = 0;
+    uint64_t max_fdatasync_time_us = 0;
+    uint64_t transaction_commits = 0;
+    uint64_t transaction_conflicts = 0;
+    uint64_t transaction_rollbacks = 0;
+    uint64_t compaction_pause_time_us = 0;
+    uint64_t max_compaction_pause_time_us = 0;
+    uint64_t recovery_time_us = 0;
+    uint64_t value_cache_hits = 0;
+    uint64_t value_cache_misses = 0;
+    uint64_t configured_worker_threads = 0;
+    uint64_t configured_shard_count = 0;
     std::array<uint64_t, kWriteLatencyBucketCount> write_latency_histogram {};
 };
 
@@ -167,6 +205,36 @@ std::string MetricsToJson(const KVStoreMetrics& metrics);
 KVStoreOptions RecommendedOptions(KVStoreProfile profile);
 std::string OptionsToJson(const KVStoreOptions& options);
 
+class KVTransaction {
+public:
+    KVTransaction(KVTransaction&&) noexcept;
+    KVTransaction& operator=(KVTransaction&&) noexcept;
+    ~KVTransaction();
+
+    KVTransaction(const KVTransaction&) = delete;
+    KVTransaction& operator=(const KVTransaction&) = delete;
+
+    std::optional<Value> Get(int key);
+    std::optional<Value> Get(const std::string& key);
+    std::optional<Value> Get(const std::vector<uint8_t>& key);
+    void Put(int key, Value value);
+    void Put(const std::string& key, Value value);
+    void Put(const std::vector<uint8_t>& key, Value value);
+    void Delete(int key);
+    void Delete(const std::string& key);
+    void Delete(const std::vector<uint8_t>& key);
+    void Commit();
+    void Rollback() noexcept;
+
+private:
+    class Impl;
+    explicit KVTransaction(std::unique_ptr<Impl> impl);
+    Impl& require_impl();
+    std::unique_ptr<Impl> pimpl_;
+
+    friend class KVStore;
+};
+
 class KVStore {
 public:
     explicit KVStore(const std::string& db_path);
@@ -184,6 +252,8 @@ public:
     void Delete(const std::string& key);
     void Delete(const std::vector<uint8_t>& key);
     std::vector<std::pair<std::string, Value>> Scan(const std::string& start_key, const std::string& end_key);
+    KVTransaction BeginTransaction();
+    void Flush();
     void Compact();
     KVStoreMetrics GetMetrics();
 

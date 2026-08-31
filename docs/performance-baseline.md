@@ -1,96 +1,141 @@
-# Performance Baseline Workflow
+# 性能基线与认证流程
 
-## Goal
+## 两类基准
 
-把 benchmark 结果拆成更适合长期演进的两层入口：
+开发回归和正式认证使用不同入口：
 
-- `microbench`：观察单项能力，如 WAL append、scan、recovery reopen。
-- `stressbench`：观察混合真实负载，也就是当前的 `bench` / baseline / regression 工作流。
+- `microbench` / `bench-baseline-json`：快速发现明显回归，不代表正式吞吐结论。
+- `qualification-bench-json`：冻结工作负载、三轮中位数和正式 2×/p99 门禁。
 
-在此基础上，把 `stressbench` 结果沉淀成可留档、可比较的 JSON 基线，而不是只看一次终端输出。
+所有性能结果必须来自 Release，并在 WSL/Linux 原生 ext4 文件系统运行，不能使用 `/mnt/*`、9p、DrvFS 或 fuseblk。执行 workload 的脚本会通过 `findmnt` 检查 `${KVSTORE_BENCHMARK_TMPDIR:-${TMPDIR:-/tmp}}`；不满足时直接失败。
 
-## Commands
+## 标准 qualification benchmark
 
-- `./build/target/bin/kv_test microbench`：打印各个单项 microbench case 的摘要。
-- `./build/target/bin/kv_test microbench-json`：打印结构化 microbench JSON。
-- `./build/target/bin/kv_test bench`：打印面向人工阅读的混合负载 stressbench 摘要。
-- `./build/target/bin/kv_test bench-baseline-json`：打印结构化 baseline JSON。
-- `bash scripts/microbench.sh`：构建并运行 microbench。
-- `bash scripts/bench-baseline.sh`：运行 baseline benchmark，并把 JSON 落到 `benchmarks/baselines/<timestamp>.json`。
-- `./build/target/bin/kv_test compare-baseline <baseline_json> <candidate_json> [min_write_ratio_pct min_read_ratio_pct max_latency_ratio_pct]`：比较两份 baseline。
-- `./build/target/bin/kv_test compare-microbench <baseline_json> <candidate_json> [min_ops_ratio_pct min_compaction_ratio_pct min_rewrite_ratio_pct min_recovery_ratio_pct]`：比较两份 microbench JSON。
-- `./build/target/bin/kv_test trend-microbench <baseline_dir> [recent_window]`：汇总一组 microbench baseline 的长期趋势。
-- `./build/target/bin/kv_test trend-microbench-json <baseline_dir> [recent_window]`：输出结构化 microbench 趋势 JSON。
-- `./build/target/bin/kv_test trend-baselines <baseline_dir> [recent_window]`：汇总一组 baseline 的长期趋势，并额外计算最近 N 次均值。
-- `./build/target/bin/kv_test trend-baselines-json <baseline_dir> [recent_window]`：输出结构化趋势 JSON。
-- `bash scripts/bench-regression-check.sh <baseline_json>`：生成 candidate baseline，并按默认阈值执行回归检查。
-- `bash scripts/ci-bench-regression.sh`：使用仓库提交的 `benchmarks/reference/ci-floor.json` 作为 CI floor。
-- `bash scripts/microbench-regression-check.sh <baseline_json>`：生成 candidate microbench，并按默认阈值执行单项能力回归检查。
-- `bash scripts/ci-microbench-regression.sh`：使用仓库提交的 `benchmarks/reference/microbench-floor.json` 作为 microbench floor。
-- `bash scripts/microbench-trend.sh [baseline_dir] [recent_window]`：对一组历史 microbench baseline 输出趋势摘要。
-- `bash scripts/bench-trend.sh [baseline_dir] [recent_window]`：对一组历史 baseline 输出趋势摘要。
-- `bash scripts/collect-artifacts.sh [output_dir] [baseline_dir] [recent_window]`：把 `microbench`、`stressbench baseline`、趋势摘要、兼容矩阵和多 profile stress 摘要统一落成 artifact 文件。
-- `bash scripts/collect-artifacts.sh [output_dir] [baseline_dir] [recent_window]`：同时还会落一份 `microbench-trend-summary.json`，便于跟踪单项能力的长期变化。
+固定配置：
 
-## JSON Shape
+| 参数 | 值 |
+| --- | ---: |
+| Durability | `kSync` |
+| 预填充 | 1,000,000 个整数键 |
+| Writers | 16 |
+| 总操作 | 10,000,000 |
+| Put/Delete/Get | 80% / 10% / 10% |
+| Value | 256 bytes |
+| Key 分布 | uniform |
+| 自动 compaction | off |
+| 轮数 | 3，逐指标取中位数 |
 
-`microbench-json` 会返回：
+运行：
 
-- `cases`：单项 case 列表；当前包含 `wal_append`、`scan`、`recovery`、`compaction`、`rewrite`
-- 每个 case 含 `name`、`duration_s`、`ops_per_s`、`operations`、`bytes`
+```bash
+bash scripts/qualification-benchmark.sh \
+  artifacts/qualification/canonical \
+  /path/to/frozen-baseline.json
+```
 
-`bench-baseline-json` 则包含四部分：
+脚本会：
 
-- `label`：本次 benchmark 的标签。
-- `workload`：writer 数、reader 数、时长和 key space。
-- `summary`：吞吐、总写入/读取次数、平均写延迟。
-- `options` / `metrics`：当前 benchmark 使用的选项和 KVStore 运行指标。
+1. 将当前工作区复制到 `/tmp` 原生 Linux 文件系统。
+2. 以 `CMAKE_BUILD_TYPE=Release` 全量构建。
+3. 运行标准三轮 workload。
+4. 保存 candidate JSON、命令和环境。
+5. 通过 `compare-qualification` 执行门禁。
 
-## Recommended Use
+门禁：
 
-- 每次调整 writer 策略、compaction 策略或格式恢复逻辑后，都先跑一轮 `microbench`，确认没有把单项能力直接拉垮，再运行新的 baseline。
-- 基线文件应与改动一起审阅，而不是只看口头描述。
-- 如需对比历史结果，优先比较 `summary` 中的吞吐和延迟，再回看 `metrics` 中的 `fsync`、batch 和队列指标。
+- `median_write_ops_per_s >= baseline * 2.0`
+- `median_write_p99_us <= baseline * 1.2`
 
-## Default Regression Thresholds
+没有冻结 baseline 时，脚本保存 candidate 但把 gate 标记为 `not_evaluated`，不能宣称通过。
 
-默认回归门槛如下：
+## 结构化结果
 
-- `write_ops_per_s` 不得低于参考基线的 `85%`
-- `read_ops_per_s` 不得低于参考基线的 `85%`
-- `avg_write_latency_us` 不得高于参考基线的 `125%`
-- `approx_write_latency_p95_us` 不得高于参考基线的 `150%`
-- `approx_write_latency_p99_us` 不得高于参考基线的 `175%`
-- `observed_fsync_pressure_per_1000_writes` 不得高于参考基线的 `150%`
-- `recent_batch_fill_per_1000` 不得低于参考基线的 `75%`
+`qualification-bench-json` 顶层包含完整 workload 配置。每轮包含：
 
-这些阈值目前是保守门槛，用来挡住明显退化，而不是替代长期性能分析。
+- duration
+- total/write throughput
+- Put/Delete/Get 精确计数
+- 端到端写 p50/p95/p99
+- 完整 `KVStoreMetrics`
 
-默认 `microbench` 回归门槛如下：
+顶层额外输出：
 
-- 通用 case `ops_per_s` 不得低于参考基线的 `80%`
-- `compaction` `ops_per_s` 不得低于参考基线的 `75%`
-- `rewrite` `ops_per_s` 不得低于参考基线的 `75%`
-- `recovery` `ops_per_s` 不得低于参考基线的 `80%`
+- `median_operations_per_s`
+- `median_write_ops_per_s`
+- `median_write_p50_us`
+- `median_write_p95_us`
+- `median_write_p99_us`
 
-## CI Floor
+端到端写延迟从调用 `Put/Delete` 前开始，到 API 成功返回为止，包含排队、worker 准备、group wait、写入和 `fdatasync`。
 
-- 仓库当前提交了 [benchmarks/reference/ci-floor.json](/home/sakauma/code/lpue/benchmarks/reference/ci-floor.json) 作为 CI floor。
-- 它不是“最佳成绩”，而是“明显退化不应低于的下限”。
-- GitHub Actions 会运行 `scripts/ci-bench-regression.sh`，并把本次 candidate baseline 作为 artifact 上传。
+## 补充矩阵
 
-## Trend Summary
+```bash
+bash scripts/qualification-matrix.sh artifacts/qualification/matrix
+```
 
-`trend-baselines` / `bench-trend.sh` 当前会输出：
+默认矩阵覆盖：
 
-- `count`：纳入统计的 baseline 文件数
-- `oldest_file` / `latest_file`：最早与最新的 baseline 文件
-- `recent_window_count`：本次统计实际使用的 recent-window 长度
-- `avg_*` / `min_*` / `max_*`：该组 baseline 的均值、最小值和最大值
-- `recent_avg_*`：最近 N 次样本的均值
-- `latest_vs_oldest_*_ratio_pct`：最新结果相对最早结果的比例
-- `latest_vs_recent_avg_*_ratio_pct`：最新结果相对 recent-window 均值的比例
-- `write_trend` / `read_trend` / `latency_trend`：基于最新相对最早结果的方向判断，取值为 `improving` / `stable` / `regressing`
-- `recent_write_trend` / `recent_read_trend` / `recent_latency_trend`：基于最新相对 recent-window 均值的方向判断
+- 8 / 32 writers
+- 64B / 1KiB value
+- 90% 请求命中 1% key 的 hotspot
+- 自动 compaction 开启
 
-这个趋势摘要适合同时观察长周期变化和短周期偏移，但它还不是完整的时序分析或可视化系统。
+矩阵结果用于解释结构性变化，不替代标准 16-writer gate。
+
+## Qualification artifact 环境字段
+
+正式 artifact 至少记录：
+
+- Git commit 和 dirty 状态
+- CPU 拓扑
+- 内存
+- 块设备、旋转属性和挂载点
+- 文件系统类型与可用空间
+- 内核
+- 编译器和 CMake
+- `Release` 构建类型
+- 完整 workload/config
+- 每轮与中位数结果
+
+同一 baseline/candidate 比较必须使用同一机器、磁盘、文件系统、内核策略和编译器配置。跨机器的比值没有认证意义。
+
+## 长时正确性认证
+
+```bash
+bash scripts/qualification-run.sh artifacts/qualification/soak
+```
+
+脚本默认拒绝低于 43200 秒或 1000 万唯一整数键的参数。工作负载在写完目标唯一键后继续对这些键更新，直到持续时间满足；compaction 开启。两项条件同时满足后，harness 再执行最多 300 秒的纯覆盖写稳定窗口；短时 smoke 的稳定窗口按持续时间同比缩短。结束时：
+
+1. 执行同步 `Compact()` 和 `Flush()`。
+2. 关闭并重新打开数据库。
+3. 逐项校验全部目标唯一键和值。
+4. 再运行共享 `verify-format`。
+5. 记录初始、峰值、最终以及稳定窗口起止 RSS/FD 和恢复校验耗时。
+6. 要求稳定窗口末端 RSS 不高于起点加 `max(64 MiB, 10%)`，FD 不增加超过 2；否则结果为 fail。
+
+`KVSTORE_ALLOW_SHORT_QUALIFICATION=1` 允许开发 smoke，但 artifact 明确标记 `smoke-only`。
+
+## 快速回归入口
+
+```bash
+bash scripts/microbench.sh
+bash scripts/bench-baseline.sh
+bash scripts/microbench-regression-check.sh benchmarks/reference/microbench-floor.json
+bash scripts/bench-regression-check.sh benchmarks/reference/ci-floor.json
+```
+
+快速 gate 的阈值较宽，只用于阻止明显倒退。它们不能代替标准 2×/p99 gate。
+
+仓库参考文件使用相对链接：
+
+- [CI stressbench floor](../benchmarks/reference/ci-floor.json)
+- [CI microbench floor](../benchmarks/reference/microbench-floor.json)
+
+## 基线冻结规则
+
+- 基线必须来自改进前冻结 commit，并使用同一个 qualification harness 或等价外部 load generator。
+- 不允许拿 `/mnt/d` 的旧数字与 ext4 candidate 直接比较。
+- 三轮原始结果全部保留，不能只保存挑选出的最好一轮。
+- 机器发生内核、文件系统、编译器或硬件变化后，旧 baseline 只能作为历史记录，必须重新冻结可比基线。

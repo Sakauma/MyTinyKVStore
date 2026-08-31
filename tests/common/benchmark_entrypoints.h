@@ -24,6 +24,12 @@ int run_compare_benchmark_baseline_entrypoint(
     double max_fsync_pressure_ratio_pct = 150.0,
     double min_batch_fill_ratio_pct = 75.0);
 
+int run_compare_qualification_benchmark_entrypoint(
+    const std::string& baseline_path,
+    const std::string& candidate_path,
+    double min_write_throughput_ratio_pct = 200.0,
+    double max_write_p99_ratio_pct = 120.0);
+
 int run_compare_microbench_entrypoint(
     const std::string& baseline_path,
     const std::string& candidate_path,

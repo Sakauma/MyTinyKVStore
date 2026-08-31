@@ -1,30 +1,23 @@
-# Format Design
+# 格式模块设计
 
-## Scope
+## 所有权
 
-格式层负责定义“磁盘上长什么样”，不负责决定何时写，也不负责恢复顺序控制。
+[storage_format.h](../../src/internal/storage_format.h) 和 [storage_format.cpp](../../src/internal/storage_format.cpp) 拥有：
 
-当前对应实现主要落在：
+- 当前 magic、磁盘版本、结构和格式上限。
+- CRC32C 与稳定 key hash。
+- Superblock/index/frame/mutation/footer 编码。
+- Checkpoint builder 和流式 runtime parser。
+- 共享 `recover_file` / `inspect_file`。
 
-- [src/internal/format.h](/home/sakauma/code/lpue/src/internal/format.h)
-- [src/internal/format.cpp](/home/sakauma/code/lpue/src/internal/format.cpp)
+[key_codec.h](../../src/internal/key_codec.h) 和 [key_codec.cpp](../../src/internal/key_codec.cpp) 只负责 int/string/binary key namespace 编码，与磁盘容器解析解耦。
 
-## Owned Concepts
+## 设计规则
 
-- snapshot / WAL 的 magic、version 和头结构
-- key namespace tag：`int` / `string` / `binary`
-- key 编码与解码
-- WAL checksum 计算
-- snapshot header 构造
+- 运行时不得复制 header checksum 或边界验证逻辑；需要生成格式结构时调用 `make_*` helper。
+- 解析器不得信任 count/length 后直接 `reserve` 或分配。
+- 完整 frame 的 header、payload、mutation 和 footer 都必须独立校验。
+- 格式工具必须调用共享 parser，而不是只检查 magic。
+- 活动解析器只接受当前磁盘版本。任何未来不兼容格式都必须先单独设计迁移边界，不能在主恢复路径中隐式改写。
 
-## Non-Goals
-
-- 不决定 WAL 何时 `fsync`
-- 不决定 compaction 何时触发
-- 不持有运行时状态
-
-## Design Rule
-
-- 所有磁盘格式常量必须集中在 format 层定义。
-- 业务层只能消费编码/校验接口，不能重复内联格式细节。
-- 若将来引入 v3/v4 格式，优先扩 format 层，而不是把版本分支散落到 writer/recovery 中。
+公开格式说明见[文件格式](../file-format.md)。

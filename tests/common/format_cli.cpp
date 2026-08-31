@@ -20,7 +20,3 @@ int run_verify_format(const std::string& db_path) {
     std::cout << result.output_line << std::endl;
     return result.status;
 }
-
-int run_compatibility_matrix() {
-    return compatibility_matrix_analysis();
-}

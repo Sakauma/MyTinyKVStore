@@ -14,6 +14,7 @@ using test_support::file_size_or_zero;
 using test_support::require;
 using test_support::TestDir;
 using test_support::text;
+using test_support::ThreadFailureCollector;
 using test_support::wait_for_start;
 using test_support::wait_until;
 
@@ -37,12 +38,13 @@ void test_batching_metrics_are_reported() {
     std::atomic<int> ready {0};
     std::atomic<bool> start_signal {false};
     std::vector<std::thread> writers;
+    ThreadFailureCollector thread_failures;
 
     for (int writer_id = 0; writer_id < kWriterCount; ++writer_id) {
-        writers.emplace_back([&store, &ready, &start_signal, writer_id]() {
+        writers.emplace_back(thread_failures.guard([&store, &ready, &start_signal, writer_id]() {
             wait_for_start(ready, start_signal, kWriterCount);
             store.Put(writer_id, text("value_" + std::to_string(writer_id)));
-        });
+        }));
     }
 
     while (ready.load(std::memory_order_acquire) < kWriterCount) {
@@ -53,6 +55,7 @@ void test_batching_metrics_are_reported() {
     for (auto& writer : writers) {
         writer.join();
     }
+    thread_failures.rethrow_first();
 
     const KVStoreMetrics metrics = store.GetMetrics();
     require(metrics.enqueued_write_requests == kWriterCount, "metrics should count all enqueued writes");
@@ -192,12 +195,13 @@ void test_batch_wal_byte_limit_is_respected() {
     std::atomic<int> ready {0};
     std::atomic<bool> start_signal {false};
     std::vector<std::thread> writers;
+    ThreadFailureCollector thread_failures;
 
     for (int writer_id = 0; writer_id < kWriterCount; ++writer_id) {
-        writers.emplace_back([&store, &ready, &start_signal, writer_id]() {
+        writers.emplace_back(thread_failures.guard([&store, &ready, &start_signal, writer_id]() {
             wait_for_start(ready, start_signal, kWriterCount);
             store.Put(writer_id, text("payload_1234567890"));
-        });
+        }));
     }
 
     while (ready.load(std::memory_order_acquire) < kWriterCount) {
@@ -208,6 +212,7 @@ void test_batch_wal_byte_limit_is_respected() {
     for (auto& writer : writers) {
         writer.join();
     }
+    thread_failures.rethrow_first();
 
     const KVStoreMetrics metrics = store.GetMetrics();
     require(metrics.committed_write_requests == kWriterCount, "all writes should commit under byte-limited batching");
@@ -248,12 +253,13 @@ void test_adaptive_batching_expands_batch_under_queue_pressure() {
     std::atomic<int> ready {0};
     std::atomic<bool> start_signal {false};
     std::vector<std::thread> writers;
+    ThreadFailureCollector thread_failures;
 
     for (int writer_id = 0; writer_id < kWriterCount; ++writer_id) {
-        writers.emplace_back([&store, &ready, &start_signal, writer_id]() {
+        writers.emplace_back(thread_failures.guard([&store, &ready, &start_signal, writer_id]() {
             wait_for_start(ready, start_signal, kWriterCount);
             store.Put(writer_id, text("adaptive_" + std::to_string(writer_id)));
-        });
+        }));
     }
 
     while (ready.load(std::memory_order_acquire) < kWriterCount) {
@@ -264,6 +270,7 @@ void test_adaptive_batching_expands_batch_under_queue_pressure() {
     for (auto& writer : writers) {
         writer.join();
     }
+    thread_failures.rethrow_first();
 
     const KVStoreMetrics metrics = store.GetMetrics();
     require(metrics.committed_write_requests == kWriterCount, "adaptive batching should still commit all queued writes");
@@ -285,12 +292,13 @@ void test_percentile_and_writer_metrics_are_reported() {
     std::atomic<int> ready {0};
     std::atomic<bool> start_signal {false};
     std::vector<std::thread> writers;
+    ThreadFailureCollector thread_failures;
 
     for (int writer_id = 0; writer_id < kWriterCount; ++writer_id) {
-        writers.emplace_back([&store, &ready, &start_signal, writer_id]() {
+        writers.emplace_back(thread_failures.guard([&store, &ready, &start_signal, writer_id]() {
             wait_for_start(ready, start_signal, kWriterCount);
             store.Put(writer_id, text("writer_metric_payload_" + std::to_string(writer_id)));
-        });
+        }));
     }
 
     while (ready.load(std::memory_order_acquire) < kWriterCount) {
@@ -301,6 +309,7 @@ void test_percentile_and_writer_metrics_are_reported() {
     for (auto& writer : writers) {
         writer.join();
     }
+    thread_failures.rethrow_first();
 
     wait_until(
         [&store]() {
@@ -337,37 +346,38 @@ void test_adaptive_flush_shortens_batch_delay() {
 
     std::atomic<int> ready {0};
     std::atomic<bool> start_signal {false};
+    ThreadFailureCollector thread_failures;
 
-    std::thread writer1([&store, &ready, &start_signal]() {
+    std::thread writer1(thread_failures.guard([&store, &ready, &start_signal]() {
         wait_for_start(ready, start_signal, 2);
         store.Put(1, text("flush_1"));
-    });
-    std::thread writer2([&store, &ready, &start_signal]() {
+    }));
+    std::thread writer2(thread_failures.guard([&store, &ready, &start_signal]() {
         wait_for_start(ready, start_signal, 2);
         store.Put(2, text("flush_2"));
-    });
+    }));
 
     while (ready.load(std::memory_order_acquire) < 2) {
         std::this_thread::yield();
     }
     start_signal.store(true, std::memory_order_release);
 
-    wait_until(
-        [&store]() {
-            const KVStoreMetrics metrics = store.GetMetrics();
-            return metrics.committed_write_requests >= 2 &&
-                   metrics.committed_write_batches >= 1 &&
-                   metrics.adaptive_flush_batches_completed >= 1;
-        },
-        "adaptive flush should commit the first shortened-delay batch before the delayed write arrives");
-
-    std::thread writer3([&store]() {
-        store.Put(3, text("flush_3"));
-    });
-
     writer1.join();
     writer2.join();
+    thread_failures.rethrow_first();
+
+    const KVStoreMetrics before_delayed_write = store.GetMetrics();
+    require(before_delayed_write.committed_write_requests >= 2 &&
+                before_delayed_write.committed_write_batches >= 1 &&
+                before_delayed_write.adaptive_flush_batches_completed >= 1,
+            "adaptive flush should commit the first shortened-delay batch before the delayed write arrives");
+
+    std::thread writer3(thread_failures.guard([&store]() {
+        store.Put(3, text("flush_3"));
+    }));
+
     writer3.join();
+    thread_failures.rethrow_first();
 
     const KVStoreMetrics metrics = store.GetMetrics();
     require(metrics.committed_write_requests == 3, "adaptive flush test should commit all writes");
@@ -417,14 +427,15 @@ void test_latency_target_adaptive_flush_kicks_in() {
 
     std::atomic<int> ready {0};
     std::atomic<bool> start_signal {false};
-    std::thread writer1([&store, &ready, &start_signal]() {
+    ThreadFailureCollector thread_failures;
+    std::thread writer1(thread_failures.guard([&store, &ready, &start_signal]() {
         wait_for_start(ready, start_signal, 2);
         store.Put(10, text("latency_target_a"));
-    });
-    std::thread writer2([&store, &ready, &start_signal]() {
+    }));
+    std::thread writer2(thread_failures.guard([&store, &ready, &start_signal]() {
         wait_for_start(ready, start_signal, 2);
         store.Put(11, text("latency_target_b"));
-    });
+    }));
 
     while (ready.load(std::memory_order_acquire) < 2) {
         std::this_thread::yield();
@@ -432,13 +443,14 @@ void test_latency_target_adaptive_flush_kicks_in() {
     start_signal.store(true, std::memory_order_release);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    std::thread writer3([&store]() {
+    std::thread writer3(thread_failures.guard([&store]() {
         store.Put(12, text("latency_target_c"));
-    });
+    }));
 
     writer1.join();
     writer2.join();
     writer3.join();
+    thread_failures.rethrow_first();
 
     const KVStoreMetrics metrics = store.GetMetrics();
     require(metrics.adaptive_latency_target_batches_completed >= 1,
@@ -493,12 +505,13 @@ void test_recent_window_metrics_capture_bursts() {
     std::atomic<int> ready {0};
     std::atomic<bool> start_signal {false};
     std::vector<std::thread> writers;
+    ThreadFailureCollector thread_failures;
 
     for (int writer_id = 0; writer_id < kWriterCount; ++writer_id) {
-        writers.emplace_back([&store, &ready, &start_signal, writer_id]() {
+        writers.emplace_back(thread_failures.guard([&store, &ready, &start_signal, writer_id]() {
             wait_for_start(ready, start_signal, kWriterCount);
             store.Put(writer_id, text("recent_" + std::to_string(writer_id)));
-        });
+        }));
     }
 
     while (ready.load(std::memory_order_acquire) < kWriterCount) {
@@ -509,6 +522,7 @@ void test_recent_window_metrics_capture_bursts() {
     for (auto& writer : writers) {
         writer.join();
     }
+    thread_failures.rethrow_first();
 
     const KVStoreMetrics metrics = store.GetMetrics();
     require(metrics.recent_window_batch_count >= 1, "recent batch window should track completed batches");
@@ -539,14 +553,16 @@ void test_read_heavy_signal_prefers_shorter_batches() {
         (void)store.Get(i);
     }
 
-    std::thread writer1([&store]() {
+    ThreadFailureCollector thread_failures;
+    std::thread writer1(thread_failures.guard([&store]() {
         store.Put(1, text("read_heavy_a"));
-    });
-    std::thread writer2([&store]() {
+    }));
+    std::thread writer2(thread_failures.guard([&store]() {
         store.Put(2, text("read_heavy_b"));
-    });
+    }));
     writer1.join();
     writer2.join();
+    thread_failures.rethrow_first();
 
     const KVStoreMetrics metrics = store.GetMetrics();
     require(metrics.adaptive_read_heavy_batches_completed >= 1,
@@ -673,12 +689,13 @@ void test_objective_short_delay_owns_delay_decision_when_enabled() {
     std::atomic<int> ready {0};
     std::atomic<bool> start_signal {false};
     std::vector<std::thread> writers;
+    ThreadFailureCollector thread_failures;
 
     for (int writer_id = 0; writer_id < kWriterCount; ++writer_id) {
-        writers.emplace_back([&store, &ready, &start_signal, writer_id]() {
+        writers.emplace_back(thread_failures.guard([&store, &ready, &start_signal, writer_id]() {
             wait_for_start(ready, start_signal, kWriterCount);
             store.Put(writer_id, text("objective_owned_delay_" + std::to_string(writer_id)));
-        });
+        }));
     }
 
     while (ready.load(std::memory_order_acquire) < kWriterCount) {
@@ -689,6 +706,7 @@ void test_objective_short_delay_owns_delay_decision_when_enabled() {
     for (auto& writer : writers) {
         writer.join();
     }
+    thread_failures.rethrow_first();
 
     const KVStoreMetrics metrics = store.GetMetrics();
     require(metrics.adaptive_objective_short_delay_batches_completed >= 1,

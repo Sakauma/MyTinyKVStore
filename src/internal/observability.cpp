@@ -65,6 +65,27 @@ std::string metrics_to_json(const KVStoreMetrics& metrics) {
         << ",\"recent_avg_batch_wal_bytes\":" << metrics.recent_avg_batch_wal_bytes
         << ",\"recent_window_batch_count\":" << metrics.recent_window_batch_count
         << ",\"observed_obsolete_wal_ratio_percent\":" << metrics.observed_obsolete_wal_ratio_percent
+        << ",\"prepared_write_requests\":" << metrics.prepared_write_requests
+        << ",\"worker_tasks_completed\":" << metrics.worker_tasks_completed
+        << ",\"worker_busy_time_us\":" << metrics.worker_busy_time_us
+        << ",\"active_workers\":" << metrics.active_workers
+        << ",\"max_active_workers\":" << metrics.max_active_workers
+        << ",\"worker_utilization_per_1000\":" << metrics.worker_utilization_per_1000
+        << ",\"group_commit_calls\":" << metrics.group_commit_calls
+        << ",\"group_commit_requests\":" << metrics.group_commit_requests
+        << ",\"max_group_commit_requests\":" << metrics.max_group_commit_requests
+        << ",\"fdatasync_time_us\":" << metrics.fdatasync_time_us
+        << ",\"max_fdatasync_time_us\":" << metrics.max_fdatasync_time_us
+        << ",\"transaction_commits\":" << metrics.transaction_commits
+        << ",\"transaction_conflicts\":" << metrics.transaction_conflicts
+        << ",\"transaction_rollbacks\":" << metrics.transaction_rollbacks
+        << ",\"compaction_pause_time_us\":" << metrics.compaction_pause_time_us
+        << ",\"max_compaction_pause_time_us\":" << metrics.max_compaction_pause_time_us
+        << ",\"recovery_time_us\":" << metrics.recovery_time_us
+        << ",\"value_cache_hits\":" << metrics.value_cache_hits
+        << ",\"value_cache_misses\":" << metrics.value_cache_misses
+        << ",\"configured_worker_threads\":" << metrics.configured_worker_threads
+        << ",\"configured_shard_count\":" << metrics.configured_shard_count
         << ",\"write_latency_histogram\":[";
     for (size_t i = 0; i < metrics.write_latency_histogram.size(); ++i) {
         if (i != 0) {
@@ -167,7 +188,17 @@ KVStoreOptions recommended_options(KVStoreProfile profile) {
 std::string options_to_json(const KVStoreOptions& options) {
     std::ostringstream out;
     out << '{'
-        << "\"max_batch_size\":" << options.max_batch_size
+        << "\"durability\":\""
+        << (options.durability == DurabilityMode::kSync
+                ? "sync"
+                : options.durability == DurabilityMode::kPeriodic ? "periodic" : "no_sync")
+        << "\""
+        << ",\"periodic_sync_interval_ms\":" << options.periodic_sync_interval_ms
+        << ",\"worker_threads\":" << options.worker_threads
+        << ",\"shard_count\":" << options.shard_count
+        << ",\"request_queue_capacity\":" << options.request_queue_capacity
+        << ",\"value_cache_bytes\":" << options.value_cache_bytes
+        << ",\"max_batch_size\":" << options.max_batch_size
         << ",\"max_batch_wal_bytes\":" << options.max_batch_wal_bytes
         << ",\"max_batch_delay_us\":" << options.max_batch_delay_us
         << ",\"adaptive_recent_window_batches\":" << options.adaptive_recent_window_batches

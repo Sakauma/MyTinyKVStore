@@ -19,9 +19,9 @@ void test_ordering_and_updates() {
 
     {
         KVStore store(db_path);
-        store.Put(3, text("v1"));
+        store.Put(3, text("first"));
         store.Delete(3);
-        store.Put(3, text("v2"));
+        store.Put(3, text("second"));
         store.Put(4, text("keep"));
     }
 
@@ -30,7 +30,7 @@ void test_ordering_and_updates() {
     const auto other = reopened.Get(4);
     require(latest.has_value(), "key 3 should exist after final put");
     require(other.has_value(), "key 4 should exist after replay");
-    require(as_string(*latest) == "v2", "operations must replay in commit order");
+    require(as_string(*latest) == "second", "operations must replay in commit order");
     require(as_string(*other) == "keep", "other keys should be unaffected");
 }
 
