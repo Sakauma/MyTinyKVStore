@@ -167,6 +167,12 @@ void test_write_batch_preserves_operation_order() {
             BatchWriteOperation::Put("gamma", text("a")),
             BatchWriteOperation::Put("gamma", text("b")),
         });
+        const auto live_seven = store.Get(7);
+        const auto live_gamma = store.Get(std::string("gamma"));
+        require(live_seven.has_value() && as_string(*live_seven) == "second",
+                "batch operation order must be visible before restart for int keys");
+        require(live_gamma.has_value() && as_string(*live_gamma) == "b",
+                "batch operation order must be visible before restart for string keys");
     }
 
     KVStore reopened(db_path);

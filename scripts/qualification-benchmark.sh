@@ -2,7 +2,8 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-output_dir="${1:-$repo_root/artifacts/qualification/benchmark-$(date +%Y%m%dT%H%M%S)}"
+qualification_root="${KVSTORE_QUALIFICATION_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/mytinykvstore/qualification}"
+output_dir="${1:-$qualification_root/benchmark-$(date +%Y%m%dT%H%M%S)}"
 baseline_json="${2:-}"
 prefill_keys="${3:-1000000}"
 operations="${4:-10000000}"
@@ -10,8 +11,11 @@ writers="${5:-16}"
 value_bytes="${6:-256}"
 rounds="${7:-3}"
 
+output_dir="$(realpath -m "$output_dir")"
+case "$output_dir/" in
+  "$repo_root/"*) echo "qualification output must be outside the repository: $output_dir" >&2; exit 2 ;;
+esac
 mkdir -p "$output_dir"
-output_dir="$(cd "$output_dir" && pwd)"
 work_root="$(mktemp -d /tmp/mytinykv-qualification.XXXXXX)"
 case "$work_root" in
   /tmp/mytinykv-qualification.*) ;;
@@ -22,6 +26,17 @@ trap 'rm -rf -- "$work_root"' EXIT
 filesystem_type="$(findmnt -T "$work_root" -n -o FSTYPE)"
 if [[ "$filesystem_type" != "ext4" ]]; then
   echo "qualification requires a native ext4 filesystem, got: $filesystem_type" >&2
+  exit 2
+fi
+output_filesystem_type="$(findmnt -T "$output_dir" -n -o FSTYPE)"
+if [[ "$output_filesystem_type" != "ext4" ]]; then
+  echo "qualification output requires a native ext4 filesystem, got: $output_filesystem_type" >&2
+  exit 2
+fi
+minimum_free_bytes=$((25 * 1024 * 1024 * 1024))
+available_bytes="$(df --output=avail -B1 "$work_root" | tail -n1 | tr -d ' ')"
+if (( available_bytes < minimum_free_bytes )); then
+  echo "qualification requires at least 25 GiB free on the workload filesystem" >&2
   exit 2
 fi
 
@@ -45,6 +60,8 @@ command_txt="$output_dir/command.txt"
   echo "git_dirty=$(if [[ -z "$(git -C "$repo_root" status --porcelain 2>/dev/null)" ]]; then echo false; else echo true; fi)"
   echo "kernel=$(uname -srvo)"
   echo "filesystem_type=$filesystem_type"
+  echo "output_filesystem_type=$output_filesystem_type"
+  echo "available_bytes_at_start=$available_bytes"
   echo "compiler=$($work_root/build-release/target/bin/kv_test --version 2>/dev/null || c++ --version | head -n1)"
   echo "cmake=$(cmake --version | head -n1)"
   echo "build_type=Release"

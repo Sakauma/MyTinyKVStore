@@ -70,6 +70,7 @@ add_library(kvstore SHARED
     src/internal/writer_policy.cpp
     src/internal/storage_engine.cpp
     src/internal/storage_format.cpp
+    src/internal/value_cache.cpp
 )
 target_include_directories(kvstore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(kvstore PRIVATE Threads::Threads)
@@ -112,6 +113,7 @@ add_executable(kv_unit_test
     tests/unit/internal_helpers_test.cpp
     tests/unit/unit_main.cpp
     tests/unit/storage_format_test.cpp
+    tests/unit/value_cache_test.cpp
 )
 target_include_directories(kv_unit_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(kv_unit_test PRIVATE kvstore Threads::Threads)

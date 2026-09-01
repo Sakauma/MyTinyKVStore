@@ -19,6 +19,29 @@ void test_crc32c_matches_standard_vector() {
             "CRC32C should match the Castagnoli standard test vector");
 }
 
+void test_crc32c_runtime_dispatch_matches_software_incrementally() {
+    std::vector<uint8_t> input(4099);
+    for (size_t index = 0; index < input.size(); ++index) {
+        input[index] = static_cast<uint8_t>((index * 37U + 11U) & 0xFFU);
+    }
+    const uint32_t runtime = kvstore::internal::crc32c(input.data(), input.size());
+    const uint32_t software = kvstore::internal::crc32c_software_extend(
+        0, input.data(), input.size());
+    require(runtime == software,
+            "Hardware-dispatched CRC32C must be bit-identical to the software fallback");
+
+    uint32_t incremental = 0;
+    size_t offset = 0;
+    const size_t chunks[] = {1, 7, 64, 513, 1024, 2490};
+    for (size_t chunk : chunks) {
+        incremental = kvstore::internal::crc32c_extend(
+            incremental, input.data() + offset, chunk);
+        offset += chunk;
+    }
+    require(offset == input.size() && incremental == runtime,
+            "Incremental runtime CRC32C must match a single complete call");
+}
+
 void test_storage_transaction_frame_has_matching_commit_footer() {
     const std::vector<kvstore::internal::Mutation> operations {
         {kvstore::internal::MutationType::kPut,
@@ -43,6 +66,19 @@ void test_storage_transaction_frame_has_matching_commit_footer() {
             "storage frame header/footer should agree on the complete frame length");
     require(header.payload_checksum == footer.payload_checksum,
             "storage frame header/footer should agree on the payload checksum");
+
+    const auto prepared_header = kvstore::internal::make_frame_header(
+        payload.size(), operations.size(), 42,
+        kvstore::internal::crc32c(payload.data(), payload.size()));
+    const auto prepared_footer = kvstore::internal::make_frame_footer(prepared_header);
+    require(std::memcmp(frame.data(), &prepared_header, sizeof(prepared_header)) == 0 &&
+                std::memcmp(frame.data() + sizeof(prepared_header),
+                            payload.data(),
+                            payload.size()) == 0 &&
+                std::memcmp(frame.data() + sizeof(prepared_header) + payload.size(),
+                            &prepared_footer,
+                            sizeof(prepared_footer)) == 0,
+            "Segmented header/payload/footer iovecs must reproduce the legacy frame bytes exactly");
 }
 
 void test_storage_checkpoint_plans_single_file_regions() {
@@ -86,6 +122,7 @@ void test_storage_superblock_checksum_detects_corruption() {
 
 void register_storage_format_tests(TestCases& tests) {
     tests.push_back({"storage CRC32C matches standard vector", test_crc32c_matches_standard_vector});
+    tests.push_back({"storage CRC32C dispatch matches software", test_crc32c_runtime_dispatch_matches_software_incrementally});
     tests.push_back({"storage frame has a matching commit footer", test_storage_transaction_frame_has_matching_commit_footer});
     tests.push_back({"storage checkpoint plans single-file regions", test_storage_checkpoint_plans_single_file_regions});
     tests.push_back({"storage superblock checksum detects corruption", test_storage_superblock_checksum_detects_corruption});

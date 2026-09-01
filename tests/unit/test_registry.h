@@ -11,6 +11,7 @@ using TestCases = std::vector<test_support::NamedTest>;
 
 void register_internal_helpers_tests(TestCases& tests);
 void register_storage_format_tests(TestCases& tests);
+void register_value_cache_tests(TestCases& tests);
 
 }  // namespace kvstore::tests::unit
 

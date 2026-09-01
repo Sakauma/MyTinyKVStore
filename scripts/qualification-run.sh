@@ -2,12 +2,13 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OUTPUT_DIR="${1:-$repo_root/artifacts/qualification/soak-$(date +%Y%m%dT%H%M%S)}"
+qualification_root="${KVSTORE_QUALIFICATION_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/mytinykvstore/qualification}"
+OUTPUT_DIR="${1:-$qualification_root/soak-$(date +%Y%m%dT%H%M%S)}"
 DURATION_SECONDS="${2:-43200}"
 REQUIRED_UNIQUE_KEYS="${3:-10000000}"
 WRITERS="${4:-16}"
 VALUE_BYTES="${5:-256}"
-BIN_PATH="${6:-$repo_root/build-release/target/bin/kv_test}"
+BIN_PATH="${6:-}"
 
 if (( DURATION_SECONDS < 43200 || REQUIRED_UNIQUE_KEYS < 10000000 )); then
   if [[ "${KVSTORE_ALLOW_SHORT_QUALIFICATION:-0}" != "1" ]]; then
@@ -19,12 +20,15 @@ else
   certification_scope="full"
 fi
 
+OUTPUT_DIR="$(realpath -m "$OUTPUT_DIR")"
+case "$OUTPUT_DIR/" in
+  "$repo_root/"*) echo "qualification output must be outside the repository: $OUTPUT_DIR" >&2; exit 2 ;;
+esac
 mkdir -p "${OUTPUT_DIR}"
-OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
-
-if [[ "$BIN_PATH" == "$repo_root/build-release/target/bin/kv_test" ]]; then
-  cmake -S "$repo_root" -B "$repo_root/build-release" -DCMAKE_BUILD_TYPE=Release
-  cmake --build "$repo_root/build-release" --parallel
+OUTPUT_FILESYSTEM_TYPE="$(findmnt -T "$OUTPUT_DIR" -n -o FSTYPE)"
+if [[ "$OUTPUT_FILESYSTEM_TYPE" != "ext4" ]]; then
+  echo "qualification output must be on native ext4, got $OUTPUT_FILESYSTEM_TYPE" >&2
+  exit 2
 fi
 
 DB_ROOT="${KVSTORE_QUALIFICATION_DB_DIR:-/tmp/mytinykv-qualification-db-$(date +%Y%m%dT%H%M%S)}"
@@ -35,10 +39,41 @@ if [[ "$FILESYSTEM_TYPE" != "ext4" ]]; then
   echo "qualification database must be on native ext4, got $FILESYSTEM_TYPE" >&2
   exit 2
 fi
+MINIMUM_FREE_BYTES=$((25 * 1024 * 1024 * 1024))
+AVAILABLE_BYTES="$(df --output=avail -B1 "$DB_ROOT" | tail -n1 | tr -d ' ')"
+if (( AVAILABLE_BYTES < MINIMUM_FREE_BYTES )); then
+  echo "qualification requires at least 25 GiB free on the database filesystem" >&2
+  exit 2
+fi
 DB_PATH="$DB_ROOT/qualification.dat"
 if [[ -e "$DB_PATH" ]]; then
   echo "qualification database already exists: $DB_PATH" >&2
   exit 1
+fi
+
+BUILD_ROOT=""
+if [[ -z "$BIN_PATH" ]]; then
+  BUILD_ROOT="$(mktemp -d /tmp/mytinykv-soak-build.XXXXXX)"
+  case "$BUILD_ROOT" in
+    /tmp/mytinykv-soak-build.*) ;;
+    *) echo "unsafe temporary build path: $BUILD_ROOT" >&2; exit 1 ;;
+  esac
+  trap 'rm -rf -- "$BUILD_ROOT"' EXIT
+  tar -C "$repo_root" \
+    --exclude=.git \
+    --exclude='build*' \
+    --exclude=target \
+    --exclude=artifacts \
+    -cf - . | tar -C "$BUILD_ROOT" -xf -
+  cmake -S "$BUILD_ROOT" -B "$BUILD_ROOT/build-release" -DCMAKE_BUILD_TYPE=Release
+  cmake --build "$BUILD_ROOT/build-release" --parallel
+  BIN_PATH="$BUILD_ROOT/build-release/target/bin/kv_test"
+fi
+
+BIN_FILESYSTEM_TYPE="$(findmnt -T "$BIN_PATH" -n -o FSTYPE)"
+if [[ "$BIN_FILESYSTEM_TYPE" != "ext4" ]]; then
+  echo "qualification binary must be built on native ext4, got $BIN_FILESYSTEM_TYPE" >&2
+  exit 2
 fi
 
 SUMMARY_JSON="${OUTPUT_DIR}/stress-summary.json"
@@ -56,6 +91,9 @@ fi
   echo "repo_root=${repo_root}"
   echo "kernel=$(uname -srvo)"
   echo "filesystem_type=${FILESYSTEM_TYPE}"
+  echo "output_filesystem_type=${OUTPUT_FILESYSTEM_TYPE}"
+  echo "binary_filesystem_type=${BIN_FILESYSTEM_TYPE}"
+  echo "available_bytes_at_start=${AVAILABLE_BYTES}"
   echo "database_path=${DB_PATH}"
   echo "duration_seconds=${DURATION_SECONDS}"
   echo "required_unique_keys=${REQUIRED_UNIQUE_KEYS}"

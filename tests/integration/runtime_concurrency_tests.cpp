@@ -1,15 +1,23 @@
 #include "tests/integration/test_registry.h"
 
+#include "internal/storage_format.h"
 #include "kvstore.h"
 #include "tests/common/runtime_entrypoints.h"
 #include "tests/common/test_support.h"
 
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <filesystem>
+#include <functional>
+#include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <unistd.h>
 
 namespace kvstore::tests::integration {
 namespace {
@@ -105,6 +113,8 @@ void test_compaction_crash_boundary_matrix_preserves_state() {
         "compaction_after_temp_sync",
         "compaction_after_rename",
         "compaction_after_directory_sync",
+        "compaction_before_entry_migration",
+        "compaction_after_entry_migration",
     };
     for (const auto& scenario : scenarios) {
         const std::string db_path = dir.file(scenario + ".dat");
@@ -358,6 +368,163 @@ void test_small_write_history_is_linearizable() {
             "a write from the second real-time wave must follow every completed first-wave write");
 }
 
+void test_mixed_history_has_a_real_time_consistent_serialization() {
+    TestDir directory("mixed_linearizable_history");
+    KVStoreOptions options;
+    options.max_batch_delay_us = 0;
+    KVStore store(directory.file("store.dat"), options);
+    store.Put(900, text("seed"));
+
+    enum class Kind {
+        kPut,
+        kDelete,
+        kGet,
+        kBatch,
+    };
+    struct Record {
+        Kind kind;
+        int begin = -1;
+        int end = -1;
+        std::optional<std::string> observed {};
+    };
+    std::array<Record, 4> history {{
+        {Kind::kPut},
+        {Kind::kDelete},
+        {Kind::kGet},
+        {Kind::kBatch},
+    }};
+    std::atomic<int> ready {0};
+    std::atomic<bool> start {false};
+    std::atomic<int> clock {0};
+    ThreadFailureCollector failures;
+    std::vector<std::thread> operations;
+    for (size_t index = 0; index < history.size(); ++index) {
+        operations.emplace_back(failures.guard([&, index] {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            history[index].begin = clock.fetch_add(1, std::memory_order_seq_cst);
+            switch (history[index].kind) {
+                case Kind::kPut:
+                    store.Put(900, text("put"));
+                    break;
+                case Kind::kDelete:
+                    store.Delete(900);
+                    break;
+                case Kind::kGet: {
+                    const auto value = store.Get(900);
+                    history[index].observed = value.has_value()
+                                                  ? std::optional<std::string>(as_string(*value))
+                                                  : std::nullopt;
+                    break;
+                }
+                case Kind::kBatch:
+                    store.WriteBatch({
+                        BatchWriteOperation::PutInt(900, text("batch")),
+                        BatchWriteOperation::PutInt(901, text("paired")),
+                    });
+                    break;
+            }
+            history[index].end = clock.fetch_add(1, std::memory_order_seq_cst);
+        }));
+    }
+    while (ready.load(std::memory_order_acquire) < static_cast<int>(history.size())) {
+        std::this_thread::yield();
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& operation : operations) {
+        operation.join();
+    }
+    failures.rethrow_first();
+
+    std::map<int, std::string> final_state;
+    if (const auto value = store.Get(900); value.has_value()) {
+        final_state[900] = as_string(*value);
+    }
+    if (const auto value = store.Get(901); value.has_value()) {
+        final_state[901] = as_string(*value);
+    }
+
+    std::array<bool, 4> used {};
+    bool linearizable = false;
+    std::function<void(size_t, std::map<int, std::string>)> search;
+    search = [&](size_t depth, std::map<int, std::string> model) {
+        if (linearizable) {
+            return;
+        }
+        if (depth == history.size()) {
+            linearizable = model == final_state;
+            return;
+        }
+        for (size_t candidate = 0; candidate < history.size(); ++candidate) {
+            if (used[candidate]) {
+                continue;
+            }
+            bool predecessor_missing = false;
+            for (size_t predecessor = 0; predecessor < history.size(); ++predecessor) {
+                if (!used[predecessor] && predecessor != candidate &&
+                    history[predecessor].end < history[candidate].begin) {
+                    predecessor_missing = true;
+                    break;
+                }
+            }
+            if (predecessor_missing) {
+                continue;
+            }
+
+            auto candidate_model = model;
+            bool response_matches = true;
+            switch (history[candidate].kind) {
+                case Kind::kPut:
+                    candidate_model[900] = "put";
+                    break;
+                case Kind::kDelete:
+                    candidate_model.erase(900);
+                    break;
+                case Kind::kGet: {
+                    const auto found = candidate_model.find(900);
+                    const std::optional<std::string> expected =
+                        found == candidate_model.end()
+                            ? std::nullopt
+                            : std::optional<std::string>(found->second);
+                    response_matches = expected == history[candidate].observed;
+                    break;
+                }
+                case Kind::kBatch:
+                    candidate_model[900] = "batch";
+                    candidate_model[901] = "paired";
+                    break;
+            }
+            if (!response_matches) {
+                continue;
+            }
+            used[candidate] = true;
+            search(depth + 1, std::move(candidate_model));
+            used[candidate] = false;
+        }
+    };
+    search(0, {{900, "seed"}});
+    require(linearizable,
+            "Put/Delete/Get/WriteBatch history must admit a legal real-time serial order");
+
+    store.Put(902, text("transaction-base"));
+    auto transaction = store.BeginTransaction();
+    const auto transaction_read = transaction.Get(902);
+    transaction.Put(903, text("must-not-publish"));
+    store.Put(902, text("concurrent-update"));
+    bool conflicted = false;
+    try {
+        transaction.Commit();
+    } catch (const KVStoreConflictError&) {
+        conflicted = true;
+    }
+    require(transaction_read.has_value() &&
+                as_string(*transaction_read) == "transaction-base" && conflicted &&
+                !store.Get(903).has_value(),
+            "The checked mixed history must also reject a stale OCC transaction atomically");
+}
+
 void test_concurrent_scan_observes_complete_batches() {
     TestDir directory("concurrent_scan_batches");
     KVStoreOptions options;
@@ -412,6 +579,49 @@ void test_concurrent_scan_observes_complete_batches() {
     thread_failures.rethrow_first();
 }
 
+void test_hot_shard_readers_race_safely_with_clock_eviction() {
+    TestDir directory("hot_shard_clock_cache");
+    KVStoreOptions options;
+    options.shard_count = 1;
+    options.worker_threads = 8;
+    options.value_cache_bytes = 4ULL * 64ULL * 1024ULL;
+    options.max_batch_delay_us = 0;
+    KVStore store(directory.file("store.dat"), options);
+    store.Put(std::string("hot"), text("hot_0"));
+
+    std::atomic<bool> writer_done {false};
+    ThreadFailureCollector failures;
+    std::thread writer(failures.guard([&] {
+        for (int version = 1; version <= 300; ++version) {
+            store.Put(std::string("hot"), text("hot_" + std::to_string(version)));
+            store.Put(std::string("churn_" + std::to_string(version)),
+                      Value(std::vector<uint8_t>(1024, static_cast<uint8_t>(version))));
+        }
+        writer_done.store(true, std::memory_order_release);
+    }));
+
+    std::vector<std::thread> readers;
+    for (int reader_id = 0; reader_id < 8; ++reader_id) {
+        readers.emplace_back(failures.guard([&] {
+            int reads = 0;
+            while (!writer_done.load(std::memory_order_acquire) || reads < 500) {
+                const auto value = store.Get(std::string("hot"));
+                require(value.has_value() && as_string(*value).rfind("hot_", 0) == 0,
+                        "Hot-key readers must observe a complete committed value");
+                ++reads;
+            }
+        }));
+    }
+
+    writer.join();
+    for (auto& reader : readers) {
+        reader.join();
+    }
+    failures.rethrow_first();
+    require(store.GetMetrics().value_cache_hits > 0,
+            "Concurrent hot-key reads should exercise shared-lock CLOCK hits");
+}
+
 void test_concurrent_compaction_with_writes() {
     TestDir dir("compact_with_writes");
     const std::string db_path = dir.file("store.dat");
@@ -462,6 +672,131 @@ void test_concurrent_compaction_with_writes() {
             require(as_string(*value) == expected, "compaction must preserve the latest committed value");
         }
     }
+}
+
+void test_compaction_delta_preserves_overwrites_deletes_transactions_and_scans() {
+    TestDir directory("compaction_delta_migration");
+    const std::string path = directory.file("store.dat");
+    KVStoreOptions options;
+    options.auto_compact_wal_bytes_threshold = 0;
+    options.auto_compact_invalid_wal_ratio_percent = 0;
+    options.max_batch_delay_us = 0;
+    auto store = std::make_unique<KVStore>(path, options);
+
+    std::vector<BatchWriteOperation> seed;
+    const Value large_value(std::vector<uint8_t>(256 * 1024, 0x5A));
+    for (int key = 0; key < 64; ++key) {
+        seed.push_back(BatchWriteOperation::PutInt(10000 + key, large_value));
+    }
+    for (int key = 0; key < 32; ++key) {
+        seed.push_back(BatchWriteOperation::Put(
+            "scan_" + std::to_string(key), text("scan-value-" + std::to_string(key))));
+    }
+    seed.push_back(BatchWriteOperation::PutInt(7000, text("before-compaction")));
+    seed.push_back(BatchWriteOperation::PutInt(7001, text("delete-during-compaction")));
+    store->WriteBatch(seed);
+
+    std::atomic<bool> stop_scans {false};
+    std::atomic<bool> compaction_done {false};
+    ThreadFailureCollector failures;
+    std::thread scanner(failures.guard([&] {
+        while (!stop_scans.load(std::memory_order_acquire)) {
+            const auto values = store->Scan("scan_", "scan_zzzz");
+            require(values.size() == 32,
+                    "A Scan concurrent with compaction migration must keep a complete view");
+            std::this_thread::yield();
+        }
+    }));
+    std::thread compactor(failures.guard([&] {
+        try {
+            store->Compact();
+        } catch (...) {
+            compaction_done.store(true, std::memory_order_release);
+            throw;
+        }
+        compaction_done.store(true, std::memory_order_release);
+    }));
+
+    const std::string temp_path = path + ".compact." +
+                                  std::to_string(static_cast<long long>(::getpid())) + ".0";
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    bool observed_temp = false;
+    while (std::chrono::steady_clock::now() < deadline &&
+           !compaction_done.load(std::memory_order_acquire)) {
+        if (std::filesystem::exists(temp_path)) {
+            observed_temp = true;
+            break;
+        }
+        std::this_thread::yield();
+    }
+    if (!observed_temp) {
+        stop_scans.store(true, std::memory_order_release);
+        compactor.join();
+        scanner.join();
+        failures.rethrow_first();
+        require(false,
+                "The compaction test must observe the temporary generation before issuing delta writes");
+        return;
+    }
+
+    store->Put(7000, text("delta-one"));
+    store->Put(7000, text("delta-two"));
+    store->Delete(7000);
+    store->Put(7000, text("delta-final"));
+    store->Delete(7001);
+    store->WriteBatch({
+        BatchWriteOperation::PutInt(7002, text("batch-live")),
+        BatchWriteOperation::PutInt(7003, text("batch-delete")),
+        BatchWriteOperation::DeleteInt(7003),
+    });
+    std::optional<Value> observed;
+    {
+        auto transaction = store->BeginTransaction();
+        observed = transaction.Get(7000);
+        transaction.Put(7004, text("transaction-live"));
+        transaction.Commit();
+    }
+
+    compactor.join();
+    stop_scans.store(true, std::memory_order_release);
+    scanner.join();
+    failures.rethrow_first();
+    require(observed.has_value() && as_string(*observed) == "delta-final",
+            "A transaction concurrent with migration must read the latest committed delta");
+    require(store->Get(7000).has_value() &&
+                as_string(*store->Get(7000)) == "delta-final" &&
+                !store->Get(7001).has_value() &&
+                store->Get(7002).has_value() &&
+                !store->Get(7003).has_value() &&
+                store->Get(7004).has_value(),
+            "Compaction migration must preserve delta overwrites, deletes, batches, and transactions");
+
+    const KVStoreMetrics before_restart = store->GetMetrics();
+    require(before_restart.wal_bytes_since_compaction ==
+                before_restart.live_wal_bytes_since_compaction +
+                    before_restart.obsolete_wal_bytes_since_compaction &&
+                before_restart.obsolete_wal_bytes_since_compaction > 0,
+            "The switched WAL epoch must exactly account for overwritten compaction delta frames");
+    const auto inspection = kvstore::internal::inspect_file(path);
+    require(inspection.journal_frames >= 7,
+            "Writes issued after the compaction cut must remain as complete journal frames");
+
+    store.reset();
+    KVStore reopened(path, options);
+    require(reopened.Get(7000).has_value() &&
+                as_string(*reopened.Get(7000)) == "delta-final" &&
+                !reopened.Get(7001).has_value() &&
+                reopened.Get(7002).has_value() &&
+                !reopened.Get(7003).has_value() &&
+                reopened.Get(7004).has_value(),
+            "Restart after compaction migration must replay the complete journal delta");
+    const KVStoreMetrics recovered = reopened.GetMetrics();
+    require(recovered.wal_bytes_since_compaction == before_restart.wal_bytes_since_compaction &&
+                recovered.live_wal_bytes_since_compaction ==
+                    before_restart.live_wal_bytes_since_compaction &&
+                recovered.obsolete_wal_bytes_since_compaction ==
+                    before_restart.obsolete_wal_bytes_since_compaction,
+            "Restart must reconstruct the switched compaction WAL accounting epoch");
 }
 
 void test_recommended_profiles_are_distinct() {
@@ -526,8 +861,11 @@ void register_runtime_concurrency_tests(TestCases& tests) {
     tests.push_back({"many concurrent writers", test_many_concurrent_writers});
     tests.push_back({"mixed 8/16/32 producer models", test_mixed_8_16_32_producer_models});
     tests.push_back({"small write history is linearizable", test_small_write_history_is_linearizable});
+    tests.push_back({"mixed history has a legal exhaustive serialization", test_mixed_history_has_a_real_time_consistent_serialization});
     tests.push_back({"concurrent scan observes complete batches", test_concurrent_scan_observes_complete_batches});
+    tests.push_back({"hot shard readers race safely with clock eviction", test_hot_shard_readers_race_safely_with_clock_eviction});
     tests.push_back({"concurrent compaction with writes", test_concurrent_compaction_with_writes});
+    tests.push_back({"compaction delta preserves concurrent operations", test_compaction_delta_preserves_overwrites_deletes_transactions_and_scans});
     tests.push_back({"recommended profiles are distinct", test_recommended_profiles_are_distinct});
     tests.push_back({"concurrency stress profiles are distinct", test_concurrency_stress_profiles_are_distinct});
 }

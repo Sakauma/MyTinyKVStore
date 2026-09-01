@@ -15,6 +15,18 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+#include <nmmintrin.h>
+#endif
+
+#if defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
+#include <arm_acle.h>
+#if defined(__linux__)
+#include <asm/hwcap.h>
+#include <sys/auxv.h>
+#endif
+#endif
+
 namespace kvstore::internal {
 
 static_assert(sizeof(Superblock) <= kSuperblockBytes, "superblock must fit in one block");
@@ -116,14 +128,22 @@ uint32_t frame_header_checksum(const FrameHeader& value) {
     return crc32c(&normalized, sizeof(normalized));
 }
 
-uint32_t mutation_checksum(const MutationHeader& value,
-                           std::string_view key,
-                           const Value& payload) {
+uint32_t mutation_checksum_bytes(const MutationHeader& value,
+                                 std::string_view key,
+                                 const void* payload,
+                                 size_t payload_size) {
     MutationHeader normalized = value;
     normalized.checksum = 0;
     uint32_t checksum = crc32c(&normalized, sizeof(normalized));
     checksum = crc32c_extend(checksum, key.data(), key.size());
-    return crc32c_extend(checksum, payload.bytes.data(), payload.bytes.size());
+    return crc32c_extend(checksum, payload, payload_size);
+}
+
+uint32_t mutation_checksum(const MutationHeader& value,
+                           std::string_view key,
+                           const Value& payload) {
+    return mutation_checksum_bytes(
+        value, key, payload.bytes.data(), payload.bytes.size());
 }
 
 uint32_t footer_checksum(const FrameFooter& value) {
@@ -167,7 +187,7 @@ void validate_key_and_value(const Mutation& operation) {
     }
 }
 
-void classify_key(const std::string& key, RecoveryResult& result) {
+void classify_key(std::string_view key, RecoveryResult& result) {
     if (key.empty()) {
         return;
     }
@@ -203,6 +223,20 @@ uint32_t crc_file_region(int fd,
     return checksum;
 }
 
+bool valid_superblock_layout(const Superblock& superblock, uint64_t size) {
+    if (superblock.index_offset != kDataOffset ||
+        superblock.checkpoint_checksum > std::numeric_limits<uint32_t>::max() ||
+        add_overflows(superblock.index_offset, superblock.index_length) ||
+        add_overflows(superblock.object_offset, superblock.object_length)) {
+        return false;
+    }
+    const uint64_t index_end = superblock.index_offset + superblock.index_length;
+    const uint64_t object_end = superblock.object_offset + superblock.object_length;
+    return superblock.object_offset == index_end &&
+           superblock.journal_offset == object_end &&
+           index_end <= size && object_end <= size && superblock.journal_offset <= size;
+}
+
 Superblock read_best_superblock(int fd,
                                 const std::string& path,
                                 uint64_t size,
@@ -215,27 +249,18 @@ Superblock read_best_superblock(int fd,
     pread_exact(fd, &copies[0], sizeof(Superblock), 0, path);
     pread_exact(fd, &copies[1], sizeof(Superblock), kSuperblockBytes, path);
 
-    const bool valid[2] = {valid_superblock(copies[0]), valid_superblock(copies[1])};
+    const bool valid[2] = {
+        valid_superblock(copies[0]) && valid_superblock_layout(copies[0], size),
+        valid_superblock(copies[1]) && valid_superblock_layout(copies[1], size),
+    };
     valid_count = static_cast<uint32_t>(valid[0]) + static_cast<uint32_t>(valid[1]);
     if (valid_count == 0) {
-        throw KVStoreError("Both superblocks are invalid: " + path);
+        throw KVStoreError(
+            "Both superblocks are invalid or contain invalid region boundaries: " + path);
     }
-    const Superblock& selected = !valid[0] ? copies[1]
-                                       : !valid[1] ? copies[0]
-                                                   : (copies[1].generation > copies[0].generation ? copies[1] : copies[0]);
-
-    if (selected.index_offset < kDataOffset ||
-        selected.checkpoint_checksum > std::numeric_limits<uint32_t>::max() ||
-        add_overflows(selected.index_offset, selected.index_length) ||
-        add_overflows(selected.object_offset, selected.object_length) ||
-        selected.index_offset + selected.index_length > size ||
-        selected.object_offset + selected.object_length > size ||
-        selected.journal_offset > size ||
-        selected.object_offset < selected.index_offset + selected.index_length ||
-        selected.journal_offset < selected.object_offset + selected.object_length) {
-        throw KVStoreError("Superblock contains invalid region boundaries: " + path);
-    }
-    return selected;
+    return !valid[0] ? copies[1]
+                     : !valid[1] ? copies[0]
+                                 : (copies[1].generation > copies[0].generation ? copies[1] : copies[0]);
 }
 
 void recover_checkpoint(int fd,
@@ -328,12 +353,12 @@ void recover_checkpoint(int fd,
     }
 }
 
-std::vector<Mutation> parse_payload(const uint8_t* data,
-                                      size_t size,
-                                      uint32_t expected_operations,
-                                      const std::string& path) {
-    std::vector<Mutation> operations;
-    operations.reserve(expected_operations);
+template <typename Visitor>
+void parse_payload_pass(const uint8_t* data,
+                        size_t size,
+                        uint32_t expected_operations,
+                        const std::string& path,
+                        Visitor&& visitor) {
     size_t cursor = 0;
     for (uint32_t index = 0; index < expected_operations; ++index) {
         if (size - cursor < sizeof(MutationHeader)) {
@@ -351,37 +376,27 @@ std::vector<Mutation> parse_payload(const uint8_t* data,
             size - cursor < static_cast<uint64_t>(header.key_size) + header.value_size) {
             throw KVStoreError("storage transaction mutation is invalid: " + path);
         }
-        std::string key(reinterpret_cast<const char*>(data + cursor), header.key_size);
+        const std::string_view key(
+            reinterpret_cast<const char*>(data + cursor), header.key_size);
         cursor += header.key_size;
         validate_encoded_key(key);
-        const uint64_t value_offset = cursor;
-        Value value(std::vector<uint8_t>(header.value_size));
-        if (header.value_size != 0) {
-            std::memcpy(value.bytes.data(), data + cursor, header.value_size);
-            cursor += header.value_size;
-        }
-        if (header.checksum != mutation_checksum(header, key, value)) {
+        const size_t value_offset = cursor;
+        const uint8_t* value = data + cursor;
+        if (header.checksum != mutation_checksum_bytes(
+                                   header, key, value, header.value_size)) {
             throw KVStoreError("storage transaction mutation checksum mismatch: " + path);
         }
-        Mutation operation {
-            static_cast<MutationType>(header.type),
-            std::move(key),
-            std::move(value),
-        };
-        operation.value_offset = value_offset;
-        operation.value_checksum = crc32c(operation.value.bytes.data(), operation.value.bytes.size());
-        operation.has_backing = operation.type == MutationType::kPut;
-        operations.push_back(std::move(operation));
+        visitor(index, header, key, value, value_offset);
+        cursor += header.value_size;
     }
     if (cursor != size) {
         throw KVStoreError("storage transaction payload has trailing bytes: " + path);
     }
-    return operations;
 }
 
 }  // namespace
 
-uint32_t crc32c_extend(uint32_t seed, const void* data, size_t size) {
+uint32_t crc32c_software_extend(uint32_t seed, const void* data, size_t size) {
     uint32_t crc = ~seed;
     const auto* bytes = static_cast<const uint8_t*>(data);
     for (size_t index = 0; index < size; ++index) {
@@ -392,6 +407,100 @@ uint32_t crc32c_extend(uint32_t seed, const void* data, size_t size) {
         }
     }
     return ~crc;
+}
+
+namespace {
+
+using Crc32cExtendFunction = uint32_t (*)(uint32_t, const void*, size_t);
+
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("sse4.2")))
+uint32_t crc32c_x86_extend(uint32_t seed, const void* data, size_t size) {
+    uint64_t crc = static_cast<uint64_t>(~seed);
+    const auto* cursor = static_cast<const uint8_t*>(data);
+#if defined(__x86_64__)
+    while (size >= sizeof(uint64_t)) {
+        uint64_t word;
+        std::memcpy(&word, cursor, sizeof(word));
+        crc = _mm_crc32_u64(crc, word);
+        cursor += sizeof(word);
+        size -= sizeof(word);
+    }
+#endif
+    while (size >= sizeof(uint32_t)) {
+        uint32_t word;
+        std::memcpy(&word, cursor, sizeof(word));
+        crc = _mm_crc32_u32(static_cast<uint32_t>(crc), word);
+        cursor += sizeof(word);
+        size -= sizeof(word);
+    }
+    while (size != 0) {
+        crc = _mm_crc32_u8(static_cast<uint32_t>(crc), *cursor++);
+        --size;
+    }
+    return ~static_cast<uint32_t>(crc);
+}
+
+bool x86_crc32c_available() {
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("sse4.2");
+}
+#endif
+
+#if defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("+crc")))
+uint32_t crc32c_arm_extend(uint32_t seed, const void* data, size_t size) {
+    uint32_t crc = ~seed;
+    const auto* cursor = static_cast<const uint8_t*>(data);
+    while (size >= sizeof(uint64_t)) {
+        uint64_t word;
+        std::memcpy(&word, cursor, sizeof(word));
+        crc = __crc32cd(crc, word);
+        cursor += sizeof(word);
+        size -= sizeof(word);
+    }
+    while (size >= sizeof(uint32_t)) {
+        uint32_t word;
+        std::memcpy(&word, cursor, sizeof(word));
+        crc = __crc32cw(crc, word);
+        cursor += sizeof(word);
+        size -= sizeof(word);
+    }
+    while (size != 0) {
+        crc = __crc32cb(crc, *cursor++);
+        --size;
+    }
+    return ~crc;
+}
+
+bool arm_crc32c_available() {
+#if defined(__linux__) && defined(HWCAP_CRC32)
+    return (::getauxval(AT_HWCAP) & HWCAP_CRC32) != 0;
+#else
+    return false;
+#endif
+}
+#endif
+
+Crc32cExtendFunction select_crc32c_implementation() {
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+    if (x86_crc32c_available()) {
+        return &crc32c_x86_extend;
+    }
+#endif
+#if defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
+    if (arm_crc32c_available()) {
+        return &crc32c_arm_extend;
+    }
+#endif
+    return &crc32c_software_extend;
+}
+
+}  // namespace
+
+uint32_t crc32c_extend(uint32_t seed, const void* data, size_t size) {
+    static const Crc32cExtendFunction implementation = select_crc32c_implementation();
+    return implementation(seed, data, size);
 }
 
 uint32_t crc32c(const void* data, size_t size) {
@@ -405,6 +514,23 @@ uint64_t stable_key_hash(const std::string& key) {
         hash *= 1099511628211ULL;
     }
     return hash;
+}
+
+uint64_t mutation_physical_charge(uint64_t encoded_mutation_bytes,
+                                  uint32_t operation_index,
+                                  uint32_t operation_count) {
+    if (operation_count == 0 || operation_index >= operation_count) {
+        throw KVStoreError("Cannot assign WAL charge for an invalid operation index");
+    }
+    constexpr uint64_t frame_overhead = sizeof(FrameHeader) + sizeof(FrameFooter);
+    const uint64_t overhead_share = frame_overhead / operation_count;
+    const uint64_t overhead_remainder = frame_overhead % operation_count;
+    const uint64_t assigned_overhead = overhead_share +
+                                       (operation_index < overhead_remainder ? 1U : 0U);
+    if (encoded_mutation_bytes > std::numeric_limits<uint64_t>::max() - assigned_overhead) {
+        throw KVStoreError("WAL mutation charge overflows uint64_t");
+    }
+    return encoded_mutation_bytes + assigned_overhead;
 }
 
 Superblock make_superblock(uint64_t generation,
@@ -515,13 +641,16 @@ std::vector<uint8_t> serialize_payload(const std::vector<Mutation>& operations) 
     return payload;
 }
 
-std::vector<uint8_t> serialize_frame(const std::vector<uint8_t>& payload,
-                                     uint32_t operation_count,
-                                     uint64_t lsn) {
-    if (operation_count == 0 || lsn == 0 || payload.size() > kMaxTransactionBytes) {
+FrameHeader make_frame_header(uint64_t payload_bytes,
+                              uint32_t operation_count,
+                              uint64_t lsn,
+                              uint32_t payload_checksum) {
+    if (operation_count == 0 || lsn == 0 || payload_bytes > kMaxTransactionBytes ||
+        payload_bytes > std::numeric_limits<uint64_t>::max() -
+                            sizeof(FrameHeader) - sizeof(FrameFooter)) {
         throw KVStoreError("Cannot serialize an empty or oversized storage transaction frame");
     }
-    const uint64_t frame_bytes = sizeof(FrameHeader) + payload.size() + sizeof(FrameFooter);
+    const uint64_t frame_bytes = sizeof(FrameHeader) + payload_bytes + sizeof(FrameFooter);
     FrameHeader header {
         kFrameMagic,
         static_cast<uint16_t>(kFormatVersion),
@@ -530,23 +659,36 @@ std::vector<uint8_t> serialize_frame(const std::vector<uint8_t>& payload,
         frame_bytes,
         lsn,
         operation_count,
-        crc32c(payload.data(), payload.size()),
+        payload_checksum,
         0,
         0,
     };
     header.header_checksum = frame_header_checksum(header);
+    return header;
+}
+
+FrameFooter make_frame_footer(const FrameHeader& header) {
     FrameFooter footer {
         kFooterMagic,
         kFormatVersion,
-        lsn,
-        frame_bytes,
+        header.lsn,
+        header.frame_bytes,
         header.payload_checksum,
         0,
     };
     footer.checksum = footer_checksum(footer);
+    return footer;
+}
+
+std::vector<uint8_t> serialize_frame(const std::vector<uint8_t>& payload,
+                                     uint32_t operation_count,
+                                     uint64_t lsn) {
+    const FrameHeader header = make_frame_header(
+        payload.size(), operation_count, lsn, crc32c(payload.data(), payload.size()));
+    const FrameFooter footer = make_frame_footer(header);
 
     std::vector<uint8_t> frame;
-    frame.reserve(static_cast<size_t>(frame_bytes));
+    frame.reserve(static_cast<size_t>(header.frame_bytes));
     append_object(frame, header);
     append_bytes(frame, payload.data(), payload.size());
     append_object(frame, footer);
@@ -617,6 +759,7 @@ RecoveryResult recover_file(int fd,
     RecoveryResult result;
     uint64_t size = file_size(fd, path);
     result.superblock = read_best_superblock(fd, path, size, result.valid_superblocks);
+    result.degraded_superblocks = result.valid_superblocks != 2;
     result.last_lsn = result.superblock.checkpoint_lsn;
     recover_checkpoint(fd, path, result.superblock, apply, result);
 
@@ -670,23 +813,57 @@ RecoveryResult recover_file(int fd,
             throw KVStoreError("Invalid storage transaction commit footer at offset " + std::to_string(offset));
         }
 
-        auto operations = parse_payload(payload.data(), payload.size(), header.operation_count, path);
-        for (auto& operation : operations) {
-            if (operation.has_backing) {
-                operation.value_offset += offset + sizeof(FrameHeader);
-            }
-            classify_key(operation.key, result);
-            if (operation.type == MutationType::kPut) {
-                ++result.put_operations;
-            } else {
-                ++result.delete_operations;
-            }
-            if (apply) {
+        parse_payload_pass(
+            payload.data(),
+            payload.size(),
+            header.operation_count,
+            path,
+            [](uint32_t,
+               const MutationHeader&,
+               std::string_view,
+               const uint8_t*,
+               size_t) {});
+        parse_payload_pass(
+            payload.data(),
+            payload.size(),
+            header.operation_count,
+            path,
+            [&](uint32_t operation_index,
+                const MutationHeader& mutation_header,
+                std::string_view key,
+                const uint8_t* value_bytes,
+                size_t value_offset) {
+                classify_key(key, result);
+                const MutationType type = static_cast<MutationType>(mutation_header.type);
+                if (type == MutationType::kPut) {
+                    ++result.put_operations;
+                } else {
+                    ++result.delete_operations;
+                }
+                if (!apply) {
+                    return;
+                }
+                Value value(std::vector<uint8_t>(mutation_header.value_size));
+                if (mutation_header.value_size != 0) {
+                    std::memcpy(
+                        value.bytes.data(), value_bytes, mutation_header.value_size);
+                }
+                Mutation operation {
+                    type,
+                    std::string(key),
+                    std::move(value),
+                };
+                operation.value_offset = offset + sizeof(FrameHeader) + value_offset;
+                operation.value_checksum = crc32c(value_bytes, mutation_header.value_size);
+                operation.wal_charge = mutation_physical_charge(
+                    sizeof(MutationHeader) + key.size() + mutation_header.value_size,
+                    operation_index,
+                    header.operation_count);
+                operation.has_backing = type == MutationType::kPut;
                 apply(operation, header.lsn);
-            }
-        }
+            });
         ++result.journal_frames;
-        result.journal_operations += operations.size();
+        result.journal_operations += header.operation_count;
         result.last_lsn = header.lsn;
         offset += header.frame_bytes;
     }

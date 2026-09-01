@@ -4,13 +4,21 @@
 #include "tests/common/format_analysis.h"
 #include "tests/common/test_support.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <cerrno>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <string>
 #include <vector>
+
+#include <sys/stat.h>
+#if defined(__linux__)
+#include <sys/xattr.h>
+#endif
+#include <unistd.h>
 
 namespace kvstore::tests::integration {
 namespace {
@@ -83,6 +91,28 @@ void test_recovery_from_single_file_journal() {
             "integer value should recover from the in-file journal");
     require(reopened.Get(std::string("alpha")).has_value(),
             "string value should recover from the in-file journal");
+}
+
+void test_existing_zero_length_file_is_rejected_without_modification() {
+    TestDir directory("storage_existing_empty");
+    const std::string path = directory.file("store.dat");
+    {
+        std::ofstream file(path, std::ios::binary);
+        require(file.is_open(), "Expected to create an empty database file");
+    }
+    require(std::filesystem::file_size(path) == 0, "Test database should start empty");
+
+    bool rejected = false;
+    try {
+        KVStore store(path);
+        (void)store;
+    } catch (const KVStoreError& error) {
+        rejected = std::string(error.what()).find("Existing database file is empty") !=
+                   std::string::npos;
+    }
+    require(rejected, "An existing zero-length file must not be treated as a new database");
+    require(std::filesystem::file_size(path) == 0,
+            "Rejecting an existing zero-length file must leave it byte-for-byte untouched");
 }
 
 void test_write_batch_tail_is_all_or_nothing() {
@@ -284,6 +314,35 @@ void test_single_superblock_corruption_is_recoverable_but_degraded() {
     require(reopened.Get(5).has_value(), "runtime should recover through the second superblock copy");
 }
 
+void test_structurally_invalid_higher_generation_superblock_falls_back() {
+    TestDir directory("storage_superblock_generation_fallback");
+    const std::string path = directory.file("store.dat");
+    {
+        KVStore store(path);
+        store.Put(17, text("seventeen"));
+    }
+
+    const auto healthy = read_object<kvstore::internal::Superblock>(path, 0);
+    auto forged = read_object<kvstore::internal::Superblock>(
+        path, kvstore::internal::kSuperblockBytes);
+    forged.generation = healthy.generation + 100;
+    forged.object_offset = std::numeric_limits<uint64_t>::max();
+    forged.checksum = 0;
+    forged.checksum = kvstore::internal::crc32c(&forged, sizeof(forged));
+    write_object(path, kvstore::internal::kSuperblockBytes, forged);
+
+    const auto inspection = kvstore::internal::inspect_file(path);
+    require(inspection.valid_superblocks == 1 && inspection.degraded_superblocks,
+            "A structurally invalid superblock must be excluded before generation selection");
+    require(inspection.superblock.generation == healthy.generation,
+            "Recovery must select the lower-generation structurally healthy copy");
+
+    KVStore reopened(path);
+    const auto value = reopened.Get(17);
+    require(value.has_value() && as_string(*value) == "seventeen",
+            "Fallback to the healthy superblock must preserve committed state");
+}
+
 void test_both_superblocks_corrupted_are_rejected() {
     TestDir directory("storage_both_superblocks");
     const std::string path = directory.file("store.dat");
@@ -324,6 +383,77 @@ void test_compaction_rewrites_checkpoint_and_preserves_state() {
     }
 }
 
+void test_compaction_preserves_metadata_and_releases_old_inode() {
+    TestDir directory("storage_compaction_metadata");
+    const std::string path = directory.file("store.dat");
+    KVStore store(path);
+    store.Put(1, text("metadata-value"));
+    require(::chmod(path.c_str(), 0640) == 0,
+            "Test database permissions should be configurable");
+
+    struct stat before {};
+    require(::stat(path.c_str(), &before) == 0,
+            "Test database metadata should be readable before compaction");
+    bool xattr_supported = false;
+#if defined(__linux__)
+    const std::string xattr_value = "metadata-preserved";
+    if (::setxattr(path.c_str(),
+                   "user.mytinykvstore.test",
+                   xattr_value.data(),
+                   xattr_value.size(),
+                   0) == 0) {
+        xattr_supported = true;
+    } else {
+        require(errno == ENOTSUP || errno == EOPNOTSUPP,
+                "Unexpected failure while setting the compaction xattr fixture");
+    }
+#endif
+
+    store.Compact();
+
+    struct stat after {};
+    require(::stat(path.c_str(), &after) == 0,
+            "Compacted database metadata should be readable");
+    require((after.st_mode & 07777) == (before.st_mode & 07777) &&
+                after.st_uid == before.st_uid && after.st_gid == before.st_gid,
+            "Compaction must preserve mode, uid, and gid");
+    require(after.st_ino != before.st_ino,
+            "Compaction should publish a new inode generation");
+
+#if defined(__linux__)
+    if (xattr_supported) {
+        std::vector<char> value(64);
+        const ssize_t size = ::getxattr(
+            path.c_str(), "user.mytinykvstore.test", value.data(), value.size());
+        require(size == static_cast<ssize_t>(xattr_value.size()) &&
+                    std::string(value.data(), static_cast<size_t>(size)) == xattr_value,
+                "Compaction must preserve supported xattrs and POSIX ACL metadata");
+    }
+#else
+    (void)xattr_supported;
+#endif
+
+    bool old_inode_still_open = false;
+    for (const auto& descriptor : std::filesystem::directory_iterator("/proc/self/fd")) {
+        const std::string name = descriptor.path().filename().string();
+        if (name.empty() ||
+            !std::all_of(name.begin(), name.end(), [](char character) {
+                return character >= '0' && character <= '9';
+            })) {
+            continue;
+        }
+        struct stat descriptor_metadata {};
+        if (::fstat(std::stoi(name), &descriptor_metadata) == 0 &&
+            descriptor_metadata.st_dev == before.st_dev &&
+            descriptor_metadata.st_ino == before.st_ino) {
+            old_inode_still_open = true;
+            break;
+        }
+    }
+    require(!old_inode_still_open,
+            "Manual Compact must finish entry migration and release the old inode before returning");
+}
+
 void test_inspect_and_verify_use_runtime_parser() {
     TestDir directory("storage_inspect");
     const std::string path = directory.file("store.dat");
@@ -346,6 +476,7 @@ void test_inspect_and_verify_use_runtime_parser() {
 
 void register_recovery_format_tests(TestCases& tests) {
     tests.push_back({"storage recovers from its single-file journal", test_recovery_from_single_file_journal});
+    tests.push_back({"existing empty database is rejected without modification", test_existing_zero_length_file_is_rejected_without_modification});
     tests.push_back({"torn WriteBatch is recovered all-or-nothing", test_write_batch_tail_is_all_or_nothing});
     tests.push_back({"truncated storage tail is reported then repaired", test_truncated_tail_is_reported_then_repaired});
     tests.push_back({"corrupted complete storage frame is rejected", test_corrupted_complete_frame_is_rejected});
@@ -354,8 +485,10 @@ void register_recovery_format_tests(TestCases& tests) {
     tests.push_back({"forged storage operation count is bounded", test_forged_operation_count_is_rejected_before_allocation});
     tests.push_back({"forged storage region length is bounded", test_forged_region_length_is_rejected_before_allocation});
     tests.push_back({"single superblock corruption is recoverable", test_single_superblock_corruption_is_recoverable_but_degraded});
+    tests.push_back({"invalid higher-generation superblock falls back", test_structurally_invalid_higher_generation_superblock_falls_back});
     tests.push_back({"both superblocks corrupted are rejected", test_both_superblocks_corrupted_are_rejected});
     tests.push_back({"storage compaction checkpoint preserves state", test_compaction_rewrites_checkpoint_and_preserves_state});
+    tests.push_back({"storage compaction preserves metadata and closes old inode", test_compaction_preserves_metadata_and_releases_old_inode});
     tests.push_back({"inspect and verify share the runtime parser", test_inspect_and_verify_use_runtime_parser});
 }
 

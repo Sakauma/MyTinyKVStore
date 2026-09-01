@@ -80,6 +80,8 @@ bash scripts/inspect-format.sh /data/store.db
 - `value_cache_hits` / `value_cache_misses`
 - `recovery_time_us`
 
+Value cache 是按规范化 key + LSN 标识的分段 CLOCK，不提供精确 LRU 顺序保证。容量为零时关闭；非零容量按每至少 64 KiB 一个 segment 配置 1–64 个二次幂 segment，所有 segment charge 之和不会超过 `value_cache_bytes`。
+
 ## Compaction 调优
 
 自动 compaction 默认关闭。启用时建议先只设置字节阈值，再依据真实 overwrite/delete 负载考虑无效比例阈值：
@@ -96,7 +98,7 @@ options.auto_compact_invalid_wal_ratio_percent = 0;
 - checkpoint 写入带宽是否挤压 journal 同步。
 - 数据集增长后 RSS 是否主要来自 key/index，而不是 value cache。
 
-手动 `Compact()` 保证返回时 compaction 完成。自动 compaction 在后台运行，但最终 inode 切换仍需要短暂停止 commit。
+手动 `Compact()` 保证返回时 entry 迁移完成且旧 inode 已释放。自动 compaction 在后台运行；最终提交暂停只包含 delta 复制、临时文件同步、rename、代际/accounting 发布和目录同步。逐 shard entry 迁移发生在恢复提交之后。观察 `max_compaction_pause_time_us` 时应把它解释为这段切换暂停，而不是完整 compaction 时长。
 
 ## Sticky fatal 处理
 
@@ -134,11 +136,14 @@ options.auto_compact_invalid_wal_ratio_percent = 0;
 ```bash
 bash scripts/ci-build.sh
 bash scripts/ci-sanitizers.sh
-bash scripts/tsan.sh
 bash scripts/concurrency-stress.sh 10 balanced
 bash scripts/concurrency-stress.sh 10 compaction-heavy
-bash scripts/qualification-benchmark.sh <output_dir> <baseline_json>
-bash scripts/qualification-run.sh <output_dir>
+qualification_root="$HOME/kvstore-qualification/$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$qualification_root"
+bash scripts/qualification-benchmark.sh \
+  "$qualification_root/benchmark" \
+  /path/to/frozen-baseline.json
+bash scripts/qualification-run.sh "$qualification_root/soak"
 ```
 
 WSL TSan 默认使用 `/usr/bin/g++-10`；如需替换，设置 `KVSTORE_TSAN_CXX`。
@@ -146,7 +151,7 @@ GCC 10 deadlock detector 受 64 锁上限影响，而 `Scan` 需要同时持有 
 锁，所以脚本设置 `detect_deadlocks=0`。这不会关闭数据竞争检测，任何竞态报告仍令
 CTest 或并发压力测试失败。TSan 缺失是失败，不会标为 SKIP。
 
-正式 qualification 命令、环境和结果必须一起归档；短时 smoke 不能替代 12 小时认证。
+正式 qualification 开始前，输出所在 ext4 文件系统必须至少有 25 GiB 可用空间。命令、环境和结果必须一起保存在 WSL ext4 的仓库外目录，不提交或推送；短时 smoke 不能替代 12 小时认证。
 
 ## 常见故障
 

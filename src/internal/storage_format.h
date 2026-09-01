@@ -104,6 +104,7 @@ struct Mutation {
     Value value;
     uint64_t value_offset = 0;
     uint32_t value_checksum = 0;
+    uint64_t wal_charge = 0;
     bool has_backing = false;
 };
 
@@ -126,6 +127,7 @@ struct RecoveryResult {
     uint64_t string_keys = 0;
     uint64_t binary_keys = 0;
     uint32_t valid_superblocks = 0;
+    bool degraded_superblocks = false;
     bool truncated_tail = false;
 };
 
@@ -133,7 +135,11 @@ using ApplyCallback = std::function<void(const Mutation&, uint64_t)>;
 
 uint32_t crc32c(const void* data, size_t size);
 uint32_t crc32c_extend(uint32_t seed, const void* data, size_t size);
+uint32_t crc32c_software_extend(uint32_t seed, const void* data, size_t size);
 uint64_t stable_key_hash(const std::string& key);
+uint64_t mutation_physical_charge(uint64_t encoded_mutation_bytes,
+                                  uint32_t operation_index,
+                                  uint32_t operation_count);
 
 Superblock make_superblock(uint64_t generation,
                            uint64_t checkpoint_lsn,
@@ -155,6 +161,11 @@ void write_superblocks(int fd, const Superblock& superblock, const std::string& 
 void initialize_file(int fd, const std::string& path);
 
 std::vector<uint8_t> serialize_payload(const std::vector<Mutation>& operations);
+FrameHeader make_frame_header(uint64_t payload_bytes,
+                              uint32_t operation_count,
+                              uint64_t lsn,
+                              uint32_t payload_checksum);
+FrameFooter make_frame_footer(const FrameHeader& header);
 std::vector<uint8_t> serialize_frame(const std::vector<uint8_t>& payload,
                                      uint32_t operation_count,
                                      uint64_t lsn);

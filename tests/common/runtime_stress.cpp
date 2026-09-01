@@ -83,6 +83,8 @@ int run_fault_injection_scenario(const std::string& scenario, const std::string&
         {"compaction_after_temp_sync", "after_compaction_temp_sync_before_rename"},
         {"compaction_after_rename", "after_compaction_rename_before_directory_sync"},
         {"compaction_after_directory_sync", "after_compaction_directory_sync"},
+        {"compaction_before_entry_migration", "before_compaction_entry_migration"},
+        {"compaction_after_entry_migration", "after_compaction_entry_migration"},
     };
     const auto compaction_failpoint = compaction_failpoints.find(scenario);
     if (compaction_failpoint != compaction_failpoints.end()) {

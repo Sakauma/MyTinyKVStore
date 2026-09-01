@@ -356,7 +356,7 @@ void test_value_cache_is_bounded_and_reports_hits_and_misses() {
     TestDir directory("bounded_value_cache");
     KVStoreOptions options;
     options.shard_count = 1;
-    options.value_cache_bytes = 160;
+    options.value_cache_bytes = 384;
     KVStore store(directory.file("store.dat"), options);
     store.Put(1, Value(std::vector<uint8_t>(24, 0x11)));
     store.Put(2, Value(std::vector<uint8_t>(24, 0x22)));

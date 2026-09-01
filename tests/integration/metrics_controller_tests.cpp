@@ -1,5 +1,7 @@
 #include "tests/integration/test_registry.h"
 
+#include "internal/key_codec.h"
+#include "internal/storage_format.h"
 #include "kvstore.h"
 
 #include <atomic>
@@ -178,6 +180,83 @@ void test_wal_obsolete_byte_metrics_are_consistent() {
             "live and obsolete WAL bytes should partition the accumulated WAL size");
     require(metrics.obsolete_wal_bytes_since_compaction > 0,
             "overwrites and deletes should create obsolete WAL bytes");
+}
+
+uint64_t single_int_frame_bytes(size_t value_bytes) {
+    return sizeof(kvstore::internal::FrameHeader) +
+           sizeof(kvstore::internal::FrameFooter) +
+           sizeof(kvstore::internal::MutationHeader) +
+           kvstore::internal::encode_int_key(0).size() + value_bytes;
+}
+
+void test_physical_wal_accounting_survives_recovery_and_compaction() {
+    TestDir dir("physical_wal_accounting");
+    const std::string db_path = dir.file("store.dat");
+    KVStoreMetrics before_restart;
+    {
+        KVStore store(db_path);
+        store.Put(1, text("a"));
+        store.Put(2, text("bb"));
+        KVStoreMetrics metrics = store.GetMetrics();
+        require(metrics.wal_bytes_since_compaction ==
+                    single_int_frame_bytes(1) + single_int_frame_bytes(2),
+                "WAL bytes must include complete physical frame overhead");
+        require(metrics.live_wal_bytes_since_compaction == metrics.wal_bytes_since_compaction &&
+                    metrics.obsolete_wal_bytes_since_compaction == 0,
+                "Unique keys must not create obsolete WAL bytes");
+
+        store.Put(1, text("ccc"));
+        store.Delete(1);
+        const size_t key_bytes = kvstore::internal::encode_int_key(3).size();
+        store.WriteBatch({
+            BatchWriteOperation::PutInt(3, text("x")),
+            BatchWriteOperation::PutInt(3, text("yy")),
+            BatchWriteOperation::DeleteInt(3),
+        });
+
+        metrics = store.GetMetrics();
+        const uint64_t batch_latest_charge = kvstore::internal::mutation_physical_charge(
+            sizeof(kvstore::internal::MutationHeader) + key_bytes,
+            2,
+            3);
+        const uint64_t expected_live = single_int_frame_bytes(2) +
+                                       single_int_frame_bytes(0) +
+                                       batch_latest_charge;
+        require(metrics.live_wal_bytes_since_compaction == expected_live,
+                "Only the newest physical mutation charge per key should remain live");
+        require(metrics.wal_bytes_since_compaction ==
+                    metrics.live_wal_bytes_since_compaction +
+                        metrics.obsolete_wal_bytes_since_compaction,
+                "Physical live and obsolete charges must exactly partition the journal");
+        require(metrics.obsolete_wal_bytes_since_compaction > 0,
+                "Overwrites and duplicate keys inside one batch must become obsolete");
+        before_restart = metrics;
+    }
+
+    {
+        KVStore reopened(db_path);
+        const KVStoreMetrics recovered = reopened.GetMetrics();
+        require(recovered.wal_bytes_since_compaction == before_restart.wal_bytes_since_compaction &&
+                    recovered.live_wal_bytes_since_compaction ==
+                        before_restart.live_wal_bytes_since_compaction &&
+                    recovered.obsolete_wal_bytes_since_compaction ==
+                        before_restart.obsolete_wal_bytes_since_compaction,
+                "Recovery must reconstruct byte-identical WAL accounting");
+
+        reopened.Compact();
+        const KVStoreMetrics compacted = reopened.GetMetrics();
+        require(compacted.wal_bytes_since_compaction == 0 &&
+                    compacted.live_wal_bytes_since_compaction == 0 &&
+                    compacted.obsolete_wal_bytes_since_compaction == 0,
+                "Compaction without concurrent writes must start a fresh empty WAL epoch");
+
+        reopened.Put(4, text("delta"));
+        const KVStoreMetrics delta = reopened.GetMetrics();
+        require(delta.wal_bytes_since_compaction == single_int_frame_bytes(5) &&
+                    delta.live_wal_bytes_since_compaction == delta.wal_bytes_since_compaction &&
+                    delta.obsolete_wal_bytes_since_compaction == 0,
+                "Post-compaction metrics must include only the new journal delta");
+    }
 }
 
 void test_batch_wal_byte_limit_is_respected() {
@@ -536,6 +615,61 @@ void test_recent_window_metrics_capture_bursts() {
             "recent latency window should expose a non-zero recent p95");
 }
 
+void test_recent_window_evicts_old_batches_and_reads() {
+    TestDir dir("recent_window_eviction");
+    const std::string db_path = dir.file("store.dat");
+
+    KVStoreOptions options;
+    options.max_batch_size = 1;
+    options.max_batch_delay_us = 0;
+    options.adaptive_recent_window_batches = 3;
+    options.adaptive_recent_write_sample_limit = 2;
+    KVStore store(db_path, options);
+
+    for (int batch = 1; batch <= 5; ++batch) {
+        for (int read = 0; read < batch; ++read) {
+            (void)store.Get(10000 + read);
+        }
+        store.Put(batch, text("window_" + std::to_string(batch)));
+    }
+
+    const KVStoreMetrics metrics = store.GetMetrics();
+    require(metrics.recent_window_batch_count == 3,
+            "The recent batch ring must have exactly the configured length");
+    require(metrics.recent_write_requests == 3 && metrics.recent_avg_batch_size == 1,
+            "Evicted batches must not contribute to recent committed-write statistics");
+    require(metrics.recent_read_requests == 12,
+            "Recent reads must be the deltas associated with the three retained batches");
+    require(metrics.recent_read_ratio_per_1000_ops == 800,
+            "Recent read ratio must use only retained read and write samples");
+    require(metrics.recent_observed_write_latency_p95_us > 0,
+            "The bounded recent completion sample set must produce a p95");
+}
+
+void test_recent_window_lengths_are_exact() {
+    for (size_t window : {size_t {1}, size_t {3}, size_t {64}}) {
+        TestDir dir("recent_window_length_" + std::to_string(window));
+        KVStoreOptions options;
+        options.max_batch_size = 1;
+        options.max_batch_delay_us = 0;
+        options.adaptive_recent_window_batches = window;
+        options.adaptive_recent_write_sample_limit = 128;
+        KVStore store(dir.file("store.dat"), options);
+
+        for (size_t batch = 0; batch < window + 2; ++batch) {
+            (void)store.Get(static_cast<int>(50000 + batch));
+            store.Put(static_cast<int>(batch), text("window"));
+        }
+
+        const KVStoreMetrics metrics = store.GetMetrics();
+        require(metrics.recent_window_batch_count == window &&
+                    metrics.recent_write_requests == window &&
+                    metrics.recent_read_requests == window &&
+                    metrics.recent_read_ratio_per_1000_ops == 500,
+                "Recent metrics must retain exactly the configured 1/3/64 batch window");
+    }
+}
+
 void test_read_heavy_signal_prefers_shorter_batches() {
     TestDir dir("read_heavy");
     const std::string db_path = dir.file("store.dat");
@@ -815,6 +949,7 @@ void register_metrics_controller_tests(TestCases& tests) {
     tests.push_back({"manual and auto compaction metrics coexist", test_manual_and_auto_compaction_metrics_coexist});
     tests.push_back({"invalid wal ratio triggers auto compaction", test_invalid_wal_ratio_triggers_auto_compaction});
     tests.push_back({"wal obsolete byte metrics are consistent", test_wal_obsolete_byte_metrics_are_consistent});
+    tests.push_back({"physical wal accounting survives recovery and compaction", test_physical_wal_accounting_survives_recovery_and_compaction});
     tests.push_back({"batch wal byte limit is respected", test_batch_wal_byte_limit_is_respected});
     tests.push_back({"latency histogram tracks write requests", test_latency_histogram_tracks_write_requests});
     tests.push_back({"adaptive batching expands batch under queue pressure", test_adaptive_batching_expands_batch_under_queue_pressure});
@@ -824,6 +959,8 @@ void register_metrics_controller_tests(TestCases& tests) {
     tests.push_back({"latency target adaptive flush kicks in", test_latency_target_adaptive_flush_kicks_in});
     tests.push_back({"fsync pressure can relax batch delay", test_fsync_pressure_can_relax_batch_delay});
     tests.push_back({"recent window metrics capture bursts", test_recent_window_metrics_capture_bursts});
+    tests.push_back({"recent window evicts old batches and reads", test_recent_window_evicts_old_batches_and_reads});
+    tests.push_back({"recent window lengths are exact", test_recent_window_lengths_are_exact});
     tests.push_back({"read heavy signal prefers shorter batches", test_read_heavy_signal_prefers_shorter_batches});
     tests.push_back({"compaction pressure signal relaxes batch delay", test_compaction_pressure_signal_relaxes_batch_delay});
     tests.push_back({"wal growth signal relaxes batch delay", test_wal_growth_signal_relaxes_batch_delay});

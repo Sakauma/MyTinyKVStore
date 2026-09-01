@@ -28,10 +28,14 @@
 运行：
 
 ```bash
+qualification_root="$HOME/kvstore-qualification/$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$qualification_root"
 bash scripts/qualification-benchmark.sh \
-  artifacts/qualification/canonical \
+  "$qualification_root/canonical" \
   /path/to/frozen-baseline.json
 ```
+
+开始前确认该 ext4 文件系统至少有 25 GiB 可用空间。Qualification 输出只保存在仓库外目录，不提交或推送。
 
 脚本会：
 
@@ -71,7 +75,7 @@ bash scripts/qualification-benchmark.sh \
 ## 补充矩阵
 
 ```bash
-bash scripts/qualification-matrix.sh artifacts/qualification/matrix
+bash scripts/qualification-matrix.sh "$qualification_root/matrix"
 ```
 
 默认矩阵覆盖：
@@ -100,10 +104,12 @@ bash scripts/qualification-matrix.sh artifacts/qualification/matrix
 
 同一 baseline/candidate 比较必须使用同一机器、磁盘、文件系统、内核策略和编译器配置。跨机器的比值没有认证意义。
 
+候选实现的 worker 负责 payload、payload/value CRC 和物理 WAL charge 准备；coordinator 负责 LSN、header/footer、ordered `pwritev` 与同步。热点读使用分段 CLOCK，compaction 使用文件代际并在提交暂停外迁移 entry。性能结果应同时保留 group size、worker utilization、cache hit rate 和 compaction pause 指标，以便判断吞吐变化来自哪条路径。
+
 ## 长时正确性认证
 
 ```bash
-bash scripts/qualification-run.sh artifacts/qualification/soak
+bash scripts/qualification-run.sh "$qualification_root/soak"
 ```
 
 脚本默认拒绝低于 43200 秒或 1000 万唯一整数键的参数。工作负载在写完目标唯一键后继续对这些键更新，直到持续时间满足；compaction 开启。两项条件同时满足后，harness 再执行最多 300 秒的纯覆盖写稳定窗口；短时 smoke 的稳定窗口按持续时间同比缩短。结束时：

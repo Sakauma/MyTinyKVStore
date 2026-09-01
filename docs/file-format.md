@@ -64,7 +64,7 @@ Index 以 32 字节 `IndexHeader` 开始：
 
 对象区只连续保存 value 字节。内存索引恢复后保存绝对文件 offset、长度和 checksum；value 不要求常驻内存。
 
-恢复 checkpoint 时，解析器按 entry 流式读取并校验对象，不把整个 object 区一次性分配进内存。Compaction 同样只快照 key 和 backing reference，再按块从旧 inode 流式复制 value。
+恢复 checkpoint 时，解析器按 entry 流式读取并校验对象，不把整个 object 区一次性分配进内存。Compaction 同样只快照 key 和 backing reference，并按文件代际与 offset 排序；相邻间隔不超过 64 KiB、总窗口不超过 1 MiB 的 value 会合并读取，其余 value 以 1 MiB 缓冲流式复制。
 
 ## Journal transaction frame
 
@@ -91,6 +91,16 @@ Commit footer 重复 LSN、frame 总长度和 payload checksum，并带自身 CR
 
 `WriteBatch` 与显式事务只产生一个 frame，因此恢复结果只能是全部操作出现或全部消失。一个 group commit 可以在同一次 `pwritev/fdatasync` 中写多个 frame，但 frame 仍保持独立事务边界和严格 LSN 顺序。
 
+Worker 在 LSN 分配前生成 payload、payload CRC、每个 value CRC 和 mutation 的物理 WAL charge。Coordinator 分配 LSN 后只填充 header/footer，并直接把三段 iovec 写入文件；分段写出的字节与连续 frame 编码完全一致。
+
+## WAL 容量统计
+
+- `wal_bytes_since_compaction` 是当前 journal 中所有完整物理 frame 的字节总和。
+- 每个 frame 的 header/footer 固定开销按 operation count 平均分配，余数字节归前若干 mutation；所有 mutation charge 之和严格等于 frame 大小。
+- 每个 key 只有最新 journal mutation 的 charge 属于 live。Put charge 保存在对应 entry 中；已删除 key 的最新 tombstone charge 保留到下一次 compaction。
+- 更早的覆盖、delete 前的 value 和批内重复 mutation 都属于 obsolete。
+- 运行时和恢复过程使用同一算法，始终满足 `wal = live + obsolete`；全新唯一 key 的 obsolete 为零。
+
 ## 恢复规则
 
 1. 读取并选择 superblock。
@@ -115,12 +125,12 @@ Operation count 还必须能够由实际 payload 容纳，禁止先按伪造 cou
 
 ## Compaction 切换
 
-1. 在 commit mutex 下记录 `start_lsn` 和旧文件 `start_offset`。
-2. 逐 shard 捕获 live key 的 backing reference，并在临时文件中流式生成 checkpoint。
-3. 对复制的每个 value 再算 CRC32C，生成并校验新 checkpoint checksum。
-4. 最终持有 commit mutex，复制 `[start_offset, end_offset)` journal delta，`fdatasync` 临时文件。
-5. 临时文件先持有独占锁，再 `rename` 到主路径；运行时立即切换到新 fd 并重定位全部 live offset。
-6. 同步父目录后释放提交暂停。
+1. 在 commit mutex 下记录 `start_lsn`、旧文件 `start_offset`，并启用第二个 WAL accounting epoch。
+2. 逐 shard 捕获 live key 的 backing reference；仍匹配的 entry 写入 relocation epoch/offset。
+3. 通过 unlink 后的 index/object spool 和 1 MiB 缓冲组装已加独占锁的临时主文件；checkpoint CRC 在顺序写入时增量计算，不重读完整输出。
+4. 最终只持有 commit mutex，复制 `[start_offset, end_offset)` journal delta，`fdatasync` 临时文件，`rename` 主路径，发布新文件代际与 WAL epoch，并同步父目录。该阶段不获取全部 shard 锁，也不遍历 live key。
+5. 释放 commit mutex 后逐 shard 迁移 entry：切点后的 value 按 journal delta 平移，切点前仍匹配 relocation epoch 的 value 指向新 checkpoint。被并发覆盖或删除的 entry 不会被旧 relocation 信息覆盖。
+6. 全部 entry 迁移完成后释放旧 inode。手动 `Compact()` 等待该过程完成；自动 compaction 在后台执行。
 
 临时文件不参与恢复。任意崩溃点只能留下旧主文件或已经自包含的新主文件。
 

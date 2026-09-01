@@ -23,5 +23,6 @@
 - 完整损坏与不完整尾部严格区分；完整损坏不能跳过。
 - `WriteBatch` 和显式事务按 frame 原子重放。
 - Runtime 与 verifier 不维护两套校验规则。
+- Journal 重放按完整物理 frame 为每条 mutation 分配 WAL charge，并重建与运行时一致的 live/obsolete accounting。
 
 恢复路径只识别当前格式；历史恢复实现已经归档，不参与运行库构造路径。

@@ -41,8 +41,8 @@
 
 - 内存 entry 不强制持有完整 value。
 - Value 可通过 offset/length/checksum `pread`。
-- 默认有界 LRU 为 256 MiB，value 与估算的每项元数据开销都计入预算。
-- 自动 compaction 在后台生成新容器；手动 `Compact()` 返回时完成。
+- 默认有界分段 CLOCK 为 256 MiB，value、key 与估算的每项节点开销都计入预算。
+- 自动 compaction 在后台生成新文件代际；手动 `Compact()` 返回时 entry 迁移完成且旧 inode 已释放。
 
 ## 正确性测试 gate
 
@@ -53,9 +53,11 @@
 - Short write/磁盘写错误、`EINTR` 重试路径和 sticky fatal。
 - 8/16/32 producers 的点操作、batch 和 transaction 模型比对。
 - Lost update、write skew、跨 shard 冲突、只读验证、read-your-writes、rollback、提交故障。
-- 并发 Scan/compaction 与状态一致性。
+- 并发 Scan/compaction 与状态一致性，包括 delta overwrite/delete、事务、文件代际迁移和旧 fd 生命周期。
 - 工作线程异常通过 `exception_ptr` 汇总，不允许不透明 `std::terminate`。
 - ASan、UBSan、TSan。TSan 配置、链接或运行时缺失都算失败。
+
+Sanitizer 构建类型固定为 `RelWithDebInfo`。ASan 默认开启 leak detection。GCC 10 TSan 因 deadlock detector 最多跟踪 64 把锁、而默认 `Scan` 同时持有 256 把 shard 锁，设置 `detect_deadlocks=0`；数据竞争检测与 `halt_on_error` 必须保持开启，并完成至少 10 秒 balanced TSan stress。
 
 ## 标准性能 gate
 
@@ -76,6 +78,8 @@
 - 端到端写 p99 中位数不高于基线的 120%。
 
 还必须归档 8/32 writers、64B/1KiB、hotspot 和 compaction-on 补充矩阵。
+
+认证开始前，WSL ext4 输出文件系统至少保留 25 GiB 可用空间。所有结果写到仓库外目录，不提交或推送。
 
 ## 长时 gate
 

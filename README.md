@@ -16,8 +16,8 @@ MyTinyKVStore 是一个使用 C++17 编写的小型嵌入式键值存储引擎�
 - **显式事务**：move-only `KVTransaction` 支持 read-your-writes、提交验证、回滚和 shard-version OCC 冲突检测。
 - **多类型键**：点操作支持整数键、字符串键和二进制键；字符串键支持有序范围扫描。
 - **三种持久化模式**：提供同步、周期同步和手动同步模式，并通过 `Flush()` 建立明确的持久化屏障。
-- **低停顿 Compaction**：后台生成新容器，在最终切换阶段短暂停止提交，回收无效 journal 空间。
-- **按需读取与缓存**：内存索引保存文件位置，value 通过 `pread` 读取；分片 LRU cache 加速热点访问。
+- **低停顿 Compaction**：后台生成新文件代际，最终切换只短暂停止提交，随后逐 shard 迁移内存 entry 并释放旧 inode。
+- **按需读取与缓存**：内存索引保存文件位置，value 通过 `pread` 读取；1–64 段的有界 CLOCK cache 加速热点访问。
 - **进程级独占锁**：同一个数据库文件只允许一个存储实例打开。
 - **可观测性**：内置吞吐、写延迟、group commit、同步耗时、事务冲突、compaction 停顿和 cache 命中率等指标。
 
@@ -31,21 +31,23 @@ flowchart LR
     D --> E[pwritev + fdatasync]
     E --> F[单一数据库文件]
     D --> G[分片内存索引]
-    G --> H[LRU Value Cache]
+    G --> H[Segmented CLOCK Value Cache]
     F --> I[Checkpoint + Objects + Journal]
 ```
 
 写入流程：
 
 1. 调用线程规范化键并将请求送入有界队列；队列满时自动形成背压。
-2. worker 并行完成请求校验和事务 payload 序列化。
-3. coordinator 按提交序号聚合准备完成的请求，验证事务版本并分配 LSN。
+2. worker 并行完成事务 payload 序列化、payload/value CRC32C 和物理 WAL charge 计算。
+3. coordinator 按提交序号聚合准备完成的请求，验证事务版本、分配 LSN 并填充 frame header/footer。
 4. 一组完整事务帧通过 `pwritev` 写入 journal；同步模式下执行一次 `fdatasync`。
 5. 写入成功后，按 shard ID 顺序加锁并原子发布内存状态，再唤醒调用方。
 
-点读取通过稳定哈希直接定位 shard，再从 LRU cache 或数据库文件读取 value。字符串 `Scan` 对各 shard 的有序索引执行 k-way merge，返回一致的范围结果。
+点读取通过稳定哈希直接定位 shard，再从按规范化 key 与 LSN 标识的分段 CLOCK cache 或对应文件代际读取 value。字符串 `Scan` 绕过 cache，对各 shard 的有序索引执行 k-way merge，返回一致的范围结果。
 
 启动恢复会依次校验 superblock、checkpoint 和 journal。完整且校验通过的事务帧按 LSN 重放，不完整的尾帧会被忽略，已提交的批次不会恢复出部分结果。
+
+Compaction 在开始时记录 journal 切点并构建 checkpoint；最终阶段只在 commit mutex 下复制 delta、同步临时文件、原子替换主文件并同步目录。旧 inode 会继续服务尚未迁移的 entry，提交恢复后再逐 shard 切换 backing generation，因此不会为了重定位全部 key 长时间暂停写入。
 
 ## 🚀 快速开始
 
@@ -148,6 +150,8 @@ int main() {
 | value cache | 256 MiB |
 | 持久化模式 | `kSync` |
 
+WAL 容量指标按物理 frame 计数：`wal_bytes_since_compaction` 包含完整 header、payload 和 footer；frame 固定开销按 mutation 分摊。每个 key 只有最新 journal mutation 的 charge 属于 live，delete tombstone 在下一次 compaction 前也属于 live，并始终满足 `wal = live + obsolete`。
+
 也可以使用内置负载配置快速生成参数：
 
 ```cpp
@@ -171,6 +175,8 @@ KVStore store("write-heavy.db", options);
 ```bash
 bash scripts/ci-sanitizers.sh
 ```
+
+Sanitizer 构建使用 `RelWithDebInfo`。ASan 默认启用 leak detection；TSan 保持数据竞争检测和 `halt_on_error`，并额外运行至少 10 秒 balanced 并发压力。
 
 运行基准与并发压力测试：
 
