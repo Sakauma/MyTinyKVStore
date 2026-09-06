@@ -1,5 +1,6 @@
 #include "tests/integration/test_registry.h"
 
+#include "internal/io.h"
 #include "internal/storage_format.h"
 #include "kvstore.h"
 #include "tests/common/runtime_entrypoints.h"
@@ -8,6 +9,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -48,21 +50,86 @@ public:
     ScopedThrowFailpoint& operator=(const ScopedThrowFailpoint&) = delete;
 };
 
-bool compaction_temp_exists(const std::string& database_path, uint64_t sequence) {
-    const std::filesystem::path database(database_path);
-    const std::filesystem::path parent = database.parent_path();
-    const std::string prefix = database.filename().string() + ".compact." +
-                               std::to_string(static_cast<long long>(::getpid())) + "." +
-                               std::to_string(sequence) + ".";
-    for (const auto& entry : std::filesystem::directory_iterator(parent)) {
-        const std::string filename = entry.path().filename().string();
-        if (filename.size() >= prefix.size() &&
-            filename.compare(0, prefix.size(), prefix) == 0) {
-            return true;
-        }
+class ScopedBlockingFailpoint {
+public:
+    explicit ScopedBlockingFailpoint(std::string name)
+        : state_(std::make_shared<State>(std::move(name))) {
+        kvstore::internal::install_failpoint_test_callback(
+            [state = state_](const char* current_name) {
+                if (state->name != current_name) {
+                    return;
+                }
+                std::unique_lock<std::mutex> lock(state->mutex);
+                state->reached = true;
+                state->condition.notify_all();
+                state->condition.wait(lock, [&state] { return state->released; });
+            });
     }
-    return false;
-}
+
+    ~ScopedBlockingFailpoint() {
+        Release();
+        kvstore::internal::clear_failpoint_test_callback();
+    }
+
+    void WaitUntilReached() {
+        std::unique_lock<std::mutex> lock(state_->mutex);
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+#if defined(KVSTORE_TSAN_INSTRUMENTED)
+        // GCC 10's libtsan does not intercept the pthread_cond_clockwait path
+        // used by steady-clock timed waits. Use the intercepted realtime path,
+        // then enforce the original steady-clock deadline.
+        while (!state_->reached) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                break;
+            }
+            const auto remaining = deadline - now;
+            auto wall_delay =
+                std::chrono::duration_cast<std::chrono::system_clock::duration>(
+                    remaining);
+            if (wall_delay < remaining) {
+                ++wall_delay;
+            }
+            state_->condition.wait_until(
+                lock, std::chrono::system_clock::now() + wall_delay);
+        }
+        const bool reached = state_->reached;
+#else
+        const bool reached = state_->condition.wait_until(
+            lock,
+            deadline,
+            [this] { return state_->reached; });
+#endif
+        require(reached,
+                "Compaction did not reach the checkpoint-complete test barrier");
+    }
+
+    void Release() noexcept {
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            state_->released = true;
+        }
+        state_->condition.notify_all();
+    }
+
+    ScopedBlockingFailpoint(const ScopedBlockingFailpoint&) = delete;
+    ScopedBlockingFailpoint& operator=(const ScopedBlockingFailpoint&) = delete;
+
+private:
+    struct State {
+        explicit State(std::string failpoint_name)
+            : name(std::move(failpoint_name)) {}
+
+        std::string name;
+        std::mutex mutex;
+        std::condition_variable condition;
+        bool reached = false;
+        bool released = false;
+    };
+
+    std::shared_ptr<State> state_;
+};
 
 void test_soak_profiles_are_distinct() {
     const SoakProfileSummary balanced = soak_profile_summary_entrypoint("balanced");
@@ -731,73 +798,63 @@ void test_compaction_delta_preserves_overwrites_deletes_transactions_and_scans()
     seed.push_back(BatchWriteOperation::PutInt(7001, text("delete-during-compaction")));
     store->WriteBatch(seed);
 
-    std::atomic<bool> stop_scans {false};
-    std::atomic<bool> compaction_done {false};
-    ThreadFailureCollector failures;
-    std::thread scanner(failures.guard([&] {
-        while (!stop_scans.load(std::memory_order_acquire)) {
-            const auto values = store->Scan("scan_", "scan_zzzz");
-            require(values.size() == 32,
-                    "A Scan concurrent with compaction migration must keep a complete view");
-            std::this_thread::yield();
-        }
-    }));
-    std::thread compactor(failures.guard([&] {
-        try {
-            store->Compact();
-        } catch (...) {
-            compaction_done.store(true, std::memory_order_release);
-            throw;
-        }
-        compaction_done.store(true, std::memory_order_release);
-    }));
-
     std::optional<Value> observed;
-    try {
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-        bool observed_temp = false;
-        while (std::chrono::steady_clock::now() < deadline &&
-               !compaction_done.load(std::memory_order_acquire)) {
-            if (compaction_temp_exists(path, 0)) {
-                observed_temp = true;
-                break;
+    {
+        std::atomic<bool> stop_scans {false};
+        ThreadFailureCollector failures;
+        ScopedBlockingFailpoint compaction_pause(
+            "after_checkpoint_write_before_sync");
+        std::thread scanner;
+        std::thread compactor;
+        try {
+            scanner = std::thread(failures.guard([&] {
+                while (!stop_scans.load(std::memory_order_acquire)) {
+                    const auto values = store->Scan("scan_", "scan_zzzz");
+                    require(values.size() == 32,
+                            "A Scan concurrent with compaction migration must keep a complete view");
+                    std::this_thread::yield();
+                }
+            }));
+            compactor = std::thread(failures.guard([&] {
+                store->Compact();
+            }));
+
+            compaction_pause.WaitUntilReached();
+
+            store->Put(7000, text("delta-one"));
+            store->Put(7000, text("delta-two"));
+            store->Delete(7000);
+            store->Put(7000, text("delta-final"));
+            store->Delete(7001);
+            store->WriteBatch({
+                BatchWriteOperation::PutInt(7002, text("batch-live")),
+                BatchWriteOperation::PutInt(7003, text("batch-delete")),
+                BatchWriteOperation::DeleteInt(7003),
+            });
+            auto transaction = store->BeginTransaction();
+            observed = transaction.Get(7000);
+            transaction.Put(7004, text("transaction-live"));
+            transaction.Commit();
+        } catch (...) {
+            const std::exception_ptr primary_failure = std::current_exception();
+            compaction_pause.Release();
+            stop_scans.store(true, std::memory_order_release);
+            if (compactor.joinable()) {
+                compactor.join();
             }
-            std::this_thread::yield();
+            if (scanner.joinable()) {
+                scanner.join();
+            }
+            failures.rethrow_first();
+            std::rethrow_exception(primary_failure);
         }
-        require(observed_temp,
-                "The compaction test must observe the temporary generation before issuing delta writes");
 
-        store->Put(7000, text("delta-one"));
-        store->Put(7000, text("delta-two"));
-        store->Delete(7000);
-        store->Put(7000, text("delta-final"));
-        store->Delete(7001);
-        store->WriteBatch({
-            BatchWriteOperation::PutInt(7002, text("batch-live")),
-            BatchWriteOperation::PutInt(7003, text("batch-delete")),
-            BatchWriteOperation::DeleteInt(7003),
-        });
-        auto transaction = store->BeginTransaction();
-        observed = transaction.Get(7000);
-        transaction.Put(7004, text("transaction-live"));
-        transaction.Commit();
-    } catch (...) {
-        const std::exception_ptr primary_failure = std::current_exception();
+        compaction_pause.Release();
+        compactor.join();
         stop_scans.store(true, std::memory_order_release);
-        if (compactor.joinable()) {
-            compactor.join();
-        }
-        if (scanner.joinable()) {
-            scanner.join();
-        }
+        scanner.join();
         failures.rethrow_first();
-        std::rethrow_exception(primary_failure);
     }
-
-    compactor.join();
-    stop_scans.store(true, std::memory_order_release);
-    scanner.join();
-    failures.rethrow_first();
     require(observed.has_value() && as_string(*observed) == "delta-final",
             "A transaction concurrent with migration must read the latest committed delta");
     require(store->Get(7000).has_value() &&
