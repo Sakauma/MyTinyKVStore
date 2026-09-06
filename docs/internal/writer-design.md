@@ -34,4 +34,6 @@
 
 Worker 的单请求序列化错误只完成该请求；journal write/sync、状态不变量和主 backing 读取/校验错误进入全局 sticky fatal。Compaction 尚未发布新代际时的普通临时文件错误只失败该次操作；主代际读取错误或 rename 后错误进入 sticky fatal。第一条根因在发布 fatal 标志前写入，避免并发调用看到空错误。
 
-最近窗口由 mutex 保护的批次环和写完成延迟样本组成。窗口严格保留 `adaptive_recent_window_batches` 个批次（上限 4096），p95 只使用最近 `adaptive_recent_write_sample_limit` 个完成样本；`GetMetrics()` 与 adaptive policy 读取同一快照。
+Coordinator 从首个就绪请求确定 group deadline。每次条件等待返回后都先重新读取时钟；已到 deadline 时立即关闭当前批次，随后才到达或才完成准备的请求留给下一批，不能因为唤醒与取队列之间的竞态越过期限。
+
+最近窗口由 mutex 保护的批次环和写完成延迟样本组成。窗口严格保留 `adaptive_recent_window_batches` 个批次（上限 4096），p95 只使用最近 `adaptive_recent_write_sample_limit` 个完成样本；`GetMetrics()` 与 adaptive policy 读取同一快照。`observed_fsync_pressure_per_1000_writes` 描述最后一个批次，`recent_fsync_pressure_per_1000_writes` 使用最近窗口内实际 fsync 次数和写请求数的总和，adaptive policy 使用后者。Benchmark 的全程门禁另以测量开始、结束时 `wal_fsync_calls` 与 `committed_write_requests` 的差值计算，避免末尾批次形状改变结果。

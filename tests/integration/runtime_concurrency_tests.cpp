@@ -1010,6 +1010,100 @@ void test_outstanding_capacity_covers_worker_failures() {
             "the capacity-one queue must continue after a worker preparation failure");
 }
 
+void test_zero_delay_leaves_prepared_followers_for_the_next_batch() {
+    TestDir dir("zero_delay_prepared_deadline");
+    KVStoreOptions options;
+    options.worker_threads = 2;
+    options.request_queue_capacity = 4;
+    options.max_batch_size = 4;
+    options.max_batch_delay_us = 0;
+    KVStore store(dir.file("store.dat"), options);
+
+    std::atomic<bool> first_done {false};
+    ThreadFailureCollector failures;
+    std::thread first(failures.guard([&] {
+        store.Put(1, Value(std::vector<uint8_t>(64ULL * 1024ULL * 1024ULL, 0x5A)));
+        first_done.store(true, std::memory_order_release);
+    }));
+    std::thread follower;
+    try {
+        wait_until(
+            [&store] {
+                return store.GetMetrics().active_workers >= 1;
+            },
+            "the large first request should enter worker preparation");
+        follower = std::thread(failures.guard([&] {
+            store.Put(2, text("follower"));
+        }));
+        wait_until(
+            [&] {
+                return store.GetMetrics().prepared_queue_depth >= 1 ||
+                       first_done.load(std::memory_order_acquire);
+            },
+            "the follower should be prepared while the first request is still pending");
+        require(!first_done.load(std::memory_order_acquire) &&
+                    store.GetMetrics().prepared_queue_depth >= 1,
+                "the regression requires a prepared follower before the first request completes");
+    } catch (...) {
+        if (first.joinable()) {
+            first.join();
+        }
+        if (follower.joinable()) {
+            follower.join();
+        }
+        throw;
+    }
+    first.join();
+    follower.join();
+    failures.rethrow_first();
+
+    const KVStoreMetrics metrics = store.GetMetrics();
+    require(metrics.committed_write_batches == 2 &&
+                metrics.max_committed_batch_size == 1,
+            "a zero batch delay must leave even an already-prepared follower for the next batch");
+    require(metrics.recent_write_requests == 2 &&
+                metrics.recent_window_batch_count == 2 &&
+                metrics.recent_fsync_pressure_per_1000_writes == 1000,
+            "recent fsync pressure must divide actual window fsyncs by window writes");
+}
+
+void test_recent_fsync_pressure_counts_explicit_and_periodic_syncs() {
+    TestDir dir("recent_actual_fsync_pressure");
+
+    KVStoreOptions no_sync_options;
+    no_sync_options.durability = DurabilityMode::kNoSync;
+    no_sync_options.max_batch_delay_us = 0;
+    KVStore no_sync(dir.file("explicit.dat"), no_sync_options);
+    no_sync.Put(1, text("pending"));
+    KVStoreMetrics before_flush = no_sync.GetMetrics();
+    require(before_flush.wal_fsync_calls == 0 &&
+                before_flush.recent_fsync_pressure_per_1000_writes == 0,
+            "a no-sync write must not be counted as a recent fsync");
+    no_sync.Flush();
+    KVStoreMetrics after_flush = no_sync.GetMetrics();
+    require(after_flush.wal_fsync_calls == 1 &&
+                after_flush.observed_fsync_pressure_per_1000_writes == 0 &&
+                after_flush.recent_fsync_pressure_per_1000_writes == 1000,
+            "an explicit flush must count as an actual recent fsync without changing the legacy batch estimate");
+
+    KVStoreOptions periodic_options;
+    periodic_options.durability = DurabilityMode::kPeriodic;
+    periodic_options.periodic_sync_interval_ms = 5;
+    periodic_options.max_batch_delay_us = 0;
+    KVStore periodic(dir.file("periodic.dat"), periodic_options);
+    periodic.Put(1, text("periodic"));
+    wait_until(
+        [&periodic] {
+            const KVStoreMetrics metrics = periodic.GetMetrics();
+            return metrics.wal_fsync_calls >= 1 &&
+                   metrics.recent_fsync_pressure_per_1000_writes >= 1000;
+        },
+        "a periodic flush should appear in actual recent fsync pressure");
+    const KVStoreMetrics after_periodic = periodic.GetMetrics();
+    require(after_periodic.observed_fsync_pressure_per_1000_writes == 0,
+            "periodic durability must not be presented as a per-batch sync estimate");
+}
+
 void test_partial_thread_start_failure_joins_started_workers() {
     TestDir dir("partial_thread_start_failure");
     const std::string path = dir.file("store.dat");
@@ -1105,6 +1199,10 @@ void register_runtime_concurrency_tests(TestCases& tests) {
     tests.push_back({"auto compaction ratio requires minimum WAL", test_auto_compaction_ratio_requires_minimum_wal});
     tests.push_back({"auto compaction safe failure backs off", test_auto_compaction_safe_failure_backs_off});
     tests.push_back({"outstanding capacity covers worker failures", test_outstanding_capacity_covers_worker_failures});
+    tests.push_back({"zero delay leaves prepared followers for next batch",
+                     test_zero_delay_leaves_prepared_followers_for_the_next_batch});
+    tests.push_back({"recent fsync pressure counts explicit and periodic syncs",
+                     test_recent_fsync_pressure_counts_explicit_and_periodic_syncs});
     tests.push_back({"partial thread start failure joins workers", test_partial_thread_start_failure_joins_started_workers});
     tests.push_back({"recommended profiles are distinct", test_recommended_profiles_are_distinct});
     tests.push_back({"concurrency stress profiles are distinct", test_concurrency_stress_profiles_are_distinct});

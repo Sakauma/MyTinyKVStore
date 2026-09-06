@@ -5,13 +5,15 @@
   "qualification_note": "The historical floor files do not contain original machine, compiler, commit, or raw-run provenance. This single-sample validation can detect obvious regressions but is not a formal qualification result.",
   "source": {
     "baseline_commit": "1ab75618fa07dd501699639b5ba4bc26d8ce12e7",
+    "validated_commit": "3b2c52de1e71e889decbc931a402b4f3e303ff16",
     "dirty": true,
+    "sample_source_note": "The benchmark ran from the dirty candidate tree recorded below; commit 3b2c52d later preserved that benchmark-relevant source and this manifest. Subsequent fixes must not reuse this sample as evidence for a newer source revision.",
     "candidate_tree_before_adding_this_record": "fd0a348325086bae6b1ad11a62e0c6ee5a2e2096",
     "digest_algorithm": "sha256 over sorted per-file sha256sum output",
     "digest": "76f2ade7b3b00344c355a58a3603fa75ef0377692974eb7eb45e3acad7da66f8",
     "digest_file_count": 86,
     "digest_scope": "Git archive bytes for CMakeLists.txt plus regular files under include/, src/, tests/, scripts/, and benchmarks/reference/, excluding development-validation-2026-09-06.json; relative paths are NUL-delimited and sorted bytewise with LC_ALL=C, and sha256sum emits the LF-delimited per-file records hashed by the final sha256sum",
-    "digest_recompute_command": "revision=HEAD; archive_root=$(mktemp -d); trap 'rm -rf -- \"$archive_root\"' EXIT; git archive --format=tar \"$revision\" | tar -xf - -C \"$archive_root\"; cd \"$archive_root\"; { printf '%s\\0' CMakeLists.txt; find include src tests scripts -type f -print0; find benchmarks/reference -type f ! -name development-validation-2026-09-06.json -print0; } | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum"
+    "digest_recompute_command": "revision=3b2c52de1e71e889decbc931a402b4f3e303ff16; archive_root=$(mktemp -d); trap 'rm -rf -- \"$archive_root\"' EXIT; git archive --format=tar \"$revision\" | tar -xf - -C \"$archive_root\"; cd \"$archive_root\"; { printf '%s\\0' CMakeLists.txt; find include src tests scripts -type f -print0; find benchmarks/reference -type f ! -name development-validation-2026-09-06.json -print0; } | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum"
   },
   "environment": {
     "captured_at_utc": "2026-09-06T14:40:21Z",

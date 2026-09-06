@@ -135,6 +135,8 @@ bash scripts/bench-regression-check.sh benchmarks/reference/ci-floor.json
 
 快速 gate 的阈值较宽，只用于阻止明显倒退。它们不能代替标准 2×/p99 gate。
 
+Stressbench 的 fsync pressure 门禁使用本次测量开始、结束时 `wal_fsync_calls` 与 `committed_write_requests` 的差值计算全窗口比率。旧 reference 没有该测量字段时，比较器仍读取原有 `observed_fsync_pressure_per_1000_writes` 作为冻结预算；candidate 不再用最后一个批次的形状代表整个三秒窗口。
+
 仓库参考文件使用相对链接：
 
 - [CI stressbench floor](../benchmarks/reference/ci-floor.json)

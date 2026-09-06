@@ -25,6 +25,9 @@ struct BenchmarkResult {
     double write_ops_per_s = 0.0;
     double read_ops_per_s = 0.0;
     double avg_write_latency_us = 0.0;
+    uint64_t measurement_committed_write_requests = 0;
+    uint64_t measurement_wal_fsync_calls = 0;
+    uint64_t measurement_fsync_pressure_per_1000_writes = 0;
 };
 
 struct MicrobenchCaseResult {

@@ -921,6 +921,8 @@ public:
         result.recent_read_requests = recent.read_requests;
         result.recent_write_requests = recent.write_requests;
         result.recent_read_ratio_per_1000_ops = recent.read_ratio_per_1000_ops;
+        result.recent_fsync_pressure_per_1000_writes =
+            recent.fsync_pressure_per_1000_writes;
         result.recent_peak_queue_depth = recent.peak_queue_depth;
         result.recent_avg_batch_size = recent.avg_batch_size;
         const uint64_t batch_target = options_.adaptive_objective_target_batch_size != 0
@@ -989,6 +991,7 @@ private:
         uint64_t id = 0;
         uint64_t read_requests = 0;
         uint64_t write_requests = 0;
+        uint64_t fsync_calls_at_start = 0;
         uint64_t batch_size = 0;
         uint64_t wal_bytes = 0;
         uint64_t peak_queue_depth = 0;
@@ -1002,6 +1005,8 @@ private:
     struct RecentWindowSnapshot {
         uint64_t read_requests = 0;
         uint64_t write_requests = 0;
+        uint64_t fsync_calls = 0;
+        uint64_t fsync_pressure_per_1000_writes = 0;
         uint64_t read_ratio_per_1000_ops = 0;
         uint64_t write_latency_p95_us = 0;
         uint64_t peak_queue_depth = 0;
@@ -1727,6 +1732,9 @@ private:
 #else
         prepared_cv_.wait_until(lock, deadline, ready);
 #endif
+        if (Clock::now() >= deadline) {
+            return {};
+        }
         const auto found = prepared_.find(sequence);
         if (found == prepared_.end()) {
             return {};
@@ -1766,11 +1774,24 @@ private:
             if (snapshot.batch_count != 0) {
                 snapshot.avg_batch_size = total_batch_size / snapshot.batch_count;
                 snapshot.avg_batch_wal_bytes = total_wal_bytes / snapshot.batch_count;
+                const uint64_t current_fsync_calls =
+                    wal_fsync_calls_.load(std::memory_order_relaxed);
+                const uint64_t window_start_fsync_calls =
+                    recent_batches_.front().fsync_calls_at_start;
+                snapshot.fsync_calls =
+                    current_fsync_calls >= window_start_fsync_calls
+                        ? current_fsync_calls - window_start_fsync_calls
+                        : current_fsync_calls;
             }
         }
         const uint64_t operations = snapshot.read_requests + snapshot.write_requests;
         snapshot.read_ratio_per_1000_ops =
             operations == 0 ? 0 : (snapshot.read_requests * 1000) / operations;
+        snapshot.fsync_pressure_per_1000_writes =
+            snapshot.write_requests == 0
+                ? 0
+                : (snapshot.fsync_calls * 1000 + snapshot.write_requests - 1) /
+                      snapshot.write_requests;
         if (!latencies.empty()) {
             std::sort(latencies.begin(), latencies.end());
             const size_t rank = (latencies.size() * 95 + 99) / 100;
@@ -1781,7 +1802,8 @@ private:
 
     void record_recent_batch(const std::vector<RequestPtr>& accepted,
                              uint64_t wal_bytes,
-                             uint64_t peak_queue_depth) {
+                             uint64_t peak_queue_depth,
+                             uint64_t fsync_calls_at_start) {
         const uint64_t current_reads = read_requests_.load(std::memory_order_relaxed);
         std::lock_guard<std::mutex> lock(recent_mutex_);
         const uint64_t batch_id = recent_next_batch_id_++;
@@ -1793,6 +1815,7 @@ private:
             batch_id,
             read_delta,
             accepted.size(),
+            fsync_calls_at_start,
             accepted.size(),
             wal_bytes,
             peak_queue_depth,
@@ -1842,7 +1865,7 @@ private:
             recent.avg_batch_size,
             recent.avg_batch_wal_bytes,
             recent.write_latency_p95_us,
-            observed_fsync_pressure_per_1000_writes_.load(std::memory_order_relaxed),
+            recent.fsync_pressure_per_1000_writes,
         });
     }
 
@@ -1969,6 +1992,8 @@ private:
     void process_group(const std::vector<RequestPtr>& batch,
                        const BatchPolicy& policy,
                        uint64_t observed_queue_depth) {
+        const uint64_t fsync_calls_at_start =
+            wal_fsync_calls_.load(std::memory_order_relaxed);
         std::vector<RequestPtr> accepted;
         std::vector<RequestPtr> conflicts;
         std::vector<RequestPtr> read_only_successes;
@@ -2039,7 +2064,8 @@ private:
                 std::max<uint64_t>(1, elapsed_us(request->enqueue_time));
         }
         if (!accepted.empty()) {
-            record_recent_batch(accepted, bytes, observed_queue_depth);
+            record_recent_batch(
+                accepted, bytes, observed_queue_depth, fsync_calls_at_start);
         }
         for (const auto& request : accepted) {
             committed_write_requests_.fetch_add(1, std::memory_order_relaxed);

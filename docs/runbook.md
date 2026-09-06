@@ -54,6 +54,8 @@ bash scripts/inspect-format.sh /data/store.db
 
 - `group_commit_calls` / `group_commit_requests` / `max_group_commit_requests`
 - `wal_fsync_calls`
+- `observed_fsync_pressure_per_1000_writes`：最后一个批次的 fsync 压力
+- `recent_fsync_pressure_per_1000_writes`：最近批次窗口累计的 fsync 压力，供自适应策略使用
 - `fdatasync_time_us` / `max_fdatasync_time_us`
 - `approx_write_latency_p50_us/p95_us/p99_us`
 - `pending_queue_depth` / `max_pending_queue_depth`

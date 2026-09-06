@@ -140,6 +140,7 @@ struct KVStoreMetrics {
     uint64_t last_effective_batch_delay_us = 0;
     uint64_t min_effective_batch_delay_us = 0;
     uint64_t max_effective_batch_delay_us = 0;
+    // Legacy last-batch estimate: ceil(1000 / batch size) in sync mode, otherwise zero.
     uint64_t observed_fsync_pressure_per_1000_writes = 0;
     uint64_t last_objective_pressure_score = 0;
     uint64_t last_objective_cost_score = 0;
@@ -154,6 +155,8 @@ struct KVStoreMetrics {
     uint64_t recent_read_requests = 0;
     uint64_t recent_write_requests = 0;
     uint64_t recent_read_ratio_per_1000_ops = 0;
+    // Actual fsync calls per 1000 writes since the oldest retained recent batch began.
+    uint64_t recent_fsync_pressure_per_1000_writes = 0;
     uint64_t recent_observed_write_latency_p95_us = 0;
     uint64_t recent_peak_queue_depth = 0;
     uint64_t recent_avg_batch_size = 0;

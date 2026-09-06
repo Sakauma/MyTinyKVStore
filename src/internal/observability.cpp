@@ -62,6 +62,8 @@ std::string metrics_to_json(const KVStoreMetrics& metrics) {
         << ",\"recent_read_requests\":" << metrics.recent_read_requests
         << ",\"recent_write_requests\":" << metrics.recent_write_requests
         << ",\"recent_read_ratio_per_1000_ops\":" << metrics.recent_read_ratio_per_1000_ops
+        << ",\"recent_fsync_pressure_per_1000_writes\":"
+        << metrics.recent_fsync_pressure_per_1000_writes
         << ",\"recent_observed_write_latency_p95_us\":" << metrics.recent_observed_write_latency_p95_us
         << ",\"recent_peak_queue_depth\":" << metrics.recent_peak_queue_depth
         << ",\"recent_avg_batch_size\":" << metrics.recent_avg_batch_size

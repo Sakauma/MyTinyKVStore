@@ -85,6 +85,7 @@ BenchmarkResult run_benchmark_capture(const BenchmarkConfig& config) {
     const std::string db_path = dir.file("store.dat");
     const KVStoreOptions options = benchmark_options();
     KVStore store(db_path, options);
+    const KVStoreMetrics metrics_before = store.GetMetrics();
 
     std::atomic<bool> stop {false};
     std::atomic<uint64_t> write_ops {0};
@@ -144,6 +145,18 @@ BenchmarkResult run_benchmark_capture(const BenchmarkConfig& config) {
         result.writes == 0 ? 0.0
                            : static_cast<double>(write_latency_ns.load(std::memory_order_relaxed)) / result.writes / 1000.0;
     result.metrics = store.GetMetrics();
+    require(result.metrics.committed_write_requests >= metrics_before.committed_write_requests,
+            "benchmark committed write counter must be monotonic");
+    require(result.metrics.wal_fsync_calls >= metrics_before.wal_fsync_calls,
+            "benchmark WAL fsync counter must be monotonic");
+    result.measurement_committed_write_requests =
+        result.metrics.committed_write_requests - metrics_before.committed_write_requests;
+    result.measurement_wal_fsync_calls = result.metrics.wal_fsync_calls - metrics_before.wal_fsync_calls;
+    if (result.measurement_committed_write_requests != 0) {
+        result.measurement_fsync_pressure_per_1000_writes =
+            (result.measurement_wal_fsync_calls * 1000 + result.measurement_committed_write_requests - 1) /
+            result.measurement_committed_write_requests;
+    }
     return result;
 }
 
@@ -164,6 +177,12 @@ std::string benchmark_result_to_json(const BenchmarkResult& result) {
         << "\"write_ops_per_s\":" << result.write_ops_per_s << ','
         << "\"read_ops_per_s\":" << result.read_ops_per_s << ','
         << "\"avg_write_latency_us\":" << result.avg_write_latency_us
+        << "},"
+        << "\"measurement\":{"
+        << "\"committed_write_requests\":" << result.measurement_committed_write_requests << ','
+        << "\"wal_fsync_calls\":" << result.measurement_wal_fsync_calls << ','
+        << "\"measurement_fsync_pressure_per_1000_writes\":"
+        << result.measurement_fsync_pressure_per_1000_writes
         << "},"
         << "\"options\":" << OptionsToJson(result.options) << ','
         << "\"metrics\":" << MetricsToJson(result.metrics)

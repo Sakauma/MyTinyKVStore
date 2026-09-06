@@ -418,54 +418,32 @@ void test_adaptive_flush_shortens_batch_delay() {
     options.max_batch_size = 16;
     options.max_batch_delay_us = 50000;
     options.adaptive_flush_enabled = true;
-    options.adaptive_flush_queue_depth_threshold = 2;
+    // The current request contributes one to the observed depth, so a
+    // threshold of one makes the integration trigger deterministic. The
+    // threshold-two policy boundary is covered by the internal policy test.
+    options.adaptive_flush_queue_depth_threshold = 1;
     options.adaptive_flush_delay_divisor = 10;
     options.adaptive_flush_min_batch_delay_us = 1000;
 
     KVStore store(db_path, options);
 
-    std::atomic<int> ready {0};
-    std::atomic<bool> start_signal {false};
-    ThreadFailureCollector thread_failures;
+    store.Put(1, text("flush_1"));
+    const KVStoreMetrics first_metrics = store.GetMetrics();
+    require(first_metrics.committed_write_requests == 1 &&
+                first_metrics.committed_write_batches == 1,
+            "adaptive flush should commit the first write before the next request");
+    require(first_metrics.adaptive_flush_batches_completed == 1,
+            "adaptive flush should apply to the first request at threshold one");
+    require(first_metrics.min_effective_batch_delay_us == 5000,
+            "adaptive flush should divide the configured delay by ten");
 
-    std::thread writer1(thread_failures.guard([&store, &ready, &start_signal]() {
-        wait_for_start(ready, start_signal, 2);
-        store.Put(1, text("flush_1"));
-    }));
-    std::thread writer2(thread_failures.guard([&store, &ready, &start_signal]() {
-        wait_for_start(ready, start_signal, 2);
-        store.Put(2, text("flush_2"));
-    }));
-
-    while (ready.load(std::memory_order_acquire) < 2) {
-        std::this_thread::yield();
-    }
-    start_signal.store(true, std::memory_order_release);
-
-    writer1.join();
-    writer2.join();
-    thread_failures.rethrow_first();
-
-    const KVStoreMetrics before_delayed_write = store.GetMetrics();
-    require(before_delayed_write.committed_write_requests >= 2 &&
-                before_delayed_write.committed_write_batches >= 1 &&
-                before_delayed_write.adaptive_flush_batches_completed >= 1,
-            "adaptive flush should commit the first shortened-delay batch before the delayed write arrives");
-
-    std::thread writer3(thread_failures.guard([&store]() {
-        store.Put(3, text("flush_3"));
-    }));
-
-    writer3.join();
-    thread_failures.rethrow_first();
+    store.Put(2, text("flush_2"));
 
     const KVStoreMetrics metrics = store.GetMetrics();
-    require(metrics.committed_write_requests == 3, "adaptive flush test should commit all writes");
-    require(metrics.committed_write_batches >= 2, "adaptive flush should flush the early batch before the delayed write arrives");
-    require(metrics.adaptive_flush_batches_completed >= 1, "adaptive flush should record at least one shortened-delay batch");
-    require(metrics.min_effective_batch_delay_us > 0 &&
-                metrics.min_effective_batch_delay_us < options.max_batch_delay_us,
-            "adaptive flush should reduce the effective batch delay below the configured base delay");
+    require(metrics.committed_write_requests == 2 && metrics.committed_write_batches == 2,
+            "adaptive flush should preserve sequential writes as separate completed batches");
+    require(metrics.adaptive_flush_batches_completed == 2,
+            "adaptive flush should apply to each sequential request at threshold one");
 }
 
 void test_compaction_long_term_metrics_accumulate() {

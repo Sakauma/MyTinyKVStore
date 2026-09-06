@@ -95,6 +95,48 @@ void test_objective_mode_keeps_read_heavy_batch_cap_without_delay_rule() {
             "objective mode should leave read-heavy delay to the objective controller");
 }
 
+void test_adaptive_flush_policy_threshold_boundary() {
+    KVStoreOptions options;
+    options.max_batch_size = 16;
+    options.max_batch_delay_us = 50000;
+    options.adaptive_flush_enabled = true;
+    options.adaptive_flush_queue_depth_threshold = 2;
+    options.adaptive_flush_delay_divisor = 10;
+    options.adaptive_flush_min_batch_delay_us = 1000;
+
+    const kvstore::internal::WriterPolicySignals below_threshold {
+        1,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    };
+    const kvstore::internal::BatchPolicy below_policy =
+        kvstore::internal::compute_batch_policy(options, below_threshold);
+    require(!below_policy.adaptive_flush && below_policy.batch_delay_us == 50000,
+            "adaptive flush should remain off below its queue-depth threshold");
+
+    const kvstore::internal::WriterPolicySignals at_threshold {
+        2,
+        2,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    };
+    const kvstore::internal::BatchPolicy at_policy =
+        kvstore::internal::compute_batch_policy(options, at_threshold);
+    require(at_policy.adaptive_flush,
+            "adaptive flush should activate at its queue-depth threshold");
+    require(at_policy.batch_delay_us == 5000,
+            "adaptive flush should divide the base delay once at threshold two");
+}
+
 }  // namespace
 
 void register_internal_helpers_tests(TestCases& tests) {
@@ -103,6 +145,8 @@ void register_internal_helpers_tests(TestCases& tests) {
                      test_internal_metrics_helpers_compute_percentiles_and_ratios});
     tests.push_back({"objective mode keeps read-heavy batch cap without delay rule",
                      test_objective_mode_keeps_read_heavy_batch_cap_without_delay_rule});
+    tests.push_back({"adaptive flush policy threshold boundary",
+                     test_adaptive_flush_policy_threshold_boundary});
 }
 
 }  // namespace kvstore::tests::unit
