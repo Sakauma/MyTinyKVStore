@@ -140,6 +140,7 @@ void test_invalid_wal_ratio_triggers_auto_compaction() {
     options.max_batch_size = 1;
     options.max_batch_delay_us = 0;
     options.auto_compact_invalid_wal_ratio_percent = 50;
+    options.auto_compact_min_wal_bytes_for_ratio = 0;
 
     {
         KVStore store(db_path, options);

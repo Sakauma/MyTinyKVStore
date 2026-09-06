@@ -8,6 +8,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct Value {
@@ -88,6 +89,8 @@ struct KVStoreOptions {
     uint32_t adaptive_wal_growth_max_batch_delay_us = 0;
     uint64_t auto_compact_wal_bytes_threshold = 0;
     uint32_t auto_compact_invalid_wal_ratio_percent = 0;
+    // Zero disables this minimum-size gate and allows ratio-only compaction at any WAL size.
+    uint64_t auto_compact_min_wal_bytes_for_ratio = 1024ULL * 1024ULL;
     bool adaptive_batching_enabled = false;
     size_t adaptive_queue_depth_threshold = 32;
     size_t adaptive_batch_size_multiplier = 4;
@@ -111,10 +114,17 @@ struct KVStoreMetrics {
     uint64_t max_committed_batch_size = 0;
     uint64_t last_committed_batch_wal_bytes = 0;
     uint64_t max_committed_batch_wal_bytes = 0;
+    // Requests currently waiting in the raw input queue, plus its high-water mark.
     uint64_t pending_queue_depth = 0;
     uint64_t max_pending_queue_depth = 0;
+    // Requests currently waiting in the prepared queue.
+    uint64_t prepared_queue_depth = 0;
+    // All admitted but unfinished requests, plus their high-water mark.
+    uint64_t inflight_request_count = 0;
+    uint64_t max_inflight_request_count = 0;
     uint64_t manual_compactions_completed = 0;
     uint64_t auto_compactions_completed = 0;
+    uint64_t auto_compaction_failures = 0;
     uint64_t adaptive_batches_completed = 0;
     uint64_t adaptive_flush_batches_completed = 0;
     uint64_t adaptive_latency_target_batches_completed = 0;
@@ -251,7 +261,12 @@ public:
     void Delete(int key);
     void Delete(const std::string& key);
     void Delete(const std::vector<uint8_t>& key);
+    // Both overloads return an inclusive [start_key, end_key] snapshot for that call.
+    // A zero limit returns no rows; separate calls do not share one snapshot.
     std::vector<std::pair<std::string, Value>> Scan(const std::string& start_key, const std::string& end_key);
+    std::vector<std::pair<std::string, Value>> Scan(const std::string& start_key,
+                                                    const std::string& end_key,
+                                                    size_t limit);
     KVTransaction BeginTransaction();
     void Flush();
     void Compact();

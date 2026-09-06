@@ -4,7 +4,7 @@
 
 namespace kvstore::internal {
 
-const std::array<uint64_t, kWriteLatencyBucketCount - 1> kWriteLatencyBucketUpperBoundsUs = {
+const std::array<uint64_t, kWriteLatencyBucketCount> kWriteLatencyBucketUpperBoundsUs = {
     50,
     100,
     250,
@@ -16,21 +16,20 @@ const std::array<uint64_t, kWriteLatencyBucketCount - 1> kWriteLatencyBucketUppe
     25000,
     50000,
     100000,
+    100001,
 };
 
-void update_atomic_max(std::atomic<uint64_t>& metric, uint64_t value) {
-    uint64_t current_max = metric.load(std::memory_order_relaxed);
-    while (current_max < value &&
-           !metric.compare_exchange_weak(
-               current_max,
-               value,
-               std::memory_order_relaxed,
-               std::memory_order_relaxed)) {
+size_t latency_bucket(uint64_t microseconds) {
+    for (size_t index = 0; index + 1 < kWriteLatencyBucketCount; ++index) {
+        if (microseconds <= kWriteLatencyBucketUpperBoundsUs[index]) {
+            return index;
+        }
     }
+    return kWriteLatencyBucketCount - 1;
 }
 
 uint64_t latency_bucket_upper_bound_us(size_t bucket) {
-    if (bucket + 1 < kWriteLatencyBucketCount) {
+    if (bucket < kWriteLatencyBucketCount) {
         return kWriteLatencyBucketUpperBoundsUs[bucket];
     }
     return kWriteLatencyBucketUpperBoundsUs.back();

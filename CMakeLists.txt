@@ -123,13 +123,45 @@ kvstore_apply_coverage(kv_unit_test)
 
 enable_testing()
 add_test(NAME kv_unit_test COMMAND kv_unit_test)
-add_test(NAME kv_test COMMAND kv_test)
+set_tests_properties(kv_unit_test PROPERTIES
+    LABELS "unit"
+    TIMEOUT 60)
+
+function(kvstore_add_integration_test test_name group_name timeout_seconds)
+    add_test(NAME ${test_name} COMMAND kv_test --group ${group_name})
+    set_tests_properties(${test_name} PROPERTIES
+        LABELS "integration;${group_name}"
+        TIMEOUT ${timeout_seconds})
+endfunction()
+
+kvstore_add_integration_test(kv_integration_basic basic 60)
+kvstore_add_integration_test(kv_integration_benchmark_trend benchmark-trend 60)
+kvstore_add_integration_test(kv_integration_durability durability 60)
+kvstore_add_integration_test(kv_integration_json_cli json-cli 60)
+kvstore_add_integration_test(kv_integration_metrics_controller metrics-controller 180)
+kvstore_add_integration_test(kv_integration_recovery_format recovery-format 180)
+kvstore_add_integration_test(kv_integration_runtime_concurrency runtime-concurrency 300)
+kvstore_add_integration_test(kv_integration_transaction transaction 180)
+
+set(KVSTORE_CTEST_TESTS
+    kv_unit_test
+    kv_integration_basic
+    kv_integration_benchmark_trend
+    kv_integration_durability
+    kv_integration_json_cli
+    kv_integration_metrics_controller
+    kv_integration_recovery_format
+    kv_integration_runtime_concurrency
+    kv_integration_transaction)
 if (KVSTORE_ENABLE_TSAN)
+    set(KVSTORE_TSAN_OPTIONS
+        "detect_deadlocks=0:halt_on_error=1"
+        CACHE STRING "ThreadSanitizer options passed to CTest targets")
     # GCC 10's deadlock detector tracks at most 64 concurrently-held locks,
     # while Scan intentionally locks every configured shard for a consistent view.
     # Race detection remains enabled and any report still fails the test.
-    set_tests_properties(kv_unit_test kv_test PROPERTIES
-        ENVIRONMENT "TSAN_OPTIONS=detect_deadlocks=0:halt_on_error=1")
+    set_tests_properties(${KVSTORE_CTEST_TESTS} PROPERTIES
+        ENVIRONMENT "TSAN_OPTIONS=${KVSTORE_TSAN_OPTIONS}")
 endif()
 
 install(TARGETS kv_test DESTINATION target/bin)

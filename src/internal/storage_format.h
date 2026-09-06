@@ -105,13 +105,6 @@ struct Mutation {
     uint64_t value_offset = 0;
     uint32_t value_checksum = 0;
     uint64_t wal_charge = 0;
-    bool has_backing = false;
-};
-
-struct CheckpointImage {
-    Superblock superblock {};
-    std::vector<uint8_t> index;
-    std::vector<uint8_t> objects;
 };
 
 struct RecoveryResult {
@@ -166,15 +159,6 @@ FrameHeader make_frame_header(uint64_t payload_bytes,
                               uint64_t lsn,
                               uint32_t payload_checksum);
 FrameFooter make_frame_footer(const FrameHeader& header);
-std::vector<uint8_t> serialize_frame(const std::vector<uint8_t>& payload,
-                                     uint32_t operation_count,
-                                     uint64_t lsn);
-CheckpointImage build_checkpoint(const std::vector<Mutation>& entries,
-                                 uint64_t generation,
-                                 uint64_t checkpoint_lsn);
-void write_checkpoint_image(int fd,
-                            const CheckpointImage& image,
-                            const std::string& path);
 
 RecoveryResult recover_file(int fd,
                             const std::string& path,

@@ -255,8 +255,14 @@ void KVStore::Delete(const std::vector<uint8_t>& key) {
 }
 
 std::vector<std::pair<std::string, Value>> KVStore::Scan(const std::string& start_key,
-                                                        const std::string& end_key) {
+                                                         const std::string& end_key) {
     return pimpl_->engine->Scan(start_key, end_key);
+}
+
+std::vector<std::pair<std::string, Value>> KVStore::Scan(const std::string& start_key,
+                                                         const std::string& end_key,
+                                                         size_t limit) {
+    return pimpl_->engine->Scan(start_key, end_key, limit);
 }
 
 KVTransaction KVStore::BeginTransaction() {

@@ -1,5 +1,7 @@
 #include "tests/common/test_support.h"
 
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -34,9 +36,20 @@ TestDir::TestDir(const std::string& name) {
     std::filesystem::create_directories(path_);
 }
 
-TestDir::~TestDir() {
-    std::error_code ec;
-    std::filesystem::remove_all(path_, ec);
+TestDir::~TestDir() noexcept {
+    try {
+        const char* keep_artifacts = std::getenv("KVSTORE_KEEP_TEST_ARTIFACTS");
+        if (keep_artifacts != nullptr && std::strcmp(keep_artifacts, "1") == 0) {
+            try {
+                std::cerr << "[test] kept artifacts: " << path_.native() << '\n';
+            } catch (...) {
+            }
+            return;
+        }
+        std::error_code ec;
+        std::filesystem::remove_all(path_, ec);
+    } catch (...) {
+    }
 }
 
 std::string TestDir::file(const std::string& name) const {
@@ -66,17 +79,57 @@ void wait_for_start(std::atomic<int>& ready, std::atomic<bool>& start_signal, in
     }
 }
 
-int run_named_tests(const std::vector<NamedTest>& tests) {
-    try {
-        for (const auto& test : tests) {
-            test.fn();
-            std::cout << "[unit] PASS " << test.name << '\n';
+int list_named_tests(const std::vector<NamedTest>& tests, const std::string& filter) {
+    size_t selected = 0;
+    for (const auto& test : tests) {
+        if (!filter.empty() && test.name.find(filter) == std::string::npos) {
+            continue;
         }
-    } catch (const std::exception& error) {
-        std::cerr << "[unit] FAIL " << error.what() << '\n';
-        return 1;
+        std::cout << test.name << '\n';
+        ++selected;
+    }
+    if (selected == 0) {
+        std::cerr << "No tests matched filter: " << filter << '\n';
+        return 2;
     }
     return 0;
+}
+
+int run_named_tests(const std::vector<NamedTest>& tests,
+                    const std::string& filter,
+                    const std::string& suite_name) {
+    size_t selected = 0;
+    size_t passed = 0;
+    size_t failed = 0;
+    for (const auto& test : tests) {
+        if (!filter.empty() && test.name.find(filter) == std::string::npos) {
+            continue;
+        }
+        ++selected;
+        try {
+            test.fn();
+            ++passed;
+            std::cout << "[PASS] " << test.name << '\n';
+        } catch (const std::exception& error) {
+            ++failed;
+            std::cerr << "[FAIL] " << test.name << ": " << error.what() << '\n';
+        } catch (...) {
+            ++failed;
+            std::cerr << "[FAIL] " << test.name << ": unknown exception\n";
+        }
+    }
+
+    if (selected == 0) {
+        std::cerr << "No tests matched filter: " << filter << '\n';
+        return 2;
+    }
+
+    if (!suite_name.empty()) {
+        std::cout << suite_name << ": ";
+    }
+    std::cout << passed << " passed, " << failed << " failed, "
+              << selected << " selected." << std::endl;
+    return failed == 0 ? 0 : 1;
 }
 
 }  // namespace test_support

@@ -4,14 +4,13 @@
 #include "kvstore.h"
 
 #include <array>
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 
 namespace kvstore::internal {
 
-extern const std::array<uint64_t, kWriteLatencyBucketCount - 1> kWriteLatencyBucketUpperBoundsUs;
+extern const std::array<uint64_t, kWriteLatencyBucketCount> kWriteLatencyBucketUpperBoundsUs;
 
 template <typename T>
 T saturating_multiply(T lhs, T rhs) {
@@ -24,7 +23,7 @@ T saturating_multiply(T lhs, T rhs) {
     return lhs * rhs;
 }
 
-void update_atomic_max(std::atomic<uint64_t>& metric, uint64_t value);
+size_t latency_bucket(uint64_t microseconds);
 uint64_t latency_bucket_upper_bound_us(size_t bucket);
 uint64_t approximate_latency_percentile_us(
     const std::array<uint64_t, kWriteLatencyBucketCount>& histogram,

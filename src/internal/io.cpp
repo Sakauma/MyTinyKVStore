@@ -14,50 +14,6 @@ KVStoreError io_error(const std::string& action, const std::string& path) {
     return KVStoreError(action + " failed for " + path + ": " + std::strerror(errno));
 }
 
-ssize_t read_once(int fd, void* buffer, size_t size) {
-    while (true) {
-        const ssize_t nread = ::read(fd, buffer, size);
-        if (nread < 0 && errno == EINTR) {
-            continue;
-        }
-        return nread;
-    }
-}
-
-size_t read_up_to(int fd, void* buffer, size_t size) {
-    auto* cursor = static_cast<uint8_t*>(buffer);
-    size_t total = 0;
-    while (total < size) {
-        const ssize_t nread = read_once(fd, cursor + total, size - total);
-        if (nread < 0) {
-            throw KVStoreError("Read failed: " + std::string(std::strerror(errno)));
-        }
-        if (nread == 0) {
-            break;
-        }
-        total += static_cast<size_t>(nread);
-    }
-    return total;
-}
-
-void write_all(int fd, const void* buffer, size_t size) {
-    const auto* cursor = static_cast<const uint8_t*>(buffer);
-    size_t total = 0;
-    while (total < size) {
-        ssize_t nwritten = ::write(fd, cursor + total, size - total);
-        if (nwritten < 0 && errno == EINTR) {
-            continue;
-        }
-        if (nwritten < 0) {
-            throw KVStoreError("Write failed: " + std::string(std::strerror(errno)));
-        }
-        if (nwritten == 0) {
-            throw KVStoreError("Write made no progress");
-        }
-        total += static_cast<size_t>(nwritten);
-    }
-}
-
 void fsync_file(int fd, const std::string& path) {
     int result;
     do {

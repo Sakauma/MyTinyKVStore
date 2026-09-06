@@ -16,7 +16,8 @@ namespace {
 void print_usage() {
     std::cerr
         << "Usage: kv_test "
-        << "[bench|microbench|microbench-json|bench-json|bench-baseline-json|compare-microbench|compare-baseline|"
+        << "[--list|--list-groups|--list-group <name>|--filter <substring>|--group <name>|"
+        << "bench|microbench|microbench-json|bench-json|bench-baseline-json|compare-microbench|compare-baseline|"
         << "trend-baselines|trend-baselines-json|trend-microbench|trend-microbench-json|profile-json|soak|"
         << "concurrency-stress|concurrency-stress-json|inspect-format|rewrite-format|verify-format|"
         << "qualification-bench-json|qualification-soak-json|compare-qualification|fault-inject]"
@@ -213,24 +214,27 @@ int run_cli_command(int argc, char* argv[]) {
     return 1;
 }
 
-int run_registered_integration_tests() {
-    kvstore::tests::integration::TestCases tests;
-    kvstore::tests::integration::register_all_integration_tests(tests);
-
-    size_t passed = 0;
-    for (const auto& [name, test] : tests) {
-        try {
-            test();
-            ++passed;
-            std::cout << "[PASS] " << name << '\n';
-        } catch (const std::exception& ex) {
-            std::cerr << "[FAIL] " << name << ": " << ex.what() << '\n';
-            return 1;
-        }
+void print_integration_test_groups() {
+    for (const auto& group : kvstore::tests::integration::integration_test_groups()) {
+        std::cout << group << '\n';
     }
+}
 
-    std::cout << "All " << passed << " tests passed." << std::endl;
-    return 0;
+int run_registered_integration_tests(const std::string& filter = {},
+                                     const std::string& group = {}) {
+    kvstore::tests::integration::TestCases tests;
+    if (group.empty()) {
+        kvstore::tests::integration::register_all_integration_tests(tests);
+    } else if (!kvstore::tests::integration::register_integration_test_group(group, tests)) {
+        std::cerr << "Unknown integration test group: " << group << '\n';
+        std::cerr << "Available groups:\n";
+        for (const auto& available : kvstore::tests::integration::integration_test_groups()) {
+            std::cerr << "  " << available << '\n';
+        }
+        return 2;
+    }
+    const std::string suite = group.empty() ? "integration" : "integration/" + group;
+    return test_support::run_named_tests(tests, filter, suite);
 }
 
 }  // namespace
@@ -238,6 +242,34 @@ int run_registered_integration_tests() {
 int run_kv_test_driver(int argc, char* argv[]) {
     set_runtime_program_path_entrypoint(argv[0]);
     if (argc > 1) {
+        const std::string command = argv[1];
+        if (command == "--list" && argc == 2) {
+            kvstore::tests::integration::TestCases tests;
+            kvstore::tests::integration::register_all_integration_tests(tests);
+            return test_support::list_named_tests(tests);
+        }
+        if (command == "--list-groups" && argc == 2) {
+            print_integration_test_groups();
+            return 0;
+        }
+        if (command == "--list-group" && argc == 3 && argv[2][0] != '\0') {
+            kvstore::tests::integration::TestCases tests;
+            if (!kvstore::tests::integration::register_integration_test_group(argv[2], tests)) {
+                std::cerr << "Unknown integration test group: " << argv[2] << '\n';
+                return 2;
+            }
+            return test_support::list_named_tests(tests);
+        }
+        if (command == "--filter" && argc == 3 && argv[2][0] != '\0') {
+            return run_registered_integration_tests(argv[2]);
+        }
+        if (command == "--group" && argc == 3 && argv[2][0] != '\0') {
+            return run_registered_integration_tests({}, argv[2]);
+        }
+        if (command.rfind("--", 0) == 0) {
+            print_usage();
+            return 2;
+        }
         return run_cli_command(argc, argv);
     }
     return run_registered_integration_tests();

@@ -7,6 +7,30 @@
 
 namespace kvstore::internal {
 
+namespace {
+
+void apply_read_heavy_batch_limits(const KVStoreOptions& options,
+                                   const WriterPolicySignals& signals,
+                                   BatchPolicy& policy) {
+    if (options.adaptive_read_heavy_read_per_1000_ops_threshold == 0 ||
+        signals.recent_read_ratio < options.adaptive_read_heavy_read_per_1000_ops_threshold) {
+        return;
+    }
+
+    policy.read_heavy_adjusted = true;
+    policy.max_batch_size = std::max<size_t>(
+        1,
+        policy.max_batch_size / std::max<size_t>(1, options.adaptive_read_heavy_batch_size_divisor));
+    if (policy.max_batch_wal_bytes > 0) {
+        policy.max_batch_wal_bytes = std::max<uint64_t>(
+            sizeof(MutationHeader),
+            policy.max_batch_wal_bytes /
+                std::max<size_t>(1, options.adaptive_read_heavy_batch_size_divisor));
+    }
+}
+
+}  // namespace
+
 BatchPolicy compute_batch_policy(const KVStoreOptions& options, const WriterPolicySignals& signals) {
     BatchPolicy policy {
         options.max_batch_size,
@@ -71,6 +95,10 @@ BatchPolicy compute_batch_policy(const KVStoreOptions& options, const WriterPoli
     }
 
     if (options.adaptive_objective_enabled) {
+        // Objective mode owns delay decisions. Read-heavy remains an independent
+        // batch-size/WAL cap signal so the profile can protect reader latency
+        // without applying a second delay adjustment.
+        apply_read_heavy_batch_limits(options, signals, policy);
         const uint64_t observed_queue_depth =
             std::max<uint64_t>(signals.request_queue_depth, signals.recent_peak_queue_depth);
         const uint64_t queue_scale =
@@ -140,15 +168,11 @@ BatchPolicy compute_batch_policy(const KVStoreOptions& options, const WriterPoli
 
     if (options.adaptive_read_heavy_read_per_1000_ops_threshold > 0 &&
         signals.recent_read_ratio >= options.adaptive_read_heavy_read_per_1000_ops_threshold) {
-        policy.read_heavy_adjusted = true;
+        const uint32_t delay_divisor = std::max<uint32_t>(1, options.adaptive_read_heavy_delay_divisor);
+        apply_read_heavy_batch_limits(options, signals, policy);
         policy.batch_delay_us = std::max(
             options.adaptive_flush_min_batch_delay_us,
-            policy.batch_delay_us / options.adaptive_read_heavy_delay_divisor);
-        policy.max_batch_size = std::max<size_t>(1, policy.max_batch_size / options.adaptive_read_heavy_batch_size_divisor);
-        if (policy.max_batch_wal_bytes > 0) {
-            policy.max_batch_wal_bytes =
-                std::max<uint64_t>(sizeof(MutationHeader), policy.max_batch_wal_bytes / options.adaptive_read_heavy_batch_size_divisor);
-        }
+            policy.batch_delay_us / delay_divisor);
     }
 
     if (options.adaptive_latency_target_p95_us > 0 &&

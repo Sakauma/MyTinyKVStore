@@ -3,38 +3,18 @@
 #include "internal/io.h"
 #include "internal/key_codec.h"
 #include "internal/metrics_helpers.h"
+#include "internal/storage_format.h"
+#include "internal/writer_policy.h"
 
 #include <array>
-#include <atomic>
-#include <cerrno>
-#include <chrono>
-#include <csignal>
 #include <cstdint>
 #include <string>
-#include <thread>
 #include <vector>
-
-#include <pthread.h>
-#include <poll.h>
-#include <unistd.h>
 
 namespace kvstore::tests::unit {
 namespace {
 
 using test_support::require;
-volatile std::sig_atomic_t g_interrupt_ack_fd = -1;
-
-void record_interrupt(int) {
-    const int saved_errno = errno;
-    const char marker = 's';
-    if (g_interrupt_ack_fd >= 0) {
-        ssize_t result;
-        do {
-            result = ::write(g_interrupt_ack_fd, &marker, 1);
-        } while (result < 0 && errno == EINTR);
-    }
-    errno = saved_errno;
-}
 
 void test_internal_format_helpers_round_trip_keys() {
     const std::string int_key = kvstore::internal::encode_int_key(42);
@@ -62,6 +42,17 @@ void test_internal_metrics_helpers_compute_percentiles_and_ratios() {
             "p50 helper should map into the first bucket that crosses the 50th percentile");
     require(kvstore::internal::approximate_latency_percentile_us(histogram, 95, 100) == 10000,
             "p95 helper should map into the tail bucket that crosses the percentile");
+    histogram.fill(0);
+    histogram[kWriteLatencyBucketCount - 2] = 1;
+    require(kvstore::internal::approximate_latency_percentile_us(histogram, 99, 100) == 100000,
+            "latency histogram should keep 100000us as the penultimate bucket boundary");
+    histogram.fill(0);
+    histogram[kWriteLatencyBucketCount - 1] = 1;
+    require(kvstore::internal::approximate_latency_percentile_us(histogram, 99, 100) == 100001,
+            "latency histogram should reserve 100001us for values above 100000us");
+    require(kvstore::internal::latency_bucket(100000) == kWriteLatencyBucketCount - 2 &&
+                kvstore::internal::latency_bucket(100001) == kWriteLatencyBucketCount - 1,
+            "latency bucket assignment should match percentile boundaries at 100000us");
     require(kvstore::internal::capped_ratio_milli(16, 4) == 4000,
             "ratio helper should cap values at 4x");
     require(kvstore::internal::weighted_signal_score(200, 100, 3) == 6000,
@@ -70,59 +61,38 @@ void test_internal_metrics_helpers_compute_percentiles_and_ratios() {
             "weighted deficit score should reflect the observed gap to target");
 }
 
-void test_io_read_once_retries_after_eintr() {
-    int pipe_fds[2] {-1, -1};
-    int interrupt_ack_fds[2] {-1, -1};
-    require(::pipe(pipe_fds) == 0, "pipe should be available for the EINTR test");
-    require(::pipe(interrupt_ack_fds) == 0,
-            "interrupt acknowledgement pipe should be available for the EINTR test");
+void test_objective_mode_keeps_read_heavy_batch_cap_without_delay_rule() {
+    KVStoreOptions options;
+    options.max_batch_size = 64;
+    options.max_batch_wal_bytes = 4096;
+    options.max_batch_delay_us = 1000;
+    options.adaptive_objective_enabled = true;
+    options.adaptive_objective_read_weight = 0;
+    options.adaptive_read_heavy_read_per_1000_ops_threshold = 600;
+    options.adaptive_read_heavy_delay_divisor = 8;
+    options.adaptive_read_heavy_batch_size_divisor = 4;
+    options.adaptive_flush_min_batch_delay_us = 100;
 
-    struct sigaction action {};
-    struct sigaction previous {};
-    action.sa_handler = record_interrupt;
-    ::sigemptyset(&action.sa_mask);
-    action.sa_flags = 0;
-    require(::sigaction(SIGUSR1, &action, &previous) == 0,
-            "SIGUSR1 handler should be installed without SA_RESTART");
+    const kvstore::internal::WriterPolicySignals signals {
+        0,
+        0,
+        800,
+        0,
+        16,
+        0,
+        0,
+        0,
+    };
+    const kvstore::internal::BatchPolicy policy = kvstore::internal::compute_batch_policy(options, signals);
 
-    g_interrupt_ack_fd = interrupt_ack_fds[1];
-    std::atomic<bool> entered_read {false};
-    ssize_t read_result = -2;
-    char received = 0;
-    std::thread reader([&] {
-        entered_read.store(true, std::memory_order_release);
-        read_result = kvstore::internal::read_once(pipe_fds[0], &received, 1);
-    });
-
-    while (!entered_read.load(std::memory_order_acquire)) {
-        std::this_thread::yield();
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    const int signal_result = ::pthread_kill(reader.native_handle(), SIGUSR1);
-    struct pollfd acknowledgement_poll {interrupt_ack_fds[0], POLLIN, 0};
-    int poll_result;
-    do {
-        poll_result = ::poll(&acknowledgement_poll, 1, 1000);
-    } while (poll_result < 0 && errno == EINTR);
-    char acknowledgement = 0;
-    const ssize_t acknowledgement_result =
-        poll_result > 0 ? ::read(interrupt_ack_fds[0], &acknowledgement, 1) : -1;
-
-    const char expected = 'x';
-    const ssize_t write_result = ::write(pipe_fds[1], &expected, 1);
-    reader.join();
-    (void)::sigaction(SIGUSR1, &previous, nullptr);
-    g_interrupt_ack_fd = -1;
-    ::close(pipe_fds[0]);
-    ::close(pipe_fds[1]);
-    ::close(interrupt_ack_fds[0]);
-    ::close(interrupt_ack_fds[1]);
-
-    require(signal_result == 0 && acknowledgement_result == 1 && acknowledgement == 's',
-            "the blocking read should receive the interrupt signal");
-    require(write_result == 1, "the EINTR test should write its completion byte");
-    require(read_result == 1 && received == expected,
-            "read_once should retry EINTR and return the subsequent byte");
+    require(policy.read_heavy_adjusted,
+            "objective mode should retain read-heavy batch-size adjustment");
+    require(policy.max_batch_size == 16,
+            "read-heavy batch-size divisor should apply in objective mode");
+    require(policy.max_batch_wal_bytes == 1024,
+            "read-heavy WAL cap divisor should apply in objective mode");
+    require(policy.batch_delay_us == options.max_batch_delay_us,
+            "objective mode should leave read-heavy delay to the objective controller");
 }
 
 }  // namespace
@@ -131,7 +101,8 @@ void register_internal_helpers_tests(TestCases& tests) {
     tests.push_back({"internal format helpers round trip keys", test_internal_format_helpers_round_trip_keys});
     tests.push_back({"internal metrics helpers compute percentiles and ratios",
                      test_internal_metrics_helpers_compute_percentiles_and_ratios});
-    tests.push_back({"internal I/O retries EINTR", test_io_read_once_retries_after_eintr});
+    tests.push_back({"objective mode keeps read-heavy batch cap without delay rule",
+                     test_objective_mode_keeps_read_heavy_batch_cap_without_delay_rule});
 }
 
 }  // namespace kvstore::tests::unit
