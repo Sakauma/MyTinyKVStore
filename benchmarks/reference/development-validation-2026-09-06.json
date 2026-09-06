@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "classification": "development-sample",
+  "qualification_status": "not_evaluated",
+  "qualification_note": "The historical floor files do not contain original machine, compiler, commit, or raw-run provenance. This single-sample validation can detect obvious regressions but is not a formal qualification result.",
+  "source": {
+    "baseline_commit": "1ab75618fa07dd501699639b5ba4bc26d8ce12e7",
+    "dirty": true,
+    "candidate_tree_before_adding_this_record": "fd0a348325086bae6b1ad11a62e0c6ee5a2e2096",
+    "digest_algorithm": "sha256 over sorted per-file sha256sum output",
+    "digest": "76f2ade7b3b00344c355a58a3603fa75ef0377692974eb7eb45e3acad7da66f8",
+    "digest_file_count": 86,
+    "digest_scope": "Git archive bytes for CMakeLists.txt plus regular files under include/, src/, tests/, scripts/, and benchmarks/reference/, excluding development-validation-2026-09-06.json; relative paths are NUL-delimited and sorted bytewise with LC_ALL=C, and sha256sum emits the LF-delimited per-file records hashed by the final sha256sum",
+    "digest_recompute_command": "revision=HEAD; archive_root=$(mktemp -d); trap 'rm -rf -- \"$archive_root\"' EXIT; git archive --format=tar \"$revision\" | tar -xf - -C \"$archive_root\"; cd \"$archive_root\"; { printf '%s\\0' CMakeLists.txt; find include src tests scripts -type f -print0; find benchmarks/reference -type f ! -name development-validation-2026-09-06.json -print0; } | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum"
+  },
+  "environment": {
+    "captured_at_utc": "2026-09-06T14:40:21Z",
+    "wsl_version": "2.4.13.0",
+    "kernel": "Linux 5.15.167.4-microsoft-standard-WSL2",
+    "filesystem": "ext4",
+    "compiler": "g++ 9.4.0",
+    "cmake": "3.16.3",
+    "generator": "Unix Makefiles",
+    "build_type": "Release",
+    "release_flags": "-O3 -DNDEBUG",
+    "cpu": "AMD Ryzen 9 7940H; 1 socket, 8 cores, 16 threads",
+    "memory_kib": 12251472
+  },
+  "commands": {
+    "setup": "mkdir -p $HOME/kvstore-development-validation/tmp $HOME/kvstore-development-validation/results",
+    "microbench": "KVSTORE_BENCHMARK_TMPDIR=$HOME/kvstore-development-validation/tmp bash scripts/microbench-regression-check.sh benchmarks/reference/microbench-floor.json $HOME/kvstore-development-validation/results",
+    "stressbench": "KVSTORE_BENCHMARK_TMPDIR=$HOME/kvstore-development-validation/tmp bash scripts/bench-regression-check.sh benchmarks/reference/ci-floor.json $HOME/kvstore-development-validation/results"
+  },
+  "reference_floors": {
+    "provenance": "historical-origin-unknown",
+    "microbench": {
+      "path": "benchmarks/reference/microbench-floor.json",
+      "sha256": "4c66ccc6d7555baf0ff6f405a80a824a92d95272f78a95833bff870ee6b06d94",
+      "ops_per_s": {
+        "wal_append": 120.0,
+        "scan": 900.0,
+        "recovery": 100.0,
+        "compaction": 20.0,
+        "rewrite": 18.0
+      }
+    },
+    "stressbench": {
+      "path": "benchmarks/reference/ci-floor.json",
+      "sha256": "4e28c0449446d64dcad4bc5eb8df135a3765f15b6c6b22505de8f9135b0511a1",
+      "workload": {
+        "writers": 8,
+        "readers": 4,
+        "duration_ms": 3000,
+        "key_space": 50000
+      },
+      "write_ops_per_s": 600.0,
+      "read_ops_per_s": 2000000.0,
+      "avg_write_latency_us": 12000.0,
+      "write_p95_us": 20000,
+      "write_p99_us": 25000,
+      "fsync_pressure_per_1000_writes": 400,
+      "batch_fill_per_1000": 300
+    }
+  },
+  "samples": {
+    "microbench": {
+      "started_at_utc": "2026-09-06T14:34:09Z",
+      "sample_count": 1,
+      "result_sha256": "e872c4b5232a94f16052914e33dea2b4cdad00205db501c13d0cded9bed33a4b",
+      "gate_status": "pass",
+      "minimum_ratios_percent": {
+        "wal_append": 80,
+        "scan": 80,
+        "recovery": 80,
+        "compaction": 75,
+        "rewrite": 75
+      },
+      "cases": {
+        "wal_append": {"ops_per_s": 241.307, "ratio_percent": 201.089},
+        "scan": {"ops_per_s": 827.555, "ratio_percent": 91.9506},
+        "recovery": {"ops_per_s": 182.062, "ratio_percent": 182.062},
+        "compaction": {"ops_per_s": 59.1545, "ratio_percent": 295.772},
+        "rewrite": {"ops_per_s": 53.6416, "ratio_percent": 298.009}
+      }
+    },
+    "stressbench": {
+      "started_at_utc": "2026-09-06T14:35:07Z",
+      "sample_count": 1,
+      "result_sha256": "caf7b7005a7877c19057b7a4bbbfd68ff9a6fecfc2cffee3edc6df2eb7797596",
+      "gate_status": "pass",
+      "result": {
+        "duration_s": 3.00591,
+        "writes": 3848,
+        "reads": 80663999,
+        "write_ops_per_s": 1280.14,
+        "read_ops_per_s": 26835100.0,
+        "avg_write_latency_us": 6251.78,
+        "write_p95_us": 10000,
+        "write_p99_us": 10000,
+        "fsync_pressure_per_1000_writes": 125,
+        "batch_fill_per_1000": 500
+      },
+      "gate_ratios_percent": {
+        "write_ops": 213.357,
+        "read_ops": 1341.76,
+        "avg_write_latency": 52.0982,
+        "write_p95": 50.0,
+        "write_p99": 40.0,
+        "fsync_pressure": 31.25,
+        "batch_fill": 166.667
+      },
+      "gate_thresholds_percent": {
+        "minimum_write_ops": 85,
+        "minimum_read_ops": 85,
+        "maximum_avg_write_latency": 125,
+        "maximum_write_p95": 150,
+        "maximum_write_p99": 175,
+        "maximum_fsync_pressure": 150,
+        "minimum_batch_fill": 75
+      }
+    }
+  }
+}

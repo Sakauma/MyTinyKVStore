@@ -21,14 +21,15 @@
 - 未确认事务可以出现或消失，但绝不能恢复半个事务。
 - `Flush()` 是它之前全部提交的有序持久化屏障。
 - 首次创建和 compaction rename 后必须同步父目录。
-- I/O/校验错误必须进入 sticky fatal。
+- Journal 或当前主代际 I/O/校验错误、主状态不变量错误，以及 compaction rename 后错误必须进入 sticky fatal。尚未发布新代际的临时文件创建/写入/同步错误必须返回错误并保持实例可继续使用。
 
 ### MPMC 路径
 
 - 多个 producer 可以并发入队。
 - 有界 worker pool 是多个实际 consumer，负责并行准备请求。
 - Ordered coordinator 只负责最终全局顺序、group write 和 sync。
-- 队列满时阻塞，不静默丢弃。
+- `request_queue_capacity` 限制 raw、worker、prepared 和 coordinator 处理中请求的总 inflight 数；达到上限时阻塞，不静默丢弃。
+- `prepared_queue_depth`、`inflight_request_count` 和 `max_inflight_request_count` 必须反映对应阶段及高水位。
 
 ### 事务
 
@@ -42,7 +43,9 @@
 - 内存 entry 不强制持有完整 value。
 - Value 可通过 offset/length/checksum `pread`。
 - 默认有界分段 CLOCK 为 256 MiB，value、key 与估算的每项节点开销都计入预算。
-- 自动 compaction 在后台生成新文件代际；手动 `Compact()` 返回时 entry 迁移完成且旧 inode 已释放。
+- 自动 compaction 在后台生成新文件代际；手动 `Compact()` 返回时 entry 迁移完成，但已开始的 reader 可以继续持有旧代际，旧 inode 在最后一个引用释放后自然回收。
+- 无效比例触发必须受可配置最小 WAL 字节数约束；值为 0 时才允许任意 WAL 大小的 ratio-only 行为。
+- 自动 compaction 的可恢复失败必须累计 `auto_compaction_failures`、退避后等待后续写入重新调度，不能让后台线程忙循环。
 
 ## 正确性测试 gate
 
@@ -54,14 +57,17 @@
 - 8/16/32 producers 的点操作、batch 和 transaction 模型比对。
 - Lost update、write skew、跨 shard 冲突、只读验证、read-your-writes、rollback、提交故障。
 - 并发 Scan/compaction 与状态一致性，包括 delta overwrite/delete、事务、文件代际迁移和旧 fd 生命周期。
-- 工作线程异常通过 `exception_ptr` 汇总，不允许不透明 `std::terminate`。
+- `Scan(start, end, limit)` 的双端包含、零 limit、截断、锁外 value 读取和独立调用快照边界。
+- Compaction 临时文件碰撞不能删除既有文件；rename 前普通临时文件错误可继续使用，主代际读取/校验错误和 rename 后错误必须 sticky fatal。
+- 部分线程启动失败时必须 stop/notify/join 已创建线程后再抛出，不能遗留后台线程或触发 `std::terminate`。
+- 测试创建的辅助线程通过 `exception_ptr` 汇总异常，不允许不透明 `std::terminate` 覆盖原测试失败。
 - ASan、UBSan、TSan。TSan 配置、链接或运行时缺失都算失败。
 
 Sanitizer 构建类型固定为 `RelWithDebInfo`。ASan 默认开启 leak detection。GCC 10 TSan 因 deadlock detector 最多跟踪 64 把锁、而默认 `Scan` 同时持有 256 把 shard 锁，设置 `detect_deadlocks=0`；数据竞争检测与 `halt_on_error` 必须保持开启，并完成至少 10 秒 balanced TSan stress。
 
 ## 标准性能 gate
 
-同一机器、同一 Release 工具链、同一原生 Linux 文件系统、`kSync`：
+同一机器、同一 Release 工具链、同一原生 Linux ext4 文件系统、`kSync`：
 
 - 预填充 100 万整数键。
 - 16 writers。
@@ -81,6 +87,8 @@ Sanitizer 构建类型固定为 `RelWithDebInfo`。ASan 默认开启 leak detect
 
 认证开始前，WSL ext4 输出文件系统至少保留 25 GiB 可用空间。所有结果写到仓库外目录，不提交或推送。
 
+Windows NTFS 的 WSL 挂载路径（例如 `/mnt/c`、`/mnt/d`）、DrvFS、9p 和 fuseblk 不在持久化正确性或性能认证支持范围内；这些路径上的 smoke 结果不能外推到受支持平台。
+
 ## 长时 gate
 
 至少一轮：
@@ -99,14 +107,15 @@ Sanitizer 构建类型固定为 `RelWithDebInfo`。ASan 默认开启 leak detect
 
 ## Artifact 必备字段
 
-- Git commit、dirty 状态。
+- 基线/候选 Git commit、dirty 状态；dirty 工作树还必须保存 source digest、diff 摘要和完整补丁路径，最终提交后核对 digest。
 - CPU、内存、磁盘、文件系统、内核。
 - 编译器、CMake、构建类型。
-- 完整 KVStore/workload 配置。
+- Harness/脚本 digest、完整命令、环境变量、时间/时区、退出状态、重复轮数和完整 KVStore/workload 配置。
 - 原始每轮结果和中位数。
 - 基线文件及其相同环境证明。
 - 格式验证和重启逐键校验结果。
 - RSS/FD 初始、峰值、最终和稳定窗口起止采样，以及稳定性 gate 结论。
+- Artifact 状态必须明确为 `development-sample`、`qualification-candidate` 或已通过全部 gate；短时或不可比环境结果不得标为正式通过。
 
 ## 非达标示例
 

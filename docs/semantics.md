@@ -2,7 +2,7 @@
 
 ## 提交顺序
 
-所有 `Put`、`Delete`、`WriteBatch`、事务 `Commit()` 和 `Flush()` 在入队时获得单调序号。Worker 可以乱序完成 payload、payload/value CRC 和 WAL charge 准备，但 ordered coordinator 只按该序号处理已准备请求。
+所有 `Put`、`Delete`、`WriteBatch`、事务 `Commit()` 和 `Flush()` 先取得总 inflight 配额，成功进入 raw queue 时再获得单调序号。Worker 可以乱序完成 payload、payload/value CRC 和 WAL charge 准备，但 ordered coordinator 只按该序号处理已准备请求。`request_queue_capacity` 限制 raw queue、worker、prepared map 和 coordinator 当前处理请求的总数；达到上限时调用方等待，不丢弃请求。
 
 被接受的写事务再获得严格递增 LSN。磁盘 frame 顺序、状态发布顺序和调用方完成通知都遵守该 LSN 顺序。OCC 冲突请求不获得 LSN、不写 journal，也不发布任何状态。
 
@@ -57,13 +57,17 @@ wal_bytes_since_compaction = live_wal_bytes_since_compaction
 
 Compaction 开始后同时维护当前和待切换 accounting epoch；切换时直接发布只包含切点后 delta 的 epoch，恢复会重建同样的数值。
 
+自动 compaction 的字节条件和无效比例条件为 OR。比例条件还受 `auto_compact_min_wal_bytes_for_ratio` 约束，默认 1 MiB；设为 `0` 时显式允许只按比例在任意 WAL 大小触发。后台安全失败会增加 `auto_compaction_failures` 并至少退避 1 秒，后续写入再次满足条件时才重新调度。
+
 ## `Scan`
 
-字符串 `Scan(start, end)` 按固定 shard 顺序获得全部共享锁，并对每个 shard 的有序字符串索引做 k-way merge：
+字符串 `Scan(start, end)` 和 `Scan(start, end, limit)` 按固定 shard 顺序获得全部共享锁，并对每个 shard 的有序字符串索引做 k-way merge：
 
 - 结果按原始字符串 key 排序。
-- 扫描期间得到一个一致的已提交视图。
-- 写事务发布需要等待扫描释放相关 shard 锁。
+- `start` 与 `end` 都包含在范围内；`limit == 0` 返回空结果，limit 大于命中数时返回全部。
+- 锁内复制至多 `limit` 个 entry 的 key、offset、checksum 和 backing generation，形成该次调用的一致已提交视图；value `pread` 在释放 shard 锁后完成。
+- 写事务发布只等待索引快照阶段，不等待全部 value 读取。
+- 多次 limit 扫描是彼此独立的快照，不承诺跨页一致性。
 - `Scan` 定位为低频管理路径；大范围或长时间扫描会提高写尾延迟。
 - 显式事务内不支持 `Scan`。
 
@@ -73,15 +77,22 @@ Compaction 开始后同时维护当前和待切换 accounting epoch；切换时�
 - 不完整最终 frame 可以丢弃，即该事务可能已经写入部分字节但从未确认。
 - 完整 frame 损坏、中段损坏或非单调 LSN 会拒绝打开，不能静默跳过。
 - `kSync` 下，崩溃发生在同步之后、内存发布之前时，重启仍会恢复该已同步 frame；调用方可能因进程崩溃没有收到返回，因此它属于“结果未知但允许出现”的事务。
-- Compaction 临时文件不是恢复依赖。Rename 前崩溃使用旧文件；rename 后只能使用完整新文件。
+- Compaction 临时文件不是恢复依赖。Rename 前崩溃使用旧文件；rename 后只能使用完整新文件。启动恢复忽略遗留 `.compact.*` 文件。
 
 ## Compaction 文件代际
 
-每个 entry 持有引用计数的 backing file generation。Compaction 的最终提交暂停只覆盖 journal delta 复制、临时文件同步、rename、代际/accounting 发布和父目录同步，不包含全量 entry 遍历。暂停结束后，旧 inode 继续服务尚未迁移的读取，后台再按 shard 迁移 offset；并发新提交已经指向新代际，不会被旧 relocation 覆盖。手动 `Compact()` 在迁移结束且旧 inode 释放后返回。
+每个 entry 和锁内取得的读快照都持有引用计数的 backing file generation。Compaction 的最终提交暂停只覆盖 journal delta 复制、临时文件同步、rename、代际/accounting 发布和父目录同步，不包含全量 entry 遍历。暂停结束后，旧 inode 继续服务尚未迁移的 entry 和已开始的读取，后台再按 shard 迁移 offset；并发新提交已经指向新代际，不会被旧 relocation 覆盖。手动 `Compact()` 等待 entry 迁移结束，但不等待已经持有旧代际的 reader；旧 inode 在最后一个引用释放后自然回收，因此调用返回不等于旧文件空间已经立即释放。
 
 ## Sticky fatal state
 
-运行时遇到 journal 写入、同步、value `pread`、checksum、compaction 或目录同步错误时会保存第一条根因并进入 sticky fatal：
+运行时遇到 journal 写入/同步、主文件 value `pread`/checksum，或 compaction 已无法信任当前主代际时，会保存第一条根因并进入 sticky fatal。Compaction 的分类更细：
+
+- 临时文件创建、临时文件写入或同步、rename 前 failpoint 等尚未发布新代际的普通异常会清理本次临时文件并返回错误，实例仍可继续使用。
+- 读取当前主代际 value 或 WAL delta 时的 `pread`、意外 EOF、checksum 错误和主状态不变量错误，即使发生在 rename 前也进入 sticky fatal。
+- Rename 已成功后的任何异常都进入 sticky fatal，因为新代际可能已经对外可见。
+- 临时文件名使用 PID、进程内序号和随机 nonce；`EEXIST` 只会换名重试，不删除发生碰撞的既有文件。
+
+进入 sticky fatal 后：
 
 - 后续 `Get`、`Scan`、`Put`、`Delete`、`WriteBatch`、事务提交、`Flush` 和 `Compact` 不再继续正常执行。
 - 后续调用抛出同一原始错误，避免一部分线程继续在不可信状态上工作。

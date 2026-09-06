@@ -2,7 +2,7 @@
 
 ## 平台与构建
 
-目标平台是 Linux/WSL POSIX 文件系统。正式性能与长时验证必须使用 Release 和原生 Linux 文件系统，不能把 `/mnt/*`、9p、DrvFS 或 fuseblk 上的结果作为认证成绩。
+目标平台是提供所需 `flock`、`pread/pwrite`、原子 rename 和目录同步语义的 Linux POSIX 文件系统。WSL 下数据库与测试临时目录必须位于 Linux 文件系统；`/mnt/*`、DrvFS、9p 和 fuseblk 未纳入持久化正确性支持范围，也不能用于性能或长时认证。源码可以位于 Windows 挂载路径，但 workload 数据不能。
 
 ```bash
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
@@ -57,6 +57,8 @@ bash scripts/inspect-format.sh /data/store.db
 - `fdatasync_time_us` / `max_fdatasync_time_us`
 - `approx_write_latency_p50_us/p95_us/p99_us`
 - `pending_queue_depth` / `max_pending_queue_depth`
+- `prepared_queue_depth`
+- `inflight_request_count` / `max_inflight_request_count`
 
 ### Worker 与事务
 
@@ -71,6 +73,7 @@ bash scripts/inspect-format.sh /data/store.db
 - `wal_bytes_since_compaction`
 - `live_wal_bytes_since_compaction` / `obsolete_wal_bytes_since_compaction`
 - `manual_compactions_completed` / `auto_compactions_completed`
+- `auto_compaction_failures`
 - `compaction_pause_time_us` / `max_compaction_pause_time_us`
 - `total_snapshot_bytes_written`
 - `total_wal_bytes_reclaimed_by_compaction`
@@ -89,20 +92,22 @@ Value cache 是按规范化 key + LSN 标识的分段 CLOCK，不提供精确 LR
 ```cpp
 options.auto_compact_wal_bytes_threshold = 256ULL * 1024 * 1024;
 options.auto_compact_invalid_wal_ratio_percent = 0;
+options.auto_compact_min_wal_bytes_for_ratio = 256ULL * 1024 * 1024;
 ```
 
-无效比例阈值过低可能在小 journal 上频繁触发。观察：
+两个触发条件为 OR。`auto_compact_min_wal_bytes_for_ratio` 只约束比例条件；设为 `0` 会允许很小的 journal 仅因比例达到阈值而压缩。建议让它至少等于业务可接受的最小压缩体积。观察：
 
 - `auto_compactions_completed` 是否异常快速增长。
+- `auto_compaction_failures` 是否增长；后台安全失败会退避至少 1 秒，并等待后续写入再次触发。
 - `max_compaction_pause_time_us` 是否影响写 p99。
 - checkpoint 写入带宽是否挤压 journal 同步。
 - 数据集增长后 RSS 是否主要来自 key/index，而不是 value cache。
 
-手动 `Compact()` 保证返回时 entry 迁移完成且旧 inode 已释放。自动 compaction 在后台运行；最终提交暂停只包含 delta 复制、临时文件同步、rename、代际/accounting 发布和目录同步。逐 shard entry 迁移发生在恢复提交之后。观察 `max_compaction_pause_time_us` 时应把它解释为这段切换暂停，而不是完整 compaction 时长。
+手动 `Compact()` 保证返回时 entry 迁移完成，但不等待已经取得旧代际快照的 reader。旧 inode 和对应空间在最后一个 reader 释放引用后自然回收，不能把 `Compact()` 返回解释为磁盘空间已立即全部释放。自动 compaction 在后台运行；最终提交暂停只包含 delta 复制、临时文件同步、rename、代际/accounting 发布和目录同步。逐 shard entry 迁移发生在恢复提交之后。观察 `max_compaction_pause_time_us` 时应把它解释为这段切换暂停，而不是完整 compaction 时长。
 
 ## Sticky fatal 处理
 
-一旦任意操作报告 I/O、checksum、short write、sync 或目录错误：
+Journal/主代际 I/O、checksum、short write、sync、主状态不变量或 compaction rename 后错误会进入 sticky fatal：
 
 1. 停止向该实例发送新请求。
 2. 记录第一条错误；后续错误应与它相同。
@@ -111,6 +116,8 @@ options.auto_compact_invalid_wal_ratio_percent = 0;
 5. 使用只读 `verify-format` 检查。
 6. 若只是已识别的不完整最终 frame，可备份后用运行库打开修复，再重新验证。
 7. 完整 checksum、边界或中段损坏必须人工调查，不能自动跳过。
+
+尚未 rename 的 compaction 临时文件创建、写入、同步或普通 failpoint 错误属于可恢复操作失败：调用会报错并只清理本次创建的临时文件，实例仍可继续服务。读取当前主代际 value/WAL delta 时的 EOF、checksum 或状态不变量错误即使发生在 rename 前也不可继续。遗留 `.compact.*` 文件不是恢复依赖；新 compaction 遇到文件名碰撞会换随机 nonce 重试，不会删除碰撞文件。
 
 磁盘满或配额错误需要先释放其他空间。不要在空间仍不足时反复 compaction，因为临时容器需要接近 live 数据集大小的额外空间。
 
@@ -125,7 +132,7 @@ options.auto_compact_invalid_wal_ratio_percent = 0;
 
 ## Scan 影响
 
-字符串 `Scan` 持有所有 shard 的共享锁直到 k-way merge 完成。若写 p99 突升时伴随长 Scan：
+字符串 `Scan` 在持有全部 shard 共享锁时完成索引合并和 entry 快照，然后释放锁并读取 value。优先使用 `Scan(start, end, limit)` 控制单次快照大小；`limit == 0` 返回空，多次调用不提供跨页一致快照。若写 p99 突升时伴随长 Scan：
 
 - 缩小范围或减少返回对象。
 - 降低 Scan 频率。
@@ -135,6 +142,10 @@ options.auto_compact_invalid_wal_ratio_percent = 0;
 
 ```bash
 bash scripts/ci-build.sh
+./build-release/target/bin/kv_unit_test --list
+./build-release/target/bin/kv_test --list-groups
+./build-release/target/bin/kv_test --group recovery-format
+./build-release/target/bin/kv_test --filter "compaction"
 bash scripts/ci-sanitizers.sh
 bash scripts/concurrency-stress.sh 10 balanced
 bash scripts/concurrency-stress.sh 10 compaction-heavy
@@ -146,7 +157,9 @@ bash scripts/qualification-benchmark.sh \
 bash scripts/qualification-run.sh "$qualification_root/soak"
 ```
 
-WSL TSan 默认使用 `/usr/bin/g++-10`；如需替换，设置 `KVSTORE_TSAN_CXX`。
+筛选不到用例会返回非零状态。排查失败时可以设置 `KVSTORE_KEEP_TEST_ARTIFACTS=1`；测试 runner 会继续执行其余独立命名用例，并把保留目录的绝对路径写到标准错误。
+
+本地 WSL TSan 脚本默认使用 `/usr/bin/g++-10`；如需替换，设置 `KVSTORE_TSAN_CXX`。GitHub Actions 显式使用 runner 提供的 `/usr/bin/g++`。直接用 CMake/CTest 时，应在配置阶段通过 `-DKVSTORE_TSAN_OPTIONS=...` 传入扩展选项；配置完成后只修改进程环境中的 `TSAN_OPTIONS` 不会覆盖 CTest 已记录的属性。
 GCC 10 deadlock detector 受 64 锁上限影响，而 `Scan` 需要同时持有 256 个 shard
 锁，所以脚本设置 `detect_deadlocks=0`。这不会关闭数据竞争检测，任何竞态报告仍令
 CTest 或并发压力测试失败。TSan 缺失是失败，不会标为 SKIP。
@@ -169,7 +182,11 @@ CTest 或并发压力测试失败。TSan 缺失是失败，不会标为 SKIP。
 
 ### Compaction 频繁
 
-提高字节阈值，禁用或提高无效比例阈值，并确认没有把测试级几 KiB 阈值带到大数据集。
+提高字节阈值或 `auto_compact_min_wal_bytes_for_ratio`，禁用/提高无效比例阈值，并确认没有把测试级几 KiB 阈值带到大数据集。
+
+### 自动 Compaction 失败增长
+
+查看 `auto_compaction_failures` 和首个操作错误。临时文件空间、权限或同步失败在 rename 前通常可恢复，修复环境后由后续写入重新调度；主代际读取/校验错误或 rename 后错误会进入 sticky fatal，按上面的保留现场流程处理。不要手工删除无法确认所有权的 `.compact.*` 文件。
 
 ### p99 高但 CPU 低
 

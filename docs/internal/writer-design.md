@@ -4,7 +4,7 @@
 
 主要实现位于 [storage_engine.cpp](../../src/internal/storage_engine.cpp)：
 
-- bounded raw queue：生产者背压和请求序号。
+- total inflight gate 与 bounded raw queue：生产者背压和请求序号。
 - worker pool：并行 payload 序列化、payload/value CRC 和物理 WAL charge 计算。
 - prepared map：容纳乱序完成的准备结果。
 - ordered coordinator：OCC 验证、LSN、header/footer、分段 `pwritev`、group sync 和状态发布。
@@ -26,10 +26,12 @@
 
 ## 背压
 
-Raw queue 默认容量 4096。队列满时 `submit_and_wait` 等待 `raw_not_full_`，不会丢弃或返回伪成功。Worker 数默认由硬件并发确定并限制为 32。
+`request_queue_capacity` 默认 4096，限制从调用线程取得 token 起，到 coordinator 完成通知为止的总 inflight 请求；该数量覆盖 raw queue、worker、prepared map 和 coordinator 当前处理请求。达到上限时 `submit_and_wait` 等待，不会丢弃或返回伪成功。请求成功进入 raw queue 时才分配单调序号。`prepared_queue_depth` 暴露 prepared map 的当前大小，`inflight_request_count` 与 `max_inflight_request_count` 暴露总量和高水位。Worker 数默认由硬件并发确定并限制为 32。
+
+线程启动是一个可回滚阶段。任一 worker、coordinator、auto-compaction 或 periodic thread 构造失败时，初始化路径会设置 stop 状态、通知所有等待点并 join 已启动线程，然后把原异常返回给构造调用方。自动 compaction 的两个阈值都为 0 时不创建对应后台线程。
 
 ## 错误
 
-Worker 的单请求序列化错误只完成该请求；journal write/sync、状态不变量、读 backing 或 compaction I/O 错误进入全局 sticky fatal。第一条根因在发布 fatal 标志前写入，避免并发调用看到空错误。
+Worker 的单请求序列化错误只完成该请求；journal write/sync、状态不变量和主 backing 读取/校验错误进入全局 sticky fatal。Compaction 尚未发布新代际时的普通临时文件错误只失败该次操作；主代际读取错误或 rename 后错误进入 sticky fatal。第一条根因在发布 fatal 标志前写入，避免并发调用看到空错误。
 
 最近窗口由 mutex 保护的批次环和写完成延迟样本组成。窗口严格保留 `adaptive_recent_window_batches` 个批次（上限 4096），p95 只使用最近 `adaptive_recent_write_sample_limit` 个完成样本；`GetMetrics()` 与 adaptive policy 读取同一快照。

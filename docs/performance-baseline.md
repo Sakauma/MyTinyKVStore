@@ -91,18 +91,19 @@ bash scripts/qualification-matrix.sh "$qualification_root/matrix"
 
 正式 artifact 至少记录：
 
-- Git commit 和 dirty 状态
-- CPU 拓扑
-- 内存
-- 块设备、旋转属性和挂载点
-- 文件系统类型与可用空间
-- 内核
-- 编译器和 CMake
-- `Release` 构建类型
-- 完整 workload/config
-- 每轮与中位数结果
+- 基线 commit、候选 commit，以及各自的 dirty 状态。
+- Dirty 工作树采样时的 source digest、`git diff --stat` 和完整补丁保存路径；最终提交后必须用 digest 证明提交内容与被测源码一致。
+- Harness/脚本路径与 digest、完整命令行、环境变量、开始/结束时间、时区、退出状态和重复轮数。
+- CPU 型号、socket/core/thread 拓扑、频率 governor；内存总量与关键限制。
+- 块设备、旋转属性、挂载点、文件系统类型、挂载选项与可用空间。
+- Linux 内核、WSL 版本（如适用）及虚拟化边界。
+- 编译器、CMake、生成器、`Release` 构建类型和实际编译/链接选项。
+- 完整 workload/config、随机种子、auto-compaction 配置和 reference baseline 文件校验和。
+- 每轮原始结果、逐指标中位数、门禁结果以及 stdout/stderr 日志路径。
 
 同一 baseline/candidate 比较必须使用同一机器、磁盘、文件系统、内核策略和编译器配置。跨机器的比值没有认证意义。
+
+本机一次或少量短时运行必须标记为 `development-sample`，只能用于发现明显回归；只有上述环境可比、固定工作负载完整运行且原始 artifact 齐全时，结果才可标记为 `qualification-candidate`。更新冻结门槛必须引用至少三轮可比测量，按逐指标中位数给出依据并保留保守裕量，不能为了让当前候选通过而降低门槛。
 
 候选实现的 worker 负责 payload、payload/value CRC 和物理 WAL charge 准备；coordinator 负责 LSN、header/footer、ordered `pwritev` 与同步。热点读使用分段 CLOCK，compaction 使用文件代际并在提交暂停外迁移 entry。性能结果应同时保留 group size、worker utilization、cache hit rate 和 compaction pause 指标，以便判断吞吐变化来自哪条路径。
 
@@ -138,6 +139,7 @@ bash scripts/bench-regression-check.sh benchmarks/reference/ci-floor.json
 
 - [CI stressbench floor](../benchmarks/reference/ci-floor.json)
 - [CI microbench floor](../benchmarks/reference/microbench-floor.json)
+- [2026-09-06 开发验证样本](../benchmarks/reference/development-validation-2026-09-06.json)：保留历史 floor 的哈希、单次 ext4 Release 结果和来源信息；历史 floor 原始来源未知，正式 qualification 仍为 `not_evaluated`。
 
 ## 基线冻结规则
 
