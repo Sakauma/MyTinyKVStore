@@ -194,4 +194,10 @@ CTest 或并发压力测试失败。TSan 缺失是失败，不会标为 SKIP。
 
 检查 `max_fdatasync_time_us`、group size 和文件系统。`kSync` 的尾延迟经常由同步延迟决定；盲目增加 worker 不能消除磁盘同步瓶颈。
 
+CI stressbench 固定保留三个三秒 candidate，并要求至少两轮各自通过全部门槛。若
+aggregate 通过但有 warning，下载全部 candidate，对照每轮的完整
+`write_latency_histogram`、`max_fdatasync_time_us`、`committed_write_batches` 和 batch
+size。不要只重跑失败 job 或丢弃异常样本。两个以上样本失败表示 smoke gate 失败；需
+在同类可比环境中继续调查，不能通过修改冻结 floor 或放宽 p99 比率处理。
+
 更完整语义见[一致性与持久化语义](semantics.md)和[文件格式](file-format.md)。

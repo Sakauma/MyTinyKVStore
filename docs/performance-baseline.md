@@ -135,6 +135,27 @@ bash scripts/bench-regression-check.sh benchmarks/reference/ci-floor.json
 
 快速 gate 的阈值较宽，只用于阻止明显倒退。它们不能代替标准 2×/p99 gate。
 
+`bench-regression-check.sh` 默认只运行一个样本。第六个参数可以固定样本数，例如在
+同一次构建后顺序运行三次：
+
+```bash
+bash scripts/bench-regression-check.sh \
+  benchmarks/reference/ci-floor.json \
+  benchmarks/baselines \
+  85 85 125 3
+```
+
+CI 固定运行三个完整三秒样本，并要求至少两个样本各自通过全部既有门槛。三个
+candidate 无论通过还是失败都会保存；若只有一个样本失败，aggregate 会通过并明确
+输出 warning。比较器返回 `2` 表示性能门禁失败，可以继续采集剩余样本；其他返回值
+表示执行、输入或格式错误，脚本立即失败。该策略不改变任何 floor 或阈值，也不把三
+轮拼成一个直方图或只保留最好结果。
+
+短时 CI smoke 仍受共享 runner 的同步 I/O 长尾影响。单轮 p99 失败时，应同时检查完整
+`write_latency_histogram`、`max_fdatasync_time_us` 和全部三轮 candidate。两轮以上重复
+失败才会使 aggregate 失败；单轮异常仍是需要保留的不稳定证据，不能当成正式性能认
+证。需要判断低频真实回归时，应使用上面的 qualification 流程和可比环境。
+
 Stressbench 的 fsync pressure 门禁使用本次测量开始、结束时 `wal_fsync_calls` 与 `committed_write_requests` 的差值计算全窗口比率。旧 reference 没有该测量字段时，比较器仍读取原有 `observed_fsync_pressure_per_1000_writes` 作为冻结预算；candidate 不再用最后一个批次的形状代表整个三秒窗口。
 
 仓库参考文件使用相对链接：

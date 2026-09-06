@@ -1,6 +1,7 @@
 #include "tests/common/qualification_benchmark.h"
 
 #include "kvstore.h"
+#include "tests/common/benchmark_shared.h"
 #include "tests/common/test_support.h"
 
 #include <algorithm>
@@ -43,14 +44,6 @@ Value qualification_value(size_t size, uint64_t salt) {
         bytes[index] = static_cast<uint8_t>((salt * 1315423911ULL + index * 17ULL) & 0xFFU);
     }
     return Value(std::move(bytes));
-}
-
-uint64_t percentile(const std::vector<uint64_t>& sorted, uint64_t numerator) {
-    if (sorted.empty()) {
-        return 0;
-    }
-    const uint64_t rank = (sorted.size() * numerator + 99) / 100;
-    return sorted[static_cast<size_t>(std::max<uint64_t>(1, rank) - 1)];
 }
 
 double median(std::vector<double> values) {
@@ -194,10 +187,11 @@ QualificationRound run_round(uint64_t prefill_keys,
                          thread_result.write_latencies_us.end());
         std::vector<uint64_t>().swap(thread_result.write_latencies_us);
     }
-    std::sort(latencies.begin(), latencies.end());
-    result.write_p50_us = percentile(latencies, 50);
-    result.write_p95_us = percentile(latencies, 95);
-    result.write_p99_us = percentile(latencies, 99);
+    const LatencyPercentiles latency_percentiles =
+        calculate_latency_percentiles(std::move(latencies));
+    result.write_p50_us = latency_percentiles.p50_us;
+    result.write_p95_us = latency_percentiles.p95_us;
+    result.write_p99_us = latency_percentiles.p99_us;
     result.operations_per_s = operations / result.duration_s;
     result.write_ops_per_s = (result.put_operations + result.delete_operations) / result.duration_s;
     result.options = options;

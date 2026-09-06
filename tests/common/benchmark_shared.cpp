@@ -3,6 +3,7 @@
 #include "tests/common/cli_entrypoints.h"
 #include "tests/common/test_support.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -80,6 +81,23 @@ KVStoreOptions benchmark_options() {
     return options;
 }
 
+LatencyPercentiles calculate_latency_percentiles(std::vector<uint64_t> latencies_us) {
+    if (latencies_us.empty()) {
+        return {};
+    }
+    std::sort(latencies_us.begin(), latencies_us.end());
+    const auto percentile = [&latencies_us](uint64_t numerator) {
+        const uint64_t rank =
+            (static_cast<uint64_t>(latencies_us.size()) * numerator + 99) / 100;
+        return latencies_us[static_cast<size_t>(std::max<uint64_t>(1, rank) - 1)];
+    };
+    return LatencyPercentiles {
+        percentile(50),
+        percentile(95),
+        percentile(99),
+    };
+}
+
 BenchmarkResult run_benchmark_capture(const BenchmarkConfig& config) {
     TestDir dir("bench_" + config.label);
     const std::string db_path = dir.file("store.dat");
@@ -91,44 +109,109 @@ BenchmarkResult run_benchmark_capture(const BenchmarkConfig& config) {
     std::atomic<uint64_t> write_ops {0};
     std::atomic<uint64_t> read_ops {0};
     std::atomic<uint64_t> write_latency_ns {0};
+    std::atomic<size_t> ready {0};
+    std::atomic<bool> begin_work {false};
+    std::vector<std::vector<uint64_t>> writer_latencies_us(
+        static_cast<size_t>(config.writer_count));
 
     std::vector<std::thread> threads;
     ThreadFailureCollector thread_failures;
-    for (int writer_id = 0; writer_id < config.writer_count; ++writer_id) {
-        threads.emplace_back(thread_failures.guard(
-            [&store, &stop, &write_ops, &write_latency_ns, &config, writer_id]() {
-            std::mt19937 gen(1337 + writer_id);
-            std::uniform_int_distribution<int> key_dist(writer_id * 100000, writer_id * 100000 + config.key_space - 1);
-            while (!stop.load(std::memory_order_acquire)) {
-                const int key = key_dist(gen);
-                const auto begin = std::chrono::steady_clock::now();
-                store.Put(key, text("payload_" + std::to_string(key)));
-                const auto end = std::chrono::steady_clock::now();
-                write_ops.fetch_add(1, std::memory_order_relaxed);
-                write_latency_ns.fetch_add(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count(),
-                    std::memory_order_relaxed);
+    const auto stop_and_join = [&] {
+        stop.store(true, std::memory_order_release);
+        begin_work.store(true, std::memory_order_release);
+        for (auto& thread : threads) {
+            if (thread.joinable()) {
+                thread.join();
             }
+        }
+    };
+    try {
+        for (int writer_id = 0; writer_id < config.writer_count; ++writer_id) {
+            threads.emplace_back(thread_failures.guard(
+                [&store,
+                 &stop,
+                 &write_ops,
+                 &write_latency_ns,
+                 &writer_latencies_us,
+                 &ready,
+                 &begin_work,
+                 &config,
+                 writer_id]() {
+                std::mt19937 gen(1337 + writer_id);
+                std::uniform_int_distribution<int> key_dist(
+                    writer_id * 100000,
+                    writer_id * 100000 + config.key_space - 1);
+                std::vector<uint64_t>& latencies_us =
+                    writer_latencies_us[static_cast<size_t>(writer_id)];
+                latencies_us.reserve(1024);
+                ready.fetch_add(1, std::memory_order_release);
+                while (!begin_work.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+                while (!stop.load(std::memory_order_acquire)) {
+                    const int key = key_dist(gen);
+                    const auto begin = std::chrono::steady_clock::now();
+                    store.Put(key, text("payload_" + std::to_string(key)));
+                    const auto end = std::chrono::steady_clock::now();
+                    latencies_us.push_back(static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            end - begin)
+                            .count()));
+                    write_ops.fetch_add(1, std::memory_order_relaxed);
+                    write_latency_ns.fetch_add(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            end - begin)
+                            .count(),
+                        std::memory_order_relaxed);
+                }
             }));
+        }
+
+        for (int reader_id = 0; reader_id < config.reader_count; ++reader_id) {
+            threads.emplace_back(thread_failures.guard([&store,
+                                                        &stop,
+                                                        &read_ops,
+                                                        &ready,
+                                                        &begin_work,
+                                                        &config,
+                                                        reader_id]() {
+                std::mt19937 gen(4242 + reader_id);
+                std::uniform_int_distribution<int> key_dist(
+                    0,
+                    config.writer_count * 100000 + config.key_space - 1);
+                ready.fetch_add(1, std::memory_order_release);
+                while (!begin_work.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+                while (!stop.load(std::memory_order_acquire)) {
+                    (void)store.Get(key_dist(gen));
+                    read_ops.fetch_add(1, std::memory_order_relaxed);
+                }
+            }));
+        }
+    } catch (...) {
+        stop_and_join();
+        throw;
     }
 
-    for (int reader_id = 0; reader_id < config.reader_count; ++reader_id) {
-        threads.emplace_back(thread_failures.guard([&store, &stop, &read_ops, &config, reader_id]() {
-            std::mt19937 gen(4242 + reader_id);
-            std::uniform_int_distribution<int> key_dist(0, config.writer_count * 100000 + config.key_space - 1);
-            while (!stop.load(std::memory_order_acquire)) {
-                (void)store.Get(key_dist(gen));
-                read_ops.fetch_add(1, std::memory_order_relaxed);
-            }
-        }));
+    const size_t thread_count = threads.size();
+    while (ready.load(std::memory_order_acquire) != thread_count &&
+           !thread_failures.has_failure()) {
+        std::this_thread::yield();
     }
-
+    if (thread_failures.has_failure()) {
+        stop_and_join();
+        thread_failures.rethrow_first();
+    }
     const auto start = std::chrono::steady_clock::now();
+    begin_work.store(true, std::memory_order_release);
     std::this_thread::sleep_for(std::chrono::milliseconds(config.duration_ms));
     stop.store(true, std::memory_order_release);
 
     for (auto& thread : threads) {
-        thread.join();
+        if (thread.joinable()) {
+            thread.join();
+        }
     }
     thread_failures.rethrow_first();
 
@@ -144,6 +227,22 @@ BenchmarkResult run_benchmark_capture(const BenchmarkConfig& config) {
     result.avg_write_latency_us =
         result.writes == 0 ? 0.0
                            : static_cast<double>(write_latency_ns.load(std::memory_order_relaxed)) / result.writes / 1000.0;
+    std::vector<uint64_t> write_latencies_us;
+    size_t latency_count = 0;
+    for (const auto& writer_samples : writer_latencies_us) {
+        latency_count += writer_samples.size();
+    }
+    write_latencies_us.reserve(latency_count);
+    for (auto& writer_samples : writer_latencies_us) {
+        write_latencies_us.insert(
+            write_latencies_us.end(), writer_samples.begin(), writer_samples.end());
+    }
+    require(write_latencies_us.size() == result.writes,
+            "benchmark latency sample count must match successful writes");
+    const LatencyPercentiles latency_percentiles =
+        calculate_latency_percentiles(std::move(write_latencies_us));
+    result.measurement_write_latency_p95_us = latency_percentiles.p95_us;
+    result.measurement_write_latency_p99_us = latency_percentiles.p99_us;
     result.metrics = store.GetMetrics();
     require(result.metrics.committed_write_requests >= metrics_before.committed_write_requests,
             "benchmark committed write counter must be monotonic");
@@ -183,6 +282,10 @@ std::string benchmark_result_to_json(const BenchmarkResult& result) {
         << "\"wal_fsync_calls\":" << result.measurement_wal_fsync_calls << ','
         << "\"measurement_fsync_pressure_per_1000_writes\":"
         << result.measurement_fsync_pressure_per_1000_writes
+        << ",\"measurement_write_latency_p95_us\":"
+        << result.measurement_write_latency_p95_us
+        << ",\"measurement_write_latency_p99_us\":"
+        << result.measurement_write_latency_p99_us
         << "},"
         << "\"options\":" << OptionsToJson(result.options) << ','
         << "\"metrics\":" << MetricsToJson(result.metrics)

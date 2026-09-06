@@ -28,6 +28,14 @@ struct BenchmarkResult {
     uint64_t measurement_committed_write_requests = 0;
     uint64_t measurement_wal_fsync_calls = 0;
     uint64_t measurement_fsync_pressure_per_1000_writes = 0;
+    uint64_t measurement_write_latency_p95_us = 0;
+    uint64_t measurement_write_latency_p99_us = 0;
+};
+
+struct LatencyPercentiles {
+    uint64_t p50_us = 0;
+    uint64_t p95_us = 0;
+    uint64_t p99_us = 0;
 };
 
 struct MicrobenchCaseResult {
@@ -46,6 +54,7 @@ BenchmarkConfig make_benchmark_config(
     int key_space);
 
 KVStoreOptions benchmark_options();
+LatencyPercentiles calculate_latency_percentiles(std::vector<uint64_t> latencies_us);
 BenchmarkResult run_benchmark_capture(const BenchmarkConfig& config);
 std::vector<MicrobenchCaseResult> run_microbench_capture();
 std::string benchmark_result_to_json(const BenchmarkResult& result);

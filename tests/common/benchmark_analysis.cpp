@@ -144,10 +144,22 @@ BenchmarkBaselineComparison compare_benchmark_baseline(
     const double candidate_read_ops_per_s = extract_json_number(candidate_json, "read_ops_per_s");
     const double baseline_avg_write_latency_us = extract_json_number(baseline_json, "avg_write_latency_us");
     const double candidate_avg_write_latency_us = extract_json_number(candidate_json, "avg_write_latency_us");
-    const double baseline_p95_latency_us = extract_json_number(baseline_json, "approx_write_latency_p95_us");
-    const double candidate_p95_latency_us = extract_json_number(candidate_json, "approx_write_latency_p95_us");
-    const double baseline_p99_latency_us = extract_json_number(baseline_json, "approx_write_latency_p99_us");
-    const double candidate_p99_latency_us = extract_json_number(candidate_json, "approx_write_latency_p99_us");
+    const double baseline_p95_latency_us = extract_json_number_with_fallback(
+        baseline_json,
+        "measurement_write_latency_p95_us",
+        "approx_write_latency_p95_us");
+    const double candidate_p95_latency_us = extract_json_number_with_fallback(
+        candidate_json,
+        "measurement_write_latency_p95_us",
+        "approx_write_latency_p95_us");
+    const double baseline_p99_latency_us = extract_json_number_with_fallback(
+        baseline_json,
+        "measurement_write_latency_p99_us",
+        "approx_write_latency_p99_us");
+    const double candidate_p99_latency_us = extract_json_number_with_fallback(
+        candidate_json,
+        "measurement_write_latency_p99_us",
+        "approx_write_latency_p99_us");
     const double baseline_fsync_pressure = extract_json_number_with_fallback(
         baseline_json,
         "measurement_fsync_pressure_per_1000_writes",

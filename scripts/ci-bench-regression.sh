@@ -8,4 +8,10 @@ if [[ ! -f "${baseline_path}" ]]; then
   exit 1
 fi
 
-bash scripts/bench-regression-check.sh "${baseline_path}"
+bash scripts/bench-regression-check.sh \
+  "${baseline_path}" \
+  benchmarks/baselines \
+  85 \
+  85 \
+  125 \
+  3
