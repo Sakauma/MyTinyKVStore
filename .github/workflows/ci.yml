@@ -1,0 +1,107 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Configure, build, and test
+        env:
+          KVSTORE_KEEP_TEST_ARTIFACTS: 1
+          TMPDIR: ${{ runner.temp }}/kvstore-test-artifacts
+        run: |
+          mkdir -p "$TMPDIR"
+          bash scripts/ci-build.sh
+      - name: Upload failed test artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-artifacts-build-and-test
+          path: ${{ runner.temp }}/kvstore-test-artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run sanitizer builds
+        env:
+          KVSTORE_KEEP_TEST_ARTIFACTS: 1
+          KVSTORE_TSAN_CXX: /usr/bin/g++
+          TMPDIR: ${{ runner.temp }}/kvstore-test-artifacts
+        run: |
+          mkdir -p "$TMPDIR"
+          bash scripts/ci-sanitizers.sh
+      - name: Upload failed sanitizer artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-artifacts-sanitizers
+          path: ${{ runner.temp }}/kvstore-test-artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run coverage build
+        run: bash scripts/coverage.sh
+
+  benchmark-regression:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run benchmark regression gate
+        run: bash scripts/ci-bench-regression.sh
+      - name: Upload benchmark candidates
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-baselines
+          path: benchmarks/baselines/*.json
+          if-no-files-found: ignore
+
+  microbench-regression:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run microbench regression gate
+        run: bash scripts/ci-microbench-regression.sh
+      - name: Upload microbench candidates
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: microbench-baselines
+          path: benchmarks/baselines/microbench-*.json
+          if-no-files-found: ignore
