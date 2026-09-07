@@ -5,7 +5,4 @@ build-*/
 *.dat
 *.dat.wal
 benchmarks/baselines/*.json
-archive/debug/
-archive/legacy_v1_v2/
-archive/planning/
 artifacts/qualification/

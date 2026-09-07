@@ -162,7 +162,6 @@ Stressbench 的 fsync pressure 门禁使用本次测量开始、结束时 `wal_f
 
 - [CI stressbench floor](../benchmarks/reference/ci-floor.json)
 - [CI microbench floor](../benchmarks/reference/microbench-floor.json)
-- [2026-09-06 开发验证样本](../benchmarks/reference/development-validation-2026-09-06.json)：保留历史 floor 的哈希、单次 ext4 Release 结果和来源信息；历史 floor 原始来源未知，正式 qualification 仍为 `not_evaluated`。
 
 ## 基线冻结规则
 

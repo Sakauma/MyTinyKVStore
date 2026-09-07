@@ -9,7 +9,7 @@
 - `tests/integration/`：持久化、恢复、事务、指标和并发集成测试。
 - `tests/common/`：测试 runner、临时目录、CLI、benchmark 和 stress 公共代码。
 - `scripts/`：CI、sanitizer、格式工具、benchmark、stress 与 qualification 入口。
-- `docs/`：当前契约、格式、运行手册和内部设计；`archive/` 只保存历史索引及本地忽略归档。
+- `docs/`：当前契约、格式、运行手册和内部设计。
 
 ## 构建与产物
 
