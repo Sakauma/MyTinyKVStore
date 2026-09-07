@@ -6,3 +6,5 @@ build-*/
 *.dat.wal
 benchmarks/baselines/*.json
 artifacts/qualification/
+AGENTS.md
+docs/
