@@ -344,7 +344,6 @@ void recover_checkpoint(int fd,
             Mutation operation {MutationType::kPut, std::move(key), std::move(value)};
             operation.value_offset = superblock.object_offset + entry.value_offset;
             operation.value_checksum = entry.value_checksum;
-            operation.has_backing = true;
             apply(operation, superblock.checkpoint_lsn);
         }
     }
@@ -680,78 +679,6 @@ FrameFooter make_frame_footer(const FrameHeader& header) {
     return footer;
 }
 
-std::vector<uint8_t> serialize_frame(const std::vector<uint8_t>& payload,
-                                     uint32_t operation_count,
-                                     uint64_t lsn) {
-    const FrameHeader header = make_frame_header(
-        payload.size(), operation_count, lsn, crc32c(payload.data(), payload.size()));
-    const FrameFooter footer = make_frame_footer(header);
-
-    std::vector<uint8_t> frame;
-    frame.reserve(static_cast<size_t>(header.frame_bytes));
-    append_object(frame, header);
-    append_bytes(frame, payload.data(), payload.size());
-    append_object(frame, footer);
-    return frame;
-}
-
-CheckpointImage build_checkpoint(const std::vector<Mutation>& entries,
-                                 uint64_t generation,
-                                 uint64_t checkpoint_lsn) {
-    CheckpointImage image;
-    image.index.resize(sizeof(IndexHeader));
-    for (const auto& entry : entries) {
-        validate_key_and_value(entry);
-        if (entry.type != MutationType::kPut) {
-            throw KVStoreError("Checkpoint image may contain only put entries");
-        }
-        IndexEntryHeader header = make_index_entry_header(
-            entry.key,
-            image.objects.size(),
-            static_cast<uint32_t>(entry.value.bytes.size()),
-            crc32c(entry.value.bytes.data(), entry.value.bytes.size()));
-        append_object(image.index, header);
-        append_bytes(image.index, entry.key.data(), entry.key.size());
-        append_bytes(image.objects, entry.value.bytes.data(), entry.value.bytes.size());
-    }
-
-    IndexHeader index_header = make_index_header(
-        entries.size(),
-        image.index.size() - sizeof(IndexHeader),
-        crc32c(image.index.data() + sizeof(IndexHeader), image.index.size() - sizeof(IndexHeader)));
-    std::memcpy(image.index.data(), &index_header, sizeof(index_header));
-
-    const uint64_t index_offset = kDataOffset;
-    const uint64_t object_offset = index_offset + image.index.size();
-    const uint64_t journal_offset = object_offset + image.objects.size();
-    uint32_t checkpoint_checksum = crc32c(image.index.data(), image.index.size());
-    checkpoint_checksum = crc32c_extend(checkpoint_checksum, image.objects.data(), image.objects.size());
-    image.superblock = make_superblock(generation,
-                                      checkpoint_lsn,
-                                      index_offset,
-                                      image.index.size(),
-                                      object_offset,
-                                      image.objects.size(),
-                                      journal_offset,
-                                      checkpoint_checksum);
-    return image;
-}
-
-void write_checkpoint_image(int fd,
-                            const CheckpointImage& image,
-                            const std::string& path) {
-    if (::ftruncate(fd, static_cast<off_t>(image.superblock.journal_offset)) != 0) {
-        throw io_error("ftruncate", path);
-    }
-    if (!image.index.empty()) {
-        pwrite_all(fd, image.index.data(), image.index.size(), image.superblock.index_offset, path);
-    }
-    if (!image.objects.empty()) {
-        pwrite_all(fd, image.objects.data(), image.objects.size(), image.superblock.object_offset, path);
-    }
-    write_superblocks(fd, image.superblock, path);
-}
-
 RecoveryResult recover_file(int fd,
                             const std::string& path,
                             const ApplyCallback& apply,
@@ -859,7 +786,6 @@ RecoveryResult recover_file(int fd,
                     sizeof(MutationHeader) + key.size() + mutation_header.value_size,
                     operation_index,
                     header.operation_count);
-                operation.has_backing = type == MutationType::kPut;
                 apply(operation, header.lsn);
             });
         ++result.journal_frames;

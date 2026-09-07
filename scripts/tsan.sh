@@ -24,6 +24,7 @@ echo "GCC 10 deadlock detection is disabled because Scan can hold 256 shard lock
 cmake -S . -B build-tsan \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DKVSTORE_ENABLE_TSAN=ON \
+  -DKVSTORE_TSAN_OPTIONS="$tsan_options" \
   -DCMAKE_CXX_COMPILER="$tsan_cxx"
 cmake --build build-tsan --parallel
 (cd build-tsan && TSAN_OPTIONS="$tsan_options" ctest --output-on-failure)

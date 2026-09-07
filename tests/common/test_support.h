@@ -30,7 +30,7 @@ void require(bool condition, const std::string& message);
 class TestDir {
 public:
     explicit TestDir(const std::string& name);
-    ~TestDir();
+    ~TestDir() noexcept;
 
     std::string file(const std::string& name) const;
 
@@ -78,7 +78,10 @@ private:
 void append_bytes(const std::string& path, std::initializer_list<uint8_t> data);
 uintmax_t file_size_or_zero(const std::string& path);
 void wait_for_start(std::atomic<int>& ready, std::atomic<bool>& start_signal, int target_count);
-int run_named_tests(const std::vector<NamedTest>& tests);
+int list_named_tests(const std::vector<NamedTest>& tests, const std::string& filter = {});
+int run_named_tests(const std::vector<NamedTest>& tests,
+                    const std::string& filter = {},
+                    const std::string& suite_name = {});
 
 template <typename Predicate>
 void wait_until(Predicate predicate, const std::string& failure_message, int timeout_ms = 2000) {

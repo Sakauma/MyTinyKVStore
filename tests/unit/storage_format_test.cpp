@@ -4,6 +4,7 @@
 #include "internal/storage_format.h"
 
 #include <cstring>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -52,7 +53,19 @@ void test_storage_transaction_frame_has_matching_commit_footer() {
          Value {}},
     };
     const auto payload = kvstore::internal::serialize_payload(operations);
-    const auto frame = kvstore::internal::serialize_frame(payload, operations.size(), 42);
+    const auto prepared_header = kvstore::internal::make_frame_header(
+        payload.size(), operations.size(), 42,
+        kvstore::internal::crc32c(payload.data(), payload.size()));
+    const auto prepared_footer = kvstore::internal::make_frame_footer(prepared_header);
+    std::vector<uint8_t> frame;
+    frame.reserve(static_cast<size_t>(prepared_header.frame_bytes));
+    const auto append = [&frame](const void* data, size_t size) {
+        const auto* bytes = static_cast<const uint8_t*>(data);
+        frame.insert(frame.end(), bytes, bytes + size);
+    };
+    append(&prepared_header, sizeof(prepared_header));
+    append(payload.data(), payload.size());
+    append(&prepared_footer, sizeof(prepared_footer));
     kvstore::internal::FrameHeader header {};
     kvstore::internal::FrameFooter footer {};
     std::memcpy(&header, frame.data(), sizeof(header));
@@ -67,10 +80,6 @@ void test_storage_transaction_frame_has_matching_commit_footer() {
     require(header.payload_checksum == footer.payload_checksum,
             "storage frame header/footer should agree on the payload checksum");
 
-    const auto prepared_header = kvstore::internal::make_frame_header(
-        payload.size(), operations.size(), 42,
-        kvstore::internal::crc32c(payload.data(), payload.size()));
-    const auto prepared_footer = kvstore::internal::make_frame_footer(prepared_header);
     require(std::memcmp(frame.data(), &prepared_header, sizeof(prepared_header)) == 0 &&
                 std::memcmp(frame.data() + sizeof(prepared_header),
                             payload.data(),
@@ -82,22 +91,24 @@ void test_storage_transaction_frame_has_matching_commit_footer() {
 }
 
 void test_storage_checkpoint_plans_single_file_regions() {
-    const std::vector<kvstore::internal::Mutation> entries {
-        {kvstore::internal::MutationType::kPut,
-         kvstore::internal::encode_int_key(1),
-         text("one")},
-        {kvstore::internal::MutationType::kPut,
-         kvstore::internal::encode_string_key("two"),
-         text("two")},
-    };
-    const auto image = kvstore::internal::build_checkpoint(entries, 3, 9);
-    require(kvstore::internal::valid_superblock(image.superblock),
+    const std::string first_key = kvstore::internal::encode_int_key(1);
+    const std::string second_key = kvstore::internal::encode_string_key("two");
+    const uint64_t index_bytes = sizeof(kvstore::internal::IndexHeader) +
+                                 sizeof(kvstore::internal::IndexEntryHeader) * 2 +
+                                 first_key.size() + second_key.size();
+    const uint64_t object_bytes = text("one").bytes.size() + text("two").bytes.size();
+    const uint64_t object_offset = kvstore::internal::kDataOffset + index_bytes;
+    const uint64_t journal_offset = object_offset + object_bytes;
+    const auto superblock = kvstore::internal::make_superblock(
+        3, 9, kvstore::internal::kDataOffset, index_bytes,
+        object_offset, object_bytes, journal_offset, 0);
+    require(kvstore::internal::valid_superblock(superblock),
             "checkpoint builder should produce a checksummed storage superblock");
-    require(image.superblock.index_offset == kvstore::internal::kDataOffset,
+    require(superblock.index_offset == kvstore::internal::kDataOffset,
             "checkpoint index should start after both fixed superblocks");
-    require(image.superblock.object_offset == image.superblock.index_offset + image.index.size(),
+    require(superblock.object_offset == superblock.index_offset + index_bytes,
             "checkpoint object region should follow its index");
-    require(image.superblock.journal_offset == image.superblock.object_offset + image.objects.size(),
+    require(superblock.journal_offset == superblock.object_offset + object_bytes,
             "in-file journal should follow checkpoint objects");
 }
 

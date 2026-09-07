@@ -3,6 +3,7 @@
 
 #include "tests/common/test_support.h"
 
+#include <string>
 #include <vector>
 
 namespace kvstore::tests::integration {
@@ -18,6 +19,8 @@ void register_recovery_format_tests(TestCases& tests);
 void register_runtime_concurrency_tests(TestCases& tests);
 void register_transaction_tests(TestCases& tests);
 void register_all_integration_tests(TestCases& tests);
+std::vector<std::string> integration_test_groups();
+bool register_integration_test_group(const std::string& group, TestCases& tests);
 
 }  // namespace kvstore::tests::integration
 

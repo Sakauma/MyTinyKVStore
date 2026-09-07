@@ -1,5 +1,6 @@
 #include "tests/integration/test_registry.h"
 
+#include "internal/io.h"
 #include "internal/storage_format.h"
 #include "kvstore.h"
 #include "tests/common/runtime_entrypoints.h"
@@ -8,7 +9,10 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <memory>
@@ -28,6 +32,104 @@ using test_support::require;
 using test_support::TestDir;
 using test_support::text;
 using test_support::ThreadFailureCollector;
+using test_support::wait_until;
+
+class ScopedThrowFailpoint {
+public:
+    explicit ScopedThrowFailpoint(const char* name) {
+        ::setenv("KVSTORE_FAILPOINT", name, 1);
+        ::setenv("KVSTORE_FAIL_ACTION", "throw", 1);
+    }
+
+    ~ScopedThrowFailpoint() {
+        ::unsetenv("KVSTORE_FAILPOINT");
+        ::unsetenv("KVSTORE_FAIL_ACTION");
+    }
+
+    ScopedThrowFailpoint(const ScopedThrowFailpoint&) = delete;
+    ScopedThrowFailpoint& operator=(const ScopedThrowFailpoint&) = delete;
+};
+
+class ScopedBlockingFailpoint {
+public:
+    explicit ScopedBlockingFailpoint(std::string name)
+        : state_(std::make_shared<State>(std::move(name))) {
+        kvstore::internal::install_failpoint_test_callback(
+            [state = state_](const char* current_name) {
+                if (state->name != current_name) {
+                    return;
+                }
+                std::unique_lock<std::mutex> lock(state->mutex);
+                state->reached = true;
+                state->condition.notify_all();
+                state->condition.wait(lock, [&state] { return state->released; });
+            });
+    }
+
+    ~ScopedBlockingFailpoint() {
+        Release();
+        kvstore::internal::clear_failpoint_test_callback();
+    }
+
+    void WaitUntilReached() {
+        std::unique_lock<std::mutex> lock(state_->mutex);
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+#if defined(KVSTORE_TSAN_INSTRUMENTED)
+        // GCC 10's libtsan does not intercept the pthread_cond_clockwait path
+        // used by steady-clock timed waits. Use the intercepted realtime path,
+        // then enforce the original steady-clock deadline.
+        while (!state_->reached) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                break;
+            }
+            const auto remaining = deadline - now;
+            auto wall_delay =
+                std::chrono::duration_cast<std::chrono::system_clock::duration>(
+                    remaining);
+            if (wall_delay < remaining) {
+                ++wall_delay;
+            }
+            state_->condition.wait_until(
+                lock, std::chrono::system_clock::now() + wall_delay);
+        }
+        const bool reached = state_->reached;
+#else
+        const bool reached = state_->condition.wait_until(
+            lock,
+            deadline,
+            [this] { return state_->reached; });
+#endif
+        require(reached,
+                "Compaction did not reach the checkpoint-complete test barrier");
+    }
+
+    void Release() noexcept {
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            state_->released = true;
+        }
+        state_->condition.notify_all();
+    }
+
+    ScopedBlockingFailpoint(const ScopedBlockingFailpoint&) = delete;
+    ScopedBlockingFailpoint& operator=(const ScopedBlockingFailpoint&) = delete;
+
+private:
+    struct State {
+        explicit State(std::string failpoint_name)
+            : name(std::move(failpoint_name)) {}
+
+        std::string name;
+        std::mutex mutex;
+        std::condition_variable condition;
+        bool reached = false;
+        bool released = false;
+    };
+
+    std::shared_ptr<State> state_;
+};
 
 void test_soak_profiles_are_distinct() {
     const SoakProfileSummary balanced = soak_profile_summary_entrypoint("balanced");
@@ -696,71 +798,63 @@ void test_compaction_delta_preserves_overwrites_deletes_transactions_and_scans()
     seed.push_back(BatchWriteOperation::PutInt(7001, text("delete-during-compaction")));
     store->WriteBatch(seed);
 
-    std::atomic<bool> stop_scans {false};
-    std::atomic<bool> compaction_done {false};
-    ThreadFailureCollector failures;
-    std::thread scanner(failures.guard([&] {
-        while (!stop_scans.load(std::memory_order_acquire)) {
-            const auto values = store->Scan("scan_", "scan_zzzz");
-            require(values.size() == 32,
-                    "A Scan concurrent with compaction migration must keep a complete view");
-            std::this_thread::yield();
-        }
-    }));
-    std::thread compactor(failures.guard([&] {
-        try {
-            store->Compact();
-        } catch (...) {
-            compaction_done.store(true, std::memory_order_release);
-            throw;
-        }
-        compaction_done.store(true, std::memory_order_release);
-    }));
-
-    const std::string temp_path = path + ".compact." +
-                                  std::to_string(static_cast<long long>(::getpid())) + ".0";
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    bool observed_temp = false;
-    while (std::chrono::steady_clock::now() < deadline &&
-           !compaction_done.load(std::memory_order_acquire)) {
-        if (std::filesystem::exists(temp_path)) {
-            observed_temp = true;
-            break;
-        }
-        std::this_thread::yield();
-    }
-    if (!observed_temp) {
-        stop_scans.store(true, std::memory_order_release);
-        compactor.join();
-        scanner.join();
-        failures.rethrow_first();
-        require(false,
-                "The compaction test must observe the temporary generation before issuing delta writes");
-        return;
-    }
-
-    store->Put(7000, text("delta-one"));
-    store->Put(7000, text("delta-two"));
-    store->Delete(7000);
-    store->Put(7000, text("delta-final"));
-    store->Delete(7001);
-    store->WriteBatch({
-        BatchWriteOperation::PutInt(7002, text("batch-live")),
-        BatchWriteOperation::PutInt(7003, text("batch-delete")),
-        BatchWriteOperation::DeleteInt(7003),
-    });
     std::optional<Value> observed;
     {
-        auto transaction = store->BeginTransaction();
-        observed = transaction.Get(7000);
-        transaction.Put(7004, text("transaction-live"));
-        transaction.Commit();
-    }
+        std::atomic<bool> stop_scans {false};
+        ThreadFailureCollector failures;
+        ScopedBlockingFailpoint compaction_pause(
+            "after_checkpoint_write_before_sync");
+        std::thread scanner;
+        std::thread compactor;
+        try {
+            scanner = std::thread(failures.guard([&] {
+                while (!stop_scans.load(std::memory_order_acquire)) {
+                    const auto values = store->Scan("scan_", "scan_zzzz");
+                    require(values.size() == 32,
+                            "A Scan concurrent with compaction migration must keep a complete view");
+                    std::this_thread::yield();
+                }
+            }));
+            compactor = std::thread(failures.guard([&] {
+                store->Compact();
+            }));
 
-    compactor.join();
-    stop_scans.store(true, std::memory_order_release);
-    scanner.join();
-    failures.rethrow_first();
+            compaction_pause.WaitUntilReached();
+
+            store->Put(7000, text("delta-one"));
+            store->Put(7000, text("delta-two"));
+            store->Delete(7000);
+            store->Put(7000, text("delta-final"));
+            store->Delete(7001);
+            store->WriteBatch({
+                BatchWriteOperation::PutInt(7002, text("batch-live")),
+                BatchWriteOperation::PutInt(7003, text("batch-delete")),
+                BatchWriteOperation::DeleteInt(7003),
+            });
+            auto transaction = store->BeginTransaction();
+            observed = transaction.Get(7000);
+            transaction.Put(7004, text("transaction-live"));
+            transaction.Commit();
+        } catch (...) {
+            const std::exception_ptr primary_failure = std::current_exception();
+            compaction_pause.Release();
+            stop_scans.store(true, std::memory_order_release);
+            if (compactor.joinable()) {
+                compactor.join();
+            }
+            if (scanner.joinable()) {
+                scanner.join();
+            }
+            failures.rethrow_first();
+            std::rethrow_exception(primary_failure);
+        }
+
+        compaction_pause.Release();
+        compactor.join();
+        stop_scans.store(true, std::memory_order_release);
+        scanner.join();
+        failures.rethrow_first();
+    }
     require(observed.has_value() && as_string(*observed) == "delta-final",
             "A transaction concurrent with migration must read the latest committed delta");
     require(store->Get(7000).has_value() &&
@@ -797,6 +891,297 @@ void test_compaction_delta_preserves_overwrites_deletes_transactions_and_scans()
                 recovered.obsolete_wal_bytes_since_compaction ==
                     before_restart.obsolete_wal_bytes_since_compaction,
             "Restart must reconstruct the switched compaction WAL accounting epoch");
+}
+
+void test_compaction_ignores_legacy_temp_name_collision() {
+    TestDir dir("compaction_temp_collision");
+    const std::string path = dir.file("store.dat");
+    KVStore store(path);
+    store.Put(1, text("stable"));
+
+    const std::string legacy_temp = path + ".compact." +
+                                    std::to_string(static_cast<long long>(::getpid())) + ".0";
+    {
+        std::ofstream output(legacy_temp, std::ios::binary | std::ios::trunc);
+        output << "unrelated-residual";
+    }
+
+    store.Compact();
+    require(std::filesystem::exists(legacy_temp),
+            "compaction must not remove a colliding file it did not create");
+    const auto value = store.Get(1);
+    require(value.has_value() && as_string(*value) == "stable",
+            "a residual legacy temp name must not block compaction or change data");
+}
+
+void test_compaction_failure_classification() {
+    TestDir dir("compaction_failure_classification");
+    const std::string safe_path = dir.file("safe.dat");
+    KVStore safe_store(safe_path);
+    safe_store.Put(1, text("before"));
+    bool safe_failed = false;
+    {
+        ScopedThrowFailpoint failpoint("after_checkpoint_write_before_sync");
+        try {
+            safe_store.Compact();
+        } catch (const KVStoreError&) {
+            safe_failed = true;
+        }
+    }
+    require(safe_failed, "the pre-rename compaction failpoint should surface its error");
+    safe_store.Put(2, text("after"));
+    require(safe_store.Get(1).has_value() && safe_store.Get(2).has_value(),
+            "a temporary-output failure before rename should leave the instance usable");
+
+    const std::string unsafe_path = dir.file("unsafe.dat");
+    KVStore unsafe_store(unsafe_path);
+    unsafe_store.Put(1, text("before"));
+    bool unsafe_failed = false;
+    {
+        ScopedThrowFailpoint failpoint("after_snapshot_rename");
+        try {
+            unsafe_store.Compact();
+        } catch (const KVStoreError&) {
+            unsafe_failed = true;
+        }
+    }
+    require(unsafe_failed, "the post-rename compaction failpoint should surface its error");
+    bool sticky = false;
+    try {
+        (void)unsafe_store.Get(1);
+    } catch (const KVStoreError&) {
+        sticky = true;
+    }
+    require(sticky, "a failure after publishing the new generation must remain sticky fatal");
+}
+
+void test_auto_compaction_ratio_requires_minimum_wal() {
+    TestDir dir("auto_compaction_ratio_floor");
+    KVStoreOptions gated_options;
+    gated_options.max_batch_delay_us = 0;
+    gated_options.auto_compact_invalid_wal_ratio_percent = 60;
+    gated_options.auto_compact_min_wal_bytes_for_ratio = 4096;
+    KVStore gated(dir.file("gated.dat"), gated_options);
+    gated.Put(1, text("one"));
+    gated.Put(1, text("two"));
+    gated.Put(1, text("three"));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    require(gated.GetMetrics().auto_compactions_completed == 0,
+            "a high obsolete ratio below the configured WAL floor must not compact");
+
+    KVStoreOptions explicit_options = gated_options;
+    explicit_options.auto_compact_min_wal_bytes_for_ratio = 0;
+    KVStore explicit_ratio(dir.file("explicit.dat"), explicit_options);
+    explicit_ratio.Put(1, text("one"));
+    explicit_ratio.Put(1, text("two"));
+    explicit_ratio.Put(1, text("three"));
+    wait_until(
+        [&explicit_ratio] {
+            return explicit_ratio.GetMetrics().auto_compactions_completed >= 1;
+        },
+        "an explicit zero WAL floor should allow ratio-only auto compaction");
+}
+
+void test_auto_compaction_safe_failure_backs_off() {
+    TestDir dir("auto_compaction_safe_failure");
+    KVStoreOptions options;
+    options.max_batch_delay_us = 0;
+    options.auto_compact_wal_bytes_threshold = 1;
+    KVStore store(dir.file("store.dat"), options);
+
+    {
+        ScopedThrowFailpoint failpoint("after_checkpoint_write_before_sync");
+        store.Put(1, text("before"));
+        wait_until(
+            [&store] {
+                return store.GetMetrics().auto_compaction_failures == 1;
+            },
+            "a safe automatic compaction failure should be counted");
+    }
+
+    require(store.Get(1).has_value(),
+            "a pre-rename automatic compaction failure must leave the instance usable");
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const KVStoreMetrics backed_off = store.GetMetrics();
+    require(backed_off.auto_compaction_failures == 1 &&
+                backed_off.auto_compactions_completed == 0,
+            "automatic compaction must not retry continuously after a safe failure");
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    store.Put(2, text("after"));
+    wait_until(
+        [&store] {
+            return store.GetMetrics().auto_compactions_completed == 1;
+        },
+        "a later write should reschedule automatic compaction after the backoff");
+}
+
+void test_outstanding_capacity_covers_worker_failures() {
+    TestDir dir("outstanding_capacity");
+    KVStoreOptions options;
+    options.worker_threads = 4;
+    options.request_queue_capacity = 1;
+    options.max_batch_delay_us = 1000;
+    KVStore store(dir.file("store.dat"), options);
+
+    constexpr int kWriterCount = 8;
+    std::atomic<int> ready {0};
+    std::atomic<bool> start {false};
+    ThreadFailureCollector failures;
+    std::vector<std::thread> writers;
+    for (int writer = 0; writer < kWriterCount; ++writer) {
+        writers.emplace_back(failures.guard([&, writer] {
+            test_support::wait_for_start(ready, start, kWriterCount);
+            store.Put(writer, text("value"));
+        }));
+    }
+    while (ready.load(std::memory_order_acquire) != kWriterCount) {
+        std::this_thread::yield();
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& writer : writers) {
+        writer.join();
+    }
+    failures.rethrow_first();
+
+    KVStoreMetrics metrics = store.GetMetrics();
+    require(metrics.max_inflight_request_count == 1 &&
+                metrics.inflight_request_count == 0 &&
+                metrics.prepared_queue_depth == 0,
+            "capacity one must cover raw, worker, and prepared request stages");
+
+    bool preparation_failed = false;
+    {
+        ScopedThrowFailpoint failpoint("before_request_prepare");
+        try {
+            store.Put(100, text("fails"));
+        } catch (const KVStoreError&) {
+            preparation_failed = true;
+        }
+    }
+    require(preparation_failed, "the worker preparation failpoint should surface an error");
+    require(store.GetMetrics().inflight_request_count == 0,
+            "a worker preparation failure must return its outstanding capacity token");
+    store.Put(101, text("succeeds"));
+    require(store.Get(101).has_value(),
+            "the capacity-one queue must continue after a worker preparation failure");
+}
+
+void test_zero_delay_leaves_prepared_followers_for_the_next_batch() {
+    TestDir dir("zero_delay_prepared_deadline");
+    KVStoreOptions options;
+    options.worker_threads = 2;
+    options.request_queue_capacity = 4;
+    options.max_batch_size = 4;
+    options.max_batch_delay_us = 0;
+    KVStore store(dir.file("store.dat"), options);
+
+    std::atomic<bool> first_done {false};
+    ThreadFailureCollector failures;
+    std::thread first(failures.guard([&] {
+        store.Put(1, Value(std::vector<uint8_t>(64ULL * 1024ULL * 1024ULL, 0x5A)));
+        first_done.store(true, std::memory_order_release);
+    }));
+    std::thread follower;
+    try {
+        wait_until(
+            [&store] {
+                return store.GetMetrics().active_workers >= 1;
+            },
+            "the large first request should enter worker preparation");
+        follower = std::thread(failures.guard([&] {
+            store.Put(2, text("follower"));
+        }));
+        wait_until(
+            [&] {
+                return store.GetMetrics().prepared_queue_depth >= 1 ||
+                       first_done.load(std::memory_order_acquire);
+            },
+            "the follower should be prepared while the first request is still pending");
+        require(!first_done.load(std::memory_order_acquire) &&
+                    store.GetMetrics().prepared_queue_depth >= 1,
+                "the regression requires a prepared follower before the first request completes");
+    } catch (...) {
+        if (first.joinable()) {
+            first.join();
+        }
+        if (follower.joinable()) {
+            follower.join();
+        }
+        throw;
+    }
+    first.join();
+    follower.join();
+    failures.rethrow_first();
+
+    const KVStoreMetrics metrics = store.GetMetrics();
+    require(metrics.committed_write_batches == 2 &&
+                metrics.max_committed_batch_size == 1,
+            "a zero batch delay must leave even an already-prepared follower for the next batch");
+    require(metrics.recent_write_requests == 2 &&
+                metrics.recent_window_batch_count == 2 &&
+                metrics.recent_fsync_pressure_per_1000_writes == 1000,
+            "recent fsync pressure must divide actual window fsyncs by window writes");
+}
+
+void test_recent_fsync_pressure_counts_explicit_and_periodic_syncs() {
+    TestDir dir("recent_actual_fsync_pressure");
+
+    KVStoreOptions no_sync_options;
+    no_sync_options.durability = DurabilityMode::kNoSync;
+    no_sync_options.max_batch_delay_us = 0;
+    KVStore no_sync(dir.file("explicit.dat"), no_sync_options);
+    no_sync.Put(1, text("pending"));
+    KVStoreMetrics before_flush = no_sync.GetMetrics();
+    require(before_flush.wal_fsync_calls == 0 &&
+                before_flush.recent_fsync_pressure_per_1000_writes == 0,
+            "a no-sync write must not be counted as a recent fsync");
+    no_sync.Flush();
+    KVStoreMetrics after_flush = no_sync.GetMetrics();
+    require(after_flush.wal_fsync_calls == 1 &&
+                after_flush.observed_fsync_pressure_per_1000_writes == 0 &&
+                after_flush.recent_fsync_pressure_per_1000_writes == 1000,
+            "an explicit flush must count as an actual recent fsync without changing the legacy batch estimate");
+
+    KVStoreOptions periodic_options;
+    periodic_options.durability = DurabilityMode::kPeriodic;
+    periodic_options.periodic_sync_interval_ms = 5;
+    periodic_options.max_batch_delay_us = 0;
+    KVStore periodic(dir.file("periodic.dat"), periodic_options);
+    periodic.Put(1, text("periodic"));
+    wait_until(
+        [&periodic] {
+            const KVStoreMetrics metrics = periodic.GetMetrics();
+            return metrics.wal_fsync_calls >= 1 &&
+                   metrics.recent_fsync_pressure_per_1000_writes >= 1000;
+        },
+        "a periodic flush should appear in actual recent fsync pressure");
+    const KVStoreMetrics after_periodic = periodic.GetMetrics();
+    require(after_periodic.observed_fsync_pressure_per_1000_writes == 0,
+            "periodic durability must not be presented as a per-batch sync estimate");
+}
+
+void test_partial_thread_start_failure_joins_started_workers() {
+    TestDir dir("partial_thread_start_failure");
+    const std::string path = dir.file("store.dat");
+    KVStoreOptions options;
+    options.worker_threads = 4;
+    bool failed = false;
+    {
+        ScopedThrowFailpoint failpoint("after_first_worker_start");
+        try {
+            KVStore store(path, options);
+        } catch (const KVStoreError&) {
+            failed = true;
+        }
+    }
+    require(failed,
+            "a deterministic failure after the first worker starts should escape construction");
+
+    KVStore reopened(path, options);
+    reopened.Put(1, text("usable"));
+    require(reopened.Get(1).has_value(),
+            "partial thread startup must join workers and release the database lock");
 }
 
 void test_recommended_profiles_are_distinct() {
@@ -866,6 +1251,16 @@ void register_runtime_concurrency_tests(TestCases& tests) {
     tests.push_back({"hot shard readers race safely with clock eviction", test_hot_shard_readers_race_safely_with_clock_eviction});
     tests.push_back({"concurrent compaction with writes", test_concurrent_compaction_with_writes});
     tests.push_back({"compaction delta preserves concurrent operations", test_compaction_delta_preserves_overwrites_deletes_transactions_and_scans});
+    tests.push_back({"compaction ignores legacy temp collision", test_compaction_ignores_legacy_temp_name_collision});
+    tests.push_back({"compaction failure classification", test_compaction_failure_classification});
+    tests.push_back({"auto compaction ratio requires minimum WAL", test_auto_compaction_ratio_requires_minimum_wal});
+    tests.push_back({"auto compaction safe failure backs off", test_auto_compaction_safe_failure_backs_off});
+    tests.push_back({"outstanding capacity covers worker failures", test_outstanding_capacity_covers_worker_failures});
+    tests.push_back({"zero delay leaves prepared followers for next batch",
+                     test_zero_delay_leaves_prepared_followers_for_the_next_batch});
+    tests.push_back({"recent fsync pressure counts explicit and periodic syncs",
+                     test_recent_fsync_pressure_counts_explicit_and_periodic_syncs});
+    tests.push_back({"partial thread start failure joins workers", test_partial_thread_start_failure_joins_started_workers});
     tests.push_back({"recommended profiles are distinct", test_recommended_profiles_are_distinct});
     tests.push_back({"concurrency stress profiles are distinct", test_concurrency_stress_profiles_are_distinct});
 }

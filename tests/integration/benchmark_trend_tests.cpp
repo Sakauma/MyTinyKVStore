@@ -1,5 +1,6 @@
 #include "tests/integration/test_registry.h"
 
+#include "tests/common/benchmark_analysis.h"
 #include "tests/common/benchmark_entrypoints.h"
 #include "tests/common/test_support.h"
 
@@ -66,7 +67,10 @@ std::string benchmark_summary_json(
     double p95_latency_us = 1000.0,
     double p99_latency_us = 1200.0,
     double fsync_pressure = 200.0,
-    double batch_fill = 500.0) {
+    double batch_fill = 500.0,
+    double measurement_fsync_pressure = -1.0,
+    double measurement_p95_latency_us = -1.0,
+    double measurement_p99_latency_us = -1.0) {
     std::ostringstream out;
     out << '{'
         << "\"write_ops_per_s\":" << write_ops_per_s
@@ -75,8 +79,17 @@ std::string benchmark_summary_json(
         << ",\"approx_write_latency_p95_us\":" << p95_latency_us
         << ",\"approx_write_latency_p99_us\":" << p99_latency_us
         << ",\"observed_fsync_pressure_per_1000_writes\":" << fsync_pressure
-        << ",\"recent_batch_fill_per_1000\":" << batch_fill
-        << '}';
+        << ",\"recent_batch_fill_per_1000\":" << batch_fill;
+    if (measurement_fsync_pressure >= 0.0) {
+        out << ",\"measurement_fsync_pressure_per_1000_writes\":" << measurement_fsync_pressure;
+    }
+    if (measurement_p95_latency_us >= 0.0) {
+        out << ",\"measurement_write_latency_p95_us\":" << measurement_p95_latency_us;
+    }
+    if (measurement_p99_latency_us >= 0.0) {
+        out << ",\"measurement_write_latency_p99_us\":" << measurement_p99_latency_us;
+    }
+    out << '}';
     return out.str();
 }
 
@@ -185,6 +198,133 @@ void test_compare_benchmark_baseline_rejects_regression() {
 
     const int status = run_compare_benchmark_baseline_entrypoint(baseline_path, candidate_path);
     require(status == 2, "compare-baseline should reject throughput/latency regressions beyond thresholds");
+}
+
+void test_compare_benchmark_uses_measurement_fsync_pressure() {
+    TestDir dir("compare_baseline_measurement_fsync");
+    const std::string baseline_path = dir.file("baseline.json");
+    const std::string sparse_last_batch_path = dir.file("sparse-last-batch.json");
+    const std::string full_last_batch_path = dir.file("full-last-batch.json");
+
+    write_text_file(
+        baseline_path,
+        benchmark_summary_json(1000.0, 2000.0, 100.0, 1000.0, 1200.0, 400.0, 500.0));
+    write_text_file(
+        sparse_last_batch_path,
+        benchmark_summary_json(1000.0, 2000.0, 100.0, 1000.0, 1200.0, 1000.0, 500.0, 400.0));
+    write_text_file(
+        full_last_batch_path,
+        benchmark_summary_json(1000.0, 2000.0, 100.0, 1000.0, 1200.0, 125.0, 500.0, 400.0));
+
+    const BenchmarkBaselineComparison sparse_last_batch = compare_benchmark_baseline(
+        baseline_path, sparse_last_batch_path, 85.0, 85.0, 125.0, 150.0, 175.0, 150.0, 75.0);
+    const BenchmarkBaselineComparison full_last_batch = compare_benchmark_baseline(
+        baseline_path, full_last_batch_path, 85.0, 85.0, 125.0, 150.0, 175.0, 150.0, 75.0);
+    require(sparse_last_batch.pass && full_last_batch.pass,
+            "measurement-wide fsync pressure should pass regardless of the final batch shape");
+    require(sparse_last_batch.fsync_pressure_ratio_pct == 100.0 &&
+                full_last_batch.fsync_pressure_ratio_pct == 100.0,
+            "the benchmark gate must use measurement-wide fsync pressure instead of the final batch");
+}
+
+void test_measurement_latency_percentiles_sort_and_use_nearest_rank() {
+    const LatencyPercentiles empty = calculate_latency_percentiles({});
+    require(empty.p50_us == 0 && empty.p95_us == 0 && empty.p99_us == 0,
+            "an empty latency sample set should report zero percentiles");
+
+    std::vector<uint64_t> unsorted_latencies;
+    for (uint64_t value = 100; value > 0; --value) {
+        unsorted_latencies.push_back(value);
+    }
+    const LatencyPercentiles percentiles =
+        calculate_latency_percentiles(std::move(unsorted_latencies));
+    require(percentiles.p50_us == 50 &&
+                percentiles.p95_us == 95 &&
+                percentiles.p99_us == 99,
+            "measurement percentiles should sort samples and use nearest-rank selection");
+
+    BenchmarkResult result;
+    result.measurement_write_latency_p95_us = 32000;
+    result.measurement_write_latency_p99_us = 43000;
+    const std::string json = benchmark_result_to_json(result);
+    require(extract_json_number(json, "measurement_write_latency_p95_us") == 32000.0 &&
+                extract_json_number(json, "measurement_write_latency_p99_us") == 43000.0,
+            "benchmark JSON should expose exact measurement latency percentiles");
+}
+
+void test_benchmark_capture_collects_exact_measurement_latency() {
+    const BenchmarkResult result = run_benchmark_capture(
+        make_benchmark_config("measurement-latency", 2, 0, 100, 100));
+    require(result.writes > 0 &&
+                result.measurement_committed_write_requests == result.writes,
+            "benchmark measurement should account for every successful Put");
+    require(result.measurement_write_latency_p95_us > 0 &&
+                result.measurement_write_latency_p99_us >=
+                    result.measurement_write_latency_p95_us,
+            "benchmark measurement should expose ordered exact latency percentiles");
+}
+
+void test_compare_benchmark_prefers_exact_measurement_latency() {
+    TestDir dir("compare_baseline_measurement_latency");
+    const std::string baseline_path = dir.file("baseline.json");
+    const std::string precise_pass_path = dir.file("precise-pass.json");
+    const std::string precise_fail_path = dir.file("precise-fail.json");
+    const std::string legacy_path = dir.file("legacy.json");
+
+    write_text_file(
+        baseline_path,
+        benchmark_summary_json(
+            1000.0, 2000.0, 100.0, 20000.0, 25000.0, 400.0, 500.0));
+    write_text_file(
+        precise_pass_path,
+        benchmark_summary_json(
+            1000.0,
+            2000.0,
+            100.0,
+            50000.0,
+            50000.0,
+            400.0,
+            500.0,
+            -1.0,
+            30000.0,
+            43000.0));
+    write_text_file(
+        precise_fail_path,
+        benchmark_summary_json(
+            1000.0,
+            2000.0,
+            100.0,
+            25000.0,
+            25000.0,
+            400.0,
+            500.0,
+            -1.0,
+            30000.0,
+            44000.0));
+    write_text_file(
+        legacy_path,
+        benchmark_summary_json(
+            1000.0, 2000.0, 100.0, 30000.0, 43000.0, 400.0, 500.0));
+
+    const BenchmarkBaselineComparison precise_pass = compare_benchmark_baseline(
+        baseline_path, precise_pass_path, 85.0, 85.0, 125.0, 150.0, 175.0, 150.0, 75.0);
+    const BenchmarkBaselineComparison precise_fail = compare_benchmark_baseline(
+        baseline_path, precise_fail_path, 85.0, 85.0, 125.0, 150.0, 175.0, 150.0, 75.0);
+    const BenchmarkBaselineComparison legacy = compare_benchmark_baseline(
+        baseline_path, legacy_path, 85.0, 85.0, 125.0, 150.0, 175.0, 150.0, 75.0);
+
+    require(precise_pass.pass &&
+                precise_pass.p99_latency_ratio_pct > 171.9 &&
+                precise_pass.p99_latency_ratio_pct < 172.1,
+            "an exact 43 ms p99 should pass the unchanged 43.75 ms budget even when the legacy histogram reports 50 ms");
+    require(!precise_fail.pass &&
+                precise_fail.p99_latency_ratio_pct > 175.9 &&
+                precise_fail.p99_latency_ratio_pct < 176.1,
+            "an exact p99 above the unchanged budget should still fail");
+    require(legacy.pass &&
+                legacy.p99_latency_ratio_pct > 171.9 &&
+                legacy.p99_latency_ratio_pct < 172.1,
+            "legacy benchmark JSON should fall back to histogram latency percentiles");
 }
 
 void test_qualification_gate_enforces_throughput_and_p99() {
@@ -359,6 +499,14 @@ void register_benchmark_trend_tests(TestCases& tests) {
                      test_compare_benchmark_baseline_passes_within_thresholds});
     tests.push_back({"compare benchmark baseline rejects regression",
                      test_compare_benchmark_baseline_rejects_regression});
+    tests.push_back({"compare benchmark uses measurement fsync pressure",
+                     test_compare_benchmark_uses_measurement_fsync_pressure});
+    tests.push_back({"measurement latency percentiles sort and use nearest rank",
+                     test_measurement_latency_percentiles_sort_and_use_nearest_rank});
+    tests.push_back({"benchmark capture collects exact measurement latency",
+                     test_benchmark_capture_collects_exact_measurement_latency});
+    tests.push_back({"compare benchmark prefers exact measurement latency",
+                     test_compare_benchmark_prefers_exact_measurement_latency});
     tests.push_back({"qualification gate enforces throughput and p99",
                      test_qualification_gate_enforces_throughput_and_p99});
     tests.push_back({"benchmark trend summarizes history", test_benchmark_trend_summarizes_history});

@@ -5,13 +5,4 @@ build-*/
 *.dat
 *.dat.wal
 benchmarks/baselines/*.json
-.github/workflows/
-.planning/debug/resolved/
-archive/legacy_v1_v2/
 artifacts/qualification/
-/AGENTS.md
-/next-phase-plan.md
-/plan.md
-/post-production-plan.md
-/production-plan.md
-/requirement-compliance-plan.md

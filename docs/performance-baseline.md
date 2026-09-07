@@ -91,18 +91,19 @@ bash scripts/qualification-matrix.sh "$qualification_root/matrix"
 
 正式 artifact 至少记录：
 
-- Git commit 和 dirty 状态
-- CPU 拓扑
-- 内存
-- 块设备、旋转属性和挂载点
-- 文件系统类型与可用空间
-- 内核
-- 编译器和 CMake
-- `Release` 构建类型
-- 完整 workload/config
-- 每轮与中位数结果
+- 基线 commit、候选 commit，以及各自的 dirty 状态。
+- Dirty 工作树采样时的 source digest、`git diff --stat` 和完整补丁保存路径；最终提交后必须用 digest 证明提交内容与被测源码一致。
+- Harness/脚本路径与 digest、完整命令行、环境变量、开始/结束时间、时区、退出状态和重复轮数。
+- CPU 型号、socket/core/thread 拓扑、频率 governor；内存总量与关键限制。
+- 块设备、旋转属性、挂载点、文件系统类型、挂载选项与可用空间。
+- Linux 内核、WSL 版本（如适用）及虚拟化边界。
+- 编译器、CMake、生成器、`Release` 构建类型和实际编译/链接选项。
+- 完整 workload/config、随机种子、auto-compaction 配置和 reference baseline 文件校验和。
+- 每轮原始结果、逐指标中位数、门禁结果以及 stdout/stderr 日志路径。
 
 同一 baseline/candidate 比较必须使用同一机器、磁盘、文件系统、内核策略和编译器配置。跨机器的比值没有认证意义。
+
+本机一次或少量短时运行必须标记为 `development-sample`，只能用于发现明显回归；只有上述环境可比、固定工作负载完整运行且原始 artifact 齐全时，结果才可标记为 `qualification-candidate`。更新冻结门槛必须引用至少三轮可比测量，按逐指标中位数给出依据并保留保守裕量，不能为了让当前候选通过而降低门槛。
 
 候选实现的 worker 负责 payload、payload/value CRC 和物理 WAL charge 准备；coordinator 负责 LSN、header/footer、ordered `pwritev` 与同步。热点读使用分段 CLOCK，compaction 使用文件代际并在提交暂停外迁移 entry。性能结果应同时保留 group size、worker utilization、cache hit rate 和 compaction pause 指标，以便判断吞吐变化来自哪条路径。
 
@@ -133,6 +134,29 @@ bash scripts/bench-regression-check.sh benchmarks/reference/ci-floor.json
 ```
 
 快速 gate 的阈值较宽，只用于阻止明显倒退。它们不能代替标准 2×/p99 gate。
+
+`bench-regression-check.sh` 默认只运行一个样本。第六个参数可以固定样本数，例如在
+同一次构建后顺序运行三次：
+
+```bash
+bash scripts/bench-regression-check.sh \
+  benchmarks/reference/ci-floor.json \
+  benchmarks/baselines \
+  85 85 125 3
+```
+
+CI 固定运行三个完整三秒样本，并要求至少两个样本各自通过全部既有门槛。三个
+candidate 无论通过还是失败都会保存；若只有一个样本失败，aggregate 会通过并明确
+输出 warning。比较器返回 `2` 表示性能门禁失败，可以继续采集剩余样本；其他返回值
+表示执行、输入或格式错误，脚本立即失败。该策略不改变任何 floor 或阈值，也不把三
+轮拼成一个直方图或只保留最好结果。
+
+短时 CI smoke 仍受共享 runner 的同步 I/O 长尾影响。单轮 p99 失败时，应同时检查完整
+`write_latency_histogram`、`max_fdatasync_time_us` 和全部三轮 candidate。两轮以上重复
+失败才会使 aggregate 失败；单轮异常仍是需要保留的不稳定证据，不能当成正式性能认
+证。需要判断低频真实回归时，应使用上面的 qualification 流程和可比环境。
+
+Stressbench 的 fsync pressure 门禁使用本次测量开始、结束时 `wal_fsync_calls` 与 `committed_write_requests` 的差值计算全窗口比率。旧 reference 没有该测量字段时，比较器仍读取原有 `observed_fsync_pressure_per_1000_writes` 作为冻结预算；candidate 不再用最后一个批次的形状代表整个三秒窗口。
 
 仓库参考文件使用相对链接：
 

@@ -1,61 +1,28 @@
 #include "io.h"
 
+#include <atomic>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <memory>
+#include <mutex>
+#include <utility>
 
 #include <fcntl.h>
 #include <unistd.h>
 
 namespace kvstore::internal {
+namespace {
+
+std::atomic<bool> failpoint_test_callback_enabled {false};
+std::shared_ptr<const FailpointTestCallback> failpoint_test_callback;
+std::mutex failpoint_test_callback_control_mutex;
+
+}  // namespace
 
 KVStoreError io_error(const std::string& action, const std::string& path) {
     return KVStoreError(action + " failed for " + path + ": " + std::strerror(errno));
-}
-
-ssize_t read_once(int fd, void* buffer, size_t size) {
-    while (true) {
-        const ssize_t nread = ::read(fd, buffer, size);
-        if (nread < 0 && errno == EINTR) {
-            continue;
-        }
-        return nread;
-    }
-}
-
-size_t read_up_to(int fd, void* buffer, size_t size) {
-    auto* cursor = static_cast<uint8_t*>(buffer);
-    size_t total = 0;
-    while (total < size) {
-        const ssize_t nread = read_once(fd, cursor + total, size - total);
-        if (nread < 0) {
-            throw KVStoreError("Read failed: " + std::string(std::strerror(errno)));
-        }
-        if (nread == 0) {
-            break;
-        }
-        total += static_cast<size_t>(nread);
-    }
-    return total;
-}
-
-void write_all(int fd, const void* buffer, size_t size) {
-    const auto* cursor = static_cast<const uint8_t*>(buffer);
-    size_t total = 0;
-    while (total < size) {
-        ssize_t nwritten = ::write(fd, cursor + total, size - total);
-        if (nwritten < 0 && errno == EINTR) {
-            continue;
-        }
-        if (nwritten < 0) {
-            throw KVStoreError("Write failed: " + std::string(std::strerror(errno)));
-        }
-        if (nwritten == 0) {
-            throw KVStoreError("Write made no progress");
-        }
-        total += static_cast<size_t>(nwritten);
-    }
 }
 
 void fsync_file(int fd, const std::string& path) {
@@ -114,7 +81,32 @@ bool failpoint_is_configured(const char* name) {
     return configured != nullptr && std::strcmp(configured, name) == 0;
 }
 
+void install_failpoint_test_callback(FailpointTestCallback callback) {
+    auto installed = std::make_shared<const FailpointTestCallback>(std::move(callback));
+    std::lock_guard<std::mutex> lock(failpoint_test_callback_control_mutex);
+    std::atomic_store_explicit(
+        &failpoint_test_callback, std::move(installed), std::memory_order_release);
+    failpoint_test_callback_enabled.store(true, std::memory_order_release);
+}
+
+void clear_failpoint_test_callback() {
+    std::lock_guard<std::mutex> lock(failpoint_test_callback_control_mutex);
+    failpoint_test_callback_enabled.store(false, std::memory_order_release);
+    std::atomic_store_explicit(
+        &failpoint_test_callback,
+        std::shared_ptr<const FailpointTestCallback> {},
+        std::memory_order_release);
+}
+
 void maybe_trigger_failpoint(const char* name) {
+    if (failpoint_test_callback_enabled.load(std::memory_order_acquire)) {
+        const std::shared_ptr<const FailpointTestCallback> callback =
+            std::atomic_load_explicit(
+                &failpoint_test_callback, std::memory_order_acquire);
+        if (callback) {
+            (*callback)(name);
+        }
+    }
     if (!failpoint_is_configured(name)) {
         return;
     }

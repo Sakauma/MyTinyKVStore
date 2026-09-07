@@ -35,6 +35,9 @@ public:
     VersionedRead GetVersioned(const std::string& key);
     std::vector<std::pair<std::string, Value>> Scan(const std::string& start_key,
                                                     const std::string& end_key);
+    std::vector<std::pair<std::string, Value>> Scan(const std::string& start_key,
+                                                    const std::string& end_key,
+                                                    size_t limit);
 
     void CommitTransaction(std::vector<Mutation> operations,
                            std::map<size_t, uint64_t> expected_versions);

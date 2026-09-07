@@ -2,6 +2,7 @@
 
 #include "io.h"
 #include "key_codec.h"
+#include "metrics_helpers.h"
 #include "value_cache.h"
 #include "writer_policy.h"
 
@@ -16,6 +17,7 @@
 #include <map>
 #include <mutex>
 #include <queue>
+#include <random>
 #include <set>
 #include <shared_mutex>
 #include <string>
@@ -42,6 +44,11 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+class CompactionFatalError : public KVStoreError {
+public:
+    explicit CompactionFatalError(const std::string& message) : KVStoreError(message) {}
+};
+
 template <typename Atomic>
 void atomic_max(Atomic& target, uint64_t value) {
     uint64_t current = target.load(std::memory_order_relaxed);
@@ -57,41 +64,6 @@ bool is_power_of_two(size_t value) {
 uint64_t elapsed_us(const Clock::time_point& start) {
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start).count());
-}
-
-size_t latency_bucket(uint64_t microseconds) {
-    constexpr std::array<uint64_t, kWriteLatencyBucketCount - 1> limits {
-        50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000,
-    };
-    for (size_t index = 0; index < limits.size(); ++index) {
-        if (microseconds <= limits[index]) {
-            return index;
-        }
-    }
-    return kWriteLatencyBucketCount - 1;
-}
-
-uint64_t percentile_from_histogram(const std::array<uint64_t, kWriteLatencyBucketCount>& buckets,
-                                   uint64_t percentile) {
-    constexpr std::array<uint64_t, kWriteLatencyBucketCount> upper_bounds {
-        50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000, 100001,
-    };
-    uint64_t total = 0;
-    for (uint64_t count : buckets) {
-        total += count;
-    }
-    if (total == 0) {
-        return 0;
-    }
-    const uint64_t target = (total * percentile + 99) / 100;
-    uint64_t cumulative = 0;
-    for (size_t index = 0; index < buckets.size(); ++index) {
-        cumulative += buckets[index];
-        if (cumulative >= target) {
-            return upper_bounds[index];
-        }
-    }
-    return upper_bounds.back();
 }
 
 void lock_file_exclusively(int fd, const std::string& path) {
@@ -217,10 +189,11 @@ void copy_fd_region(int source_fd,
                             static_cast<off_t>(source_offset + copied));
         } while (nread < 0 && errno == EINTR);
         if (nread < 0) {
-            throw io_error("pread", source_path);
+            throw CompactionFatalError(io_error("pread", source_path).what());
         }
         if (nread == 0) {
-            throw KVStoreError("Unexpected EOF while copying compacted journal from " + source_path);
+            throw CompactionFatalError(
+                "Unexpected EOF while copying compacted journal from " + source_path);
         }
         size_t written = 0;
         while (written < static_cast<size_t>(nread)) {
@@ -364,8 +337,8 @@ private:
 };
 
 ScopedFd open_unlinked_spool(const std::string& database_path,
-                             const std::string& label,
-                             uint64_t sequence) {
+                              const std::string& label,
+                              uint64_t sequence) {
     const std::string path = database_path + "." + label + "." +
                              std::to_string(::getpid()) + "." + std::to_string(sequence);
     const int fd = open_or_throw(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
@@ -376,6 +349,36 @@ ScopedFd open_unlinked_spool(const std::string& database_path,
         throw io_error("unlink compaction spool", path);
     }
     return ScopedFd(fd);
+}
+
+ScopedFd open_unique_compaction_file(const std::string& database_path,
+                                     uint64_t sequence,
+                                     std::string& created_path) {
+    constexpr size_t kMaximumAttempts = 64;
+    std::random_device random_source;
+    for (size_t attempt = 0; attempt < kMaximumAttempts; ++attempt) {
+        const uint64_t nonce = (static_cast<uint64_t>(random_source()) << 32U) ^
+                               static_cast<uint64_t>(random_source());
+        const std::string candidate = database_path + ".compact." +
+                                      std::to_string(::getpid()) + "." +
+                                      std::to_string(sequence) + "." +
+                                      std::to_string(nonce);
+        int fd;
+        do {
+            fd = ::open(candidate.c_str(),
+                        O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC,
+                        0600);
+        } while (fd < 0 && errno == EINTR);
+        if (fd >= 0) {
+            created_path = candidate;
+            return ScopedFd(fd);
+        }
+        if (errno != EEXIST) {
+            throw io_error("create compaction container", candidate);
+        }
+    }
+    throw KVStoreError("Could not allocate a unique compaction container beside " +
+                       database_path);
 }
 
 void copy_spool(int spool_fd,
@@ -655,8 +658,13 @@ public:
             std::lock_guard<std::mutex> lock(raw_mutex_);
             raw_stop_ = true;
         }
+        {
+            std::lock_guard<std::mutex> lock(outstanding_mutex_);
+            outstanding_stop_ = true;
+        }
         raw_not_empty_.notify_all();
         raw_not_full_.notify_all();
+        outstanding_cv_.notify_all();
         prepared_cv_.notify_all();
         for (auto& worker : workers_) {
             if (worker.joinable()) {
@@ -723,6 +731,12 @@ public:
 
     std::vector<std::pair<std::string, Value>> Scan(const std::string& start_key,
                                                     const std::string& end_key) {
+        return Scan(start_key, end_key, std::numeric_limits<size_t>::max());
+    }
+
+    std::vector<std::pair<std::string, Value>> Scan(const std::string& start_key,
+                                                    const std::string& end_key,
+                                                    size_t limit) {
         throw_if_fatal();
         if (start_key > end_key) {
             throw KVStoreError("Scan start key must not be greater than end key");
@@ -732,6 +746,9 @@ public:
         const std::string encoded_end = encode_string_key(end_key);
         validate_api_key(encoded_start);
         validate_api_key(encoded_end);
+        if (limit == 0) {
+            return {};
+        }
 
         std::vector<std::shared_lock<std::shared_mutex>> locks;
         locks.reserve(shards_.size());
@@ -758,9 +775,10 @@ public:
             }
         }
 
-        std::vector<std::pair<std::string, Value>> result;
+        std::vector<std::pair<std::string, Entry>> snapshot;
+        snapshot.reserve(std::min(limit, static_cast<size_t>(1024)));
         try {
-            while (!heap.empty()) {
+            while (!heap.empty() && snapshot.size() < limit) {
                 Cursor cursor = heap.top();
                 heap.pop();
                 const std::string key = *cursor.iterator;
@@ -768,11 +786,23 @@ public:
                 if (value == shards_[cursor.shard_id]->values.end()) {
                     throw KVStoreError("String scan index is inconsistent with the point index");
                 }
-                result.emplace_back(decode_string_key(key), read_entry_without_cache(value->second));
+                snapshot.emplace_back(key, value->second);
                 ++cursor.iterator;
                 if (cursor.iterator != cursor.end && *cursor.iterator <= encoded_end) {
                     heap.push(cursor);
                 }
+            }
+        } catch (const std::exception& error) {
+            set_fatal(error.what());
+            throw;
+        }
+        locks.clear();
+
+        std::vector<std::pair<std::string, Value>> result;
+        result.reserve(snapshot.size());
+        try {
+            for (const auto& [key, entry] : snapshot) {
+                result.emplace_back(decode_string_key(key), read_entry_without_cache(entry));
             }
         } catch (const std::exception& error) {
             set_fatal(error.what());
@@ -805,12 +835,7 @@ public:
     }
 
     void Compact() {
-        try {
-            compact_impl(false);
-        } catch (const std::exception& error) {
-            set_fatal(error.what());
-            throw;
-        }
+        compact_impl(false);
     }
 
     KVStoreMetrics GetMetrics() const {
@@ -836,8 +861,19 @@ public:
             result.pending_queue_depth = raw_queue_.size();
         }
         result.max_pending_queue_depth = max_pending_queue_depth_.load(std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(prepared_mutex_);
+            result.prepared_queue_depth = prepared_.size();
+        }
+        {
+            std::lock_guard<std::mutex> lock(outstanding_mutex_);
+            result.inflight_request_count = outstanding_requests_;
+        }
+        result.max_inflight_request_count =
+            max_inflight_request_count_.load(std::memory_order_relaxed);
         result.manual_compactions_completed = manual_compactions_completed_.load(std::memory_order_relaxed);
         result.auto_compactions_completed = auto_compactions_completed_.load(std::memory_order_relaxed);
+        result.auto_compaction_failures = auto_compaction_failures_.load(std::memory_order_relaxed);
         result.adaptive_batches_completed = adaptive_batches_completed_.load(std::memory_order_relaxed);
         result.adaptive_flush_batches_completed = adaptive_flush_batches_completed_.load(std::memory_order_relaxed);
         result.adaptive_latency_target_batches_completed =
@@ -874,14 +910,19 @@ public:
         for (size_t index = 0; index < kWriteLatencyBucketCount; ++index) {
             result.write_latency_histogram[index] = write_latency_histogram_[index].load(std::memory_order_relaxed);
         }
-        result.approx_write_latency_p50_us = percentile_from_histogram(result.write_latency_histogram, 50);
-        result.approx_write_latency_p95_us = percentile_from_histogram(result.write_latency_histogram, 95);
-        result.approx_write_latency_p99_us = percentile_from_histogram(result.write_latency_histogram, 99);
+        result.approx_write_latency_p50_us =
+            approximate_latency_percentile_us(result.write_latency_histogram, 50, 100);
+        result.approx_write_latency_p95_us =
+            approximate_latency_percentile_us(result.write_latency_histogram, 95, 100);
+        result.approx_write_latency_p99_us =
+            approximate_latency_percentile_us(result.write_latency_histogram, 99, 100);
         const RecentWindowSnapshot recent = recent_window_snapshot(result.read_requests);
         result.recent_observed_write_latency_p95_us = recent.write_latency_p95_us;
         result.recent_read_requests = recent.read_requests;
         result.recent_write_requests = recent.write_requests;
         result.recent_read_ratio_per_1000_ops = recent.read_ratio_per_1000_ops;
+        result.recent_fsync_pressure_per_1000_writes =
+            recent.fsync_pressure_per_1000_writes;
         result.recent_peak_queue_depth = recent.peak_queue_depth;
         result.recent_avg_batch_size = recent.avg_batch_size;
         const uint64_t batch_target = options_.adaptive_objective_target_batch_size != 0
@@ -950,6 +991,7 @@ private:
         uint64_t id = 0;
         uint64_t read_requests = 0;
         uint64_t write_requests = 0;
+        uint64_t fsync_calls_at_start = 0;
         uint64_t batch_size = 0;
         uint64_t wal_bytes = 0;
         uint64_t peak_queue_depth = 0;
@@ -963,6 +1005,8 @@ private:
     struct RecentWindowSnapshot {
         uint64_t read_requests = 0;
         uint64_t write_requests = 0;
+        uint64_t fsync_calls = 0;
+        uint64_t fsync_pressure_per_1000_writes = 0;
         uint64_t read_ratio_per_1000_ops = 0;
         uint64_t write_latency_p95_us = 0;
         uint64_t peak_queue_depth = 0;
@@ -1013,6 +1057,7 @@ private:
         std::condition_variable completion_cv;
         bool completed = false;
         bool conflict = false;
+        bool owns_outstanding_token = false;
         uint64_t completion_latency_us = 0;
         std::string error;
     };
@@ -1035,7 +1080,7 @@ private:
     std::deque<RequestPtr> raw_queue_;
     bool raw_stop_ = false;
 
-    std::mutex prepared_mutex_;
+    mutable std::mutex prepared_mutex_;
     std::condition_variable prepared_cv_;
     std::map<uint64_t, RequestPtr> prepared_;
     uint64_t coordinator_sequence_ = 1;
@@ -1046,6 +1091,12 @@ private:
     uint64_t next_sequence_ = 1;  // Guarded by raw_mutex_.
     std::atomic<bool> stopping_ {false};
     std::atomic<bool> dirty_ {false};
+
+    mutable std::mutex outstanding_mutex_;
+    std::condition_variable outstanding_cv_;
+    size_t outstanding_requests_ = 0;
+    bool outstanding_stop_ = false;
+    std::atomic<uint64_t> max_inflight_request_count_ {0};
 
     std::mutex commit_mutex_;
     std::mutex compaction_mutex_;
@@ -1063,6 +1114,7 @@ private:
     bool auto_compaction_requested_ = false;
     std::thread auto_compaction_thread_;
     Clock::time_point worker_pool_start_ = Clock::now();
+    Clock::time_point auto_compaction_retry_after_ = Clock::time_point::min();
 
     std::atomic<bool> fatal_ {false};
     mutable std::mutex fatal_mutex_;
@@ -1088,6 +1140,7 @@ private:
     std::atomic<uint64_t> max_pending_queue_depth_ {0};
     std::atomic<uint64_t> manual_compactions_completed_ {0};
     std::atomic<uint64_t> auto_compactions_completed_ {0};
+    std::atomic<uint64_t> auto_compaction_failures_ {0};
     std::atomic<uint64_t> writer_wait_events_ {0};
     std::atomic<uint64_t> writer_wait_time_us_ {0};
     std::atomic<uint64_t> adaptive_batches_completed_ {0};
@@ -1395,14 +1448,51 @@ private:
 
     void start_threads() {
         worker_pool_start_ = Clock::now();
-        workers_.reserve(options_.worker_threads);
-        for (size_t index = 0; index < options_.worker_threads; ++index) {
-            workers_.emplace_back([this] { worker_loop(); });
+        try {
+            workers_.reserve(options_.worker_threads);
+            for (size_t index = 0; index < options_.worker_threads; ++index) {
+                workers_.emplace_back([this] { worker_loop(); });
+                if (index == 0) {
+                    maybe_trigger_failpoint("after_first_worker_start");
+                }
+            }
+            coordinator_ = std::thread([this] { coordinator_loop(); });
+            if (options_.auto_compact_wal_bytes_threshold != 0 ||
+                options_.auto_compact_invalid_wal_ratio_percent != 0) {
+                auto_compaction_thread_ = std::thread([this] { auto_compaction_loop(); });
+            }
+            if (options_.durability == DurabilityMode::kPeriodic) {
+                periodic_thread_ = std::thread([this] { periodic_loop(); });
+            }
+        } catch (...) {
+            stop_threads_after_start_failure();
+            throw;
         }
-        coordinator_ = std::thread([this] { coordinator_loop(); });
-        auto_compaction_thread_ = std::thread([this] { auto_compaction_loop(); });
-        if (options_.durability == DurabilityMode::kPeriodic) {
-            periodic_thread_ = std::thread([this] { periodic_loop(); });
+    }
+
+    void stop_threads_after_start_failure() noexcept {
+        stop_periodic_thread();
+        stop_auto_compaction_thread();
+        {
+            std::lock_guard<std::mutex> lock(raw_mutex_);
+            raw_stop_ = true;
+        }
+        {
+            std::lock_guard<std::mutex> lock(outstanding_mutex_);
+            outstanding_stop_ = true;
+        }
+        coordinator_stop_.store(true, std::memory_order_release);
+        raw_not_empty_.notify_all();
+        raw_not_full_.notify_all();
+        prepared_cv_.notify_all();
+        outstanding_cv_.notify_all();
+        for (auto& worker : workers_) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+        if (coordinator_.joinable()) {
+            coordinator_.join();
         }
     }
 
@@ -1437,6 +1527,36 @@ private:
         submit_and_wait(request, false);
     }
 
+    void acquire_outstanding_token(const RequestPtr& request) {
+        std::unique_lock<std::mutex> lock(outstanding_mutex_);
+        outstanding_cv_.wait(lock, [this] {
+            return outstanding_stop_ || outstanding_requests_ < options_.request_queue_capacity;
+        });
+        if (outstanding_stop_) {
+            throw KVStoreError("KVStore worker queue is stopped");
+        }
+        ++outstanding_requests_;
+        request->owns_outstanding_token = true;
+        atomic_max(max_inflight_request_count_, outstanding_requests_);
+    }
+
+    void release_outstanding_token(const RequestPtr& request) noexcept {
+        bool released = false;
+        {
+            std::lock_guard<std::mutex> lock(outstanding_mutex_);
+            if (request->owns_outstanding_token) {
+                request->owns_outstanding_token = false;
+                if (outstanding_requests_ != 0) {
+                    --outstanding_requests_;
+                }
+                released = true;
+            }
+        }
+        if (released) {
+            outstanding_cv_.notify_one();
+        }
+    }
+
     void submit_and_wait(const RequestPtr& request, bool allow_stopping) {
         if (!allow_stopping) {
             throw_if_fatal();
@@ -1444,22 +1564,28 @@ private:
                 throw KVStoreError("KVStore is shutting down");
             }
         }
+        acquire_outstanding_token(request);
         request->enqueue_time = Clock::now();
-        {
-            std::unique_lock<std::mutex> lock(raw_mutex_);
-            raw_not_full_.wait(lock, [this] {
-                return raw_stop_ || raw_queue_.size() < options_.request_queue_capacity;
-            });
-            if (raw_stop_) {
-                throw KVStoreError("KVStore worker queue is stopped");
+        try {
+            {
+                std::unique_lock<std::mutex> lock(raw_mutex_);
+                raw_not_full_.wait(lock, [this] {
+                    return raw_stop_ || raw_queue_.size() < options_.request_queue_capacity;
+                });
+                if (raw_stop_) {
+                    throw KVStoreError("KVStore worker queue is stopped");
+                }
+                raw_queue_.push_back(request);
+                if (next_sequence_ == std::numeric_limits<uint64_t>::max()) {
+                    raw_queue_.pop_back();
+                    throw KVStoreError("KVStore request sequence space is exhausted");
+                }
+                request->sequence = next_sequence_++;
+                atomic_max(max_pending_queue_depth_, raw_queue_.size());
             }
-            raw_queue_.push_back(request);
-            if (next_sequence_ == std::numeric_limits<uint64_t>::max()) {
-                raw_queue_.pop_back();
-                throw KVStoreError("KVStore request sequence space is exhausted");
-            }
-            request->sequence = next_sequence_++;
-            atomic_max(max_pending_queue_depth_, raw_queue_.size());
+        } catch (...) {
+            release_outstanding_token(request);
+            throw;
         }
         if (request->kind == RequestKind::kWrite) {
             enqueued_write_requests_.fetch_add(1, std::memory_order_relaxed);
@@ -1483,6 +1609,7 @@ private:
                              ? std::max<uint64_t>(1, elapsed_us(request->enqueue_time))
                              : request->completion_latency_us;
         }
+        bool completed_now = false;
         {
             std::lock_guard<std::mutex> lock(request->completion_mutex);
             if (request->completed) {
@@ -1492,13 +1619,17 @@ private:
             request->conflict = conflict;
             request->completion_latency_us = latency_us;
             request->completed = true;
+            completed_now = true;
         }
         if (request->kind == RequestKind::kWrite) {
             write_latency_histogram_[latency_bucket(latency_us)].fetch_add(
                 1,
                 std::memory_order_relaxed);
         }
-        request->completion_cv.notify_all();
+        if (completed_now) {
+            release_outstanding_token(request);
+            request->completion_cv.notify_all();
+        }
     }
 
     void worker_loop() {
@@ -1522,6 +1653,7 @@ private:
             atomic_max(max_active_workers_, active);
             try {
                 if (request->kind == RequestKind::kWrite && !request->operations.empty()) {
+                    maybe_trigger_failpoint("before_request_prepare");
                     if (request->operations.size() > std::numeric_limits<uint32_t>::max()) {
                         throw KVStoreError("Transaction operation count exceeds the storage format limit");
                     }
@@ -1600,6 +1732,9 @@ private:
 #else
         prepared_cv_.wait_until(lock, deadline, ready);
 #endif
+        if (Clock::now() >= deadline) {
+            return {};
+        }
         const auto found = prepared_.find(sequence);
         if (found == prepared_.end()) {
             return {};
@@ -1639,11 +1774,24 @@ private:
             if (snapshot.batch_count != 0) {
                 snapshot.avg_batch_size = total_batch_size / snapshot.batch_count;
                 snapshot.avg_batch_wal_bytes = total_wal_bytes / snapshot.batch_count;
+                const uint64_t current_fsync_calls =
+                    wal_fsync_calls_.load(std::memory_order_relaxed);
+                const uint64_t window_start_fsync_calls =
+                    recent_batches_.front().fsync_calls_at_start;
+                snapshot.fsync_calls =
+                    current_fsync_calls >= window_start_fsync_calls
+                        ? current_fsync_calls - window_start_fsync_calls
+                        : current_fsync_calls;
             }
         }
         const uint64_t operations = snapshot.read_requests + snapshot.write_requests;
         snapshot.read_ratio_per_1000_ops =
             operations == 0 ? 0 : (snapshot.read_requests * 1000) / operations;
+        snapshot.fsync_pressure_per_1000_writes =
+            snapshot.write_requests == 0
+                ? 0
+                : (snapshot.fsync_calls * 1000 + snapshot.write_requests - 1) /
+                      snapshot.write_requests;
         if (!latencies.empty()) {
             std::sort(latencies.begin(), latencies.end());
             const size_t rank = (latencies.size() * 95 + 99) / 100;
@@ -1654,7 +1802,8 @@ private:
 
     void record_recent_batch(const std::vector<RequestPtr>& accepted,
                              uint64_t wal_bytes,
-                             uint64_t peak_queue_depth) {
+                             uint64_t peak_queue_depth,
+                             uint64_t fsync_calls_at_start) {
         const uint64_t current_reads = read_requests_.load(std::memory_order_relaxed);
         std::lock_guard<std::mutex> lock(recent_mutex_);
         const uint64_t batch_id = recent_next_batch_id_++;
@@ -1666,6 +1815,7 @@ private:
             batch_id,
             read_delta,
             accepted.size(),
+            fsync_calls_at_start,
             accepted.size(),
             wal_bytes,
             peak_queue_depth,
@@ -1715,7 +1865,7 @@ private:
             recent.avg_batch_size,
             recent.avg_batch_wal_bytes,
             recent.write_latency_p95_us,
-            observed_fsync_pressure_per_1000_writes_.load(std::memory_order_relaxed),
+            recent.fsync_pressure_per_1000_writes,
         });
     }
 
@@ -1842,6 +1992,8 @@ private:
     void process_group(const std::vector<RequestPtr>& batch,
                        const BatchPolicy& policy,
                        uint64_t observed_queue_depth) {
+        const uint64_t fsync_calls_at_start =
+            wal_fsync_calls_.load(std::memory_order_relaxed);
         std::vector<RequestPtr> accepted;
         std::vector<RequestPtr> conflicts;
         std::vector<RequestPtr> read_only_successes;
@@ -1912,7 +2064,8 @@ private:
                 std::max<uint64_t>(1, elapsed_us(request->enqueue_time));
         }
         if (!accepted.empty()) {
-            record_recent_batch(accepted, bytes, observed_queue_depth);
+            record_recent_batch(
+                accepted, bytes, observed_queue_depth, fsync_calls_at_start);
         }
         for (const auto& request : accepted) {
             committed_write_requests_.fetch_add(1, std::memory_order_relaxed);
@@ -2160,12 +2313,17 @@ private:
         const bool byte_threshold = options_.auto_compact_wal_bytes_threshold != 0 &&
                                     bytes >= options_.auto_compact_wal_bytes_threshold;
         const bool ratio_threshold = options_.auto_compact_invalid_wal_ratio_percent != 0 &&
+                                     (options_.auto_compact_min_wal_bytes_for_ratio == 0 ||
+                                      bytes >= options_.auto_compact_min_wal_bytes_for_ratio) &&
                                      obsolete_ratio >= options_.auto_compact_invalid_wal_ratio_percent;
         if (!byte_threshold && !ratio_threshold) {
             return;
         }
         {
             std::lock_guard<std::mutex> lock(auto_compaction_mutex_);
+            if (Clock::now() < auto_compaction_retry_after_) {
+                return;
+            }
             auto_compaction_requested_ = true;
         }
         auto_compaction_cv_.notify_one();
@@ -2185,8 +2343,11 @@ private:
             }
             try {
                 compact_impl(true);
-            } catch (const std::exception& error) {
-                set_fatal(error.what());
+            } catch (...) {
+                auto_compaction_failures_.fetch_add(1, std::memory_order_relaxed);
+                std::lock_guard<std::mutex> lock(auto_compaction_mutex_);
+                auto_compaction_requested_ = false;
+                auto_compaction_retry_after_ = Clock::now() + std::chrono::seconds(1);
             }
         }
     }
@@ -2230,10 +2391,12 @@ private:
         while (index < references.size()) {
             const CheckpointReference& first = references[index];
             if (!first.file_generation) {
-                throw KVStoreError("Compaction reference has no backing file generation");
+                throw CompactionFatalError(
+                    "Compaction reference has no backing file generation");
             }
             if (writer.Offset() != first.checkpoint_value_offset) {
-                throw KVStoreError("Compaction object spool offset changed unexpectedly");
+                throw CompactionFatalError(
+                    "Compaction object spool offset changed unexpectedly");
             }
 
             if (first.value_size > kReadWindowBytes) {
@@ -2242,18 +2405,23 @@ private:
                 while (consumed < first.value_size) {
                     const size_t chunk = static_cast<size_t>(
                         std::min<uint64_t>(buffer.size(), first.value_size - consumed));
-                    pread_exact_at(first.file_generation->fd(),
-                                   first.source_value_offset + consumed,
-                                   buffer.data(),
-                                   chunk,
-                                   first.file_generation->path());
+                    try {
+                        pread_exact_at(first.file_generation->fd(),
+                                       first.source_value_offset + consumed,
+                                       buffer.data(),
+                                       chunk,
+                                       first.file_generation->path());
+                    } catch (const std::exception& error) {
+                        throw CompactionFatalError(error.what());
+                    }
                     checksum = crc32c_extend(checksum, buffer.data(), chunk);
                     writer.Write(buffer.data(), chunk);
                     consumed += chunk;
                 }
                 if (checksum != first.value_checksum) {
-                    throw KVStoreError("Value checksum mismatch while streaming compaction from " +
-                                       first.file_generation->path());
+                    throw CompactionFatalError(
+                        "Value checksum mismatch while streaming compaction from " +
+                        first.file_generation->path());
                 }
                 ++index;
                 continue;
@@ -2290,22 +2458,28 @@ private:
 
             const size_t window_size = static_cast<size_t>(window_end - window_start);
             if (window_size != 0) {
-                pread_exact_at(first.file_generation->fd(),
-                               window_start,
-                               buffer.data(),
-                               window_size,
-                               first.file_generation->path());
+                try {
+                    pread_exact_at(first.file_generation->fd(),
+                                   window_start,
+                                   buffer.data(),
+                                   window_size,
+                                   first.file_generation->path());
+                } catch (const std::exception& error) {
+                    throw CompactionFatalError(error.what());
+                }
             }
             for (size_t current = index; current < end_index; ++current) {
                 const CheckpointReference& reference = references[current];
                 if (writer.Offset() != reference.checkpoint_value_offset) {
-                    throw KVStoreError("Compaction object ordering changed unexpectedly");
+                    throw CompactionFatalError(
+                        "Compaction object ordering changed unexpectedly");
                 }
                 const uint64_t relative = reference.source_value_offset - window_start;
                 const uint8_t* value = buffer.data() + relative;
                 if (crc32c(value, reference.value_size) != reference.value_checksum) {
-                    throw KVStoreError("Value checksum mismatch while coalescing compaction from " +
-                                       reference.file_generation->path());
+                    throw CompactionFatalError(
+                        "Value checksum mismatch while coalescing compaction from " +
+                        reference.file_generation->path());
                 }
                 writer.Write(value, reference.value_size);
             }
@@ -2373,10 +2547,9 @@ private:
 
         const uint64_t temp_id =
             compact_temp_sequence_.fetch_add(1, std::memory_order_relaxed);
-        const std::string temp_path = db_path_ + ".compact." +
-                                      std::to_string(::getpid()) + "." +
-                                      std::to_string(temp_id);
+        std::string temp_path;
         std::shared_ptr<LockedFileGeneration> temp_generation;
+        bool temp_created = false;
 
         try {
             {
@@ -2388,6 +2561,10 @@ private:
                 start_lsn = last_lsn_;
                 generation = superblock_.generation + 1;
                 source_generation = current_file_;
+                if (!source_generation) {
+                    throw CompactionFatalError(
+                        "Compaction source has no backing file generation");
+                }
                 begin_pending_wal_accounting();
                 accounting_started = true;
             }
@@ -2400,7 +2577,8 @@ private:
                     if (!entry.file_generation ||
                         entry.value_offset > std::numeric_limits<uint64_t>::max() -
                                                  entry.value_size) {
-                        throw KVStoreError("Checkpoint entry has invalid backing metadata");
+                        throw CompactionFatalError(
+                            "Checkpoint entry has invalid backing metadata");
                     }
                     const uint64_t index_addition = sizeof(IndexEntryHeader) + key.size();
                     if (index_entries_bytes >
@@ -2488,12 +2666,13 @@ private:
             }
             index_writer.Flush();
             if (index_writer.Offset() != index_entries_bytes) {
-                throw KVStoreError("Checkpoint index spool size changed during compaction");
+                throw CompactionFatalError(
+                    "Checkpoint index spool size changed during compaction");
             }
             write_checkpoint_objects(references, object_spool.get());
 
-            ScopedFd raw_temp(open_or_throw(
-                temp_path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600));
+            ScopedFd raw_temp = open_unique_compaction_file(db_path_, temp_id, temp_path);
+            temp_created = true;
             lock_file_exclusively(raw_temp.get(), temp_path);
             copy_supported_file_metadata(source_generation->fd(),
                                          raw_temp.get(),
@@ -2516,7 +2695,8 @@ private:
                        checkpoint_writer,
                        "unlinked compaction index spool");
             if (checkpoint_writer.Offset() != object_offset) {
-                throw KVStoreError("Checkpoint object region did not follow its index");
+                throw CompactionFatalError(
+                    "Checkpoint object region did not follow its index");
             }
             copy_spool(object_spool.get(),
                        object_length,
@@ -2524,7 +2704,8 @@ private:
                        "unlinked compaction object spool");
             checkpoint_writer.Flush();
             if (checkpoint_writer.Offset() != journal_offset) {
-                throw KVStoreError("Checkpoint journal boundary changed during assembly");
+                throw CompactionFatalError(
+                    "Checkpoint journal boundary changed during assembly");
             }
             const Superblock compacted_superblock = make_superblock(
                 generation,
@@ -2541,17 +2722,19 @@ private:
             const auto pause_start = Clock::now();
             std::unique_lock<std::mutex> commit_lock(commit_mutex_);
             if (current_file_ != source_generation) {
-                throw KVStoreError("Database file generation changed during compaction");
+                throw CompactionFatalError(
+                    "Database file generation changed during compaction");
             }
             end_offset = append_offset_;
             if (end_offset < start_offset || pending_wal_accounting_slot_ < 0) {
-                throw KVStoreError("Journal offset or WAL epoch moved backwards during compaction");
+                throw CompactionFatalError(
+                    "Journal offset or WAL epoch moved backwards during compaction");
             }
             const uint64_t delta_bytes = end_offset - start_offset;
             const size_t pending_slot =
                 static_cast<size_t>(pending_wal_accounting_slot_);
             if (wal_accounting_[pending_slot].wal_bytes != delta_bytes) {
-                throw KVStoreError(
+                throw CompactionFatalError(
                     "Compaction delta WAL accounting does not match copied bytes");
             }
             if (delta_bytes >
@@ -2618,10 +2801,6 @@ private:
                                           compacted_superblock);
             maybe_trigger_failpoint("after_compaction_entry_migration");
             references.clear();
-            if (source_generation.use_count() != 1) {
-                throw KVStoreError(
-                    "Old database file generation remained referenced after migration");
-            }
             source_generation.reset();
 
             total_snapshot_bytes_written_.fetch_add(
@@ -2637,14 +2816,41 @@ private:
             } else {
                 manual_compactions_completed_.fetch_add(1, std::memory_order_relaxed);
             }
+        } catch (const CompactionFatalError& error) {
+            if (accounting_started && !accounting_switched) {
+                std::lock_guard<std::mutex> lock(commit_mutex_);
+                abandon_pending_wal_accounting();
+            }
+            temp_generation.reset();
+            if (temp_created && !renamed) {
+                (void)::unlink(temp_path.c_str());
+            }
+            set_fatal(error.what());
+            throw;
+        } catch (const std::exception& error) {
+            if (accounting_started && !accounting_switched) {
+                std::lock_guard<std::mutex> lock(commit_mutex_);
+                abandon_pending_wal_accounting();
+            }
+            temp_generation.reset();
+            if (temp_created && !renamed) {
+                (void)::unlink(temp_path.c_str());
+            }
+            if (renamed) {
+                set_fatal(error.what());
+            }
+            throw;
         } catch (...) {
             if (accounting_started && !accounting_switched) {
                 std::lock_guard<std::mutex> lock(commit_mutex_);
                 abandon_pending_wal_accounting();
             }
             temp_generation.reset();
-            if (!renamed) {
+            if (temp_created && !renamed) {
                 (void)::unlink(temp_path.c_str());
+            }
+            if (renamed) {
+                set_fatal("Compaction failed after publishing the new file generation");
             }
             throw;
         }
@@ -2699,8 +2905,14 @@ StorageEngine::VersionedRead StorageEngine::GetVersioned(const std::string& key)
 }
 
 std::vector<std::pair<std::string, Value>> StorageEngine::Scan(const std::string& start_key,
-                                                         const std::string& end_key) {
+                                                               const std::string& end_key) {
     return pimpl_->Scan(start_key, end_key);
+}
+
+std::vector<std::pair<std::string, Value>> StorageEngine::Scan(const std::string& start_key,
+                                                               const std::string& end_key,
+                                                               size_t limit) {
+    return pimpl_->Scan(start_key, end_key, limit);
 }
 
 void StorageEngine::CommitTransaction(std::vector<Mutation> operations,

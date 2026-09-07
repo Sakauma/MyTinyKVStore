@@ -72,6 +72,30 @@ void test_string_scan_returns_sorted_range() {
     require(results[2].first == "date" && as_string(results[2].second) == "d", "scan should include the upper bound");
 }
 
+void test_string_scan_limit_is_bounded_and_inclusive() {
+    TestDir dir("string_scan_limit");
+    const std::string db_path = dir.file("store.dat");
+    KVStore store(db_path);
+
+    store.Put(std::string("apple"), text("a"));
+    store.Put(std::string("banana"), text("b"));
+    store.Put(std::string("carrot"), text("c"));
+
+    require(store.Scan("apple", "carrot", 0).empty(),
+            "a zero scan limit should return no rows");
+    const auto limited = store.Scan("apple", "carrot", 2);
+    require(limited.size() == 2 && limited[0].first == "apple" &&
+                limited[1].first == "banana",
+            "a scan limit should return the first rows in lexical order");
+    const auto oversized = store.Scan("apple", "carrot", 100);
+    require(oversized.size() == 3 && oversized.back().first == "carrot",
+            "a scan limit larger than the range should preserve the inclusive range result");
+
+    const auto next_page = store.Scan(limited.back().first + '\0', "carrot", 2);
+    require(next_page.size() == 1 && next_page[0].first == "carrot",
+            "callers can continue an inclusive scan after the last key without implying a snapshot");
+}
+
 void test_binary_keys_do_not_collide_with_other_namespaces() {
     TestDir dir("binary_keys");
     const std::string db_path = dir.file("store.dat");
@@ -202,6 +226,7 @@ void register_basic_kv_tests(TestCases& tests) {
     tests.push_back({"basic persistence", test_basic_persistence});
     tests.push_back({"string keys do not collide with int keys", test_string_keys_do_not_collide_with_int_keys});
     tests.push_back({"string scan returns sorted range", test_string_scan_returns_sorted_range});
+    tests.push_back({"string scan limit is bounded and inclusive", test_string_scan_limit_is_bounded_and_inclusive});
     tests.push_back({"binary keys do not collide with other namespaces", test_binary_keys_do_not_collide_with_other_namespaces});
     tests.push_back({"batch write persists mixed key types", test_write_batch_persists_mixed_key_types});
     tests.push_back({"batch write mixes put and delete", test_write_batch_mixes_put_and_delete});

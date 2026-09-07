@@ -451,7 +451,7 @@ void test_compaction_preserves_metadata_and_releases_old_inode() {
         }
     }
     require(!old_inode_still_open,
-            "Manual Compact must finish entry migration and release the old inode before returning");
+            "Manual Compact without concurrent readers must release the old inode before returning");
 }
 
 void test_inspect_and_verify_use_runtime_parser() {

@@ -4,7 +4,7 @@
 
 运行库只创建和读取当前单文件格式。历史格式实现已经归档；运行库不会读取、隐式迁移或原地覆盖历史数据。
 
-当前格式面向 Linux/WSL POSIX 文件系统。实现把 packed C++ 结构按本机小端序写盘，因此正式支持范围是常见的 little-endian Linux ABI；它不是跨大端机器的交换格式。
+当前格式面向 little-endian Linux ABI，以及提供所需 `flock`、`pread/pwrite`、原子 rename 和目录同步语义的原生 Linux POSIX 文件系统。WSL 的数据库必须位于 Linux 文件系统；`/mnt/*`、DrvFS、9p 和 fuseblk 不在持久化正确性支持范围。Packed C++ 结构按本机小端序写盘，因此它也不是跨大端机器的交换格式。
 
 ## 文件布局
 
@@ -25,6 +25,7 @@
 - `object_offset/object_length` 指向连续 value 对象区。
 - `journal_offset` 指向追加事务日志的起点。
 - 稳态恢复只依赖这一个主文件。Compaction 可以短暂创建临时文件。
+- 恢复不扫描或采用 `.compact.*` 文件；遗留临时文件不是提交标记。
 
 ## Superblock
 
@@ -130,7 +131,9 @@ Operation count 还必须能够由实际 payload 容纳，禁止先按伪造 cou
 3. 通过 unlink 后的 index/object spool 和 1 MiB 缓冲组装已加独占锁的临时主文件；checkpoint CRC 在顺序写入时增量计算，不重读完整输出。
 4. 最终只持有 commit mutex，复制 `[start_offset, end_offset)` journal delta，`fdatasync` 临时文件，`rename` 主路径，发布新文件代际与 WAL epoch，并同步父目录。该阶段不获取全部 shard 锁，也不遍历 live key。
 5. 释放 commit mutex 后逐 shard 迁移 entry：切点后的 value 按 journal delta 平移，切点前仍匹配 relocation epoch 的 value 指向新 checkpoint。被并发覆盖或删除的 entry 不会被旧 relocation 信息覆盖。
-6. 全部 entry 迁移完成后释放旧 inode。手动 `Compact()` 等待该过程完成；自动 compaction 在后台执行。
+6. 全部 entry 迁移完成后释放 engine 对旧代际的持有。手动 `Compact()` 等待迁移完成；已经取得快照的 reader 可以继续持有旧 fd，旧 inode 在最后一个引用结束后自然回收。自动 compaction 在后台执行。
+
+主文件旁的临时容器使用 `.compact.<pid>.<sequence>.<random nonce>` 命名并以 `O_EXCL` 创建。名称碰撞时换 nonce 重试，不删除碰撞文件；异常清理只 unlink 本次已经创建且尚未 rename 的路径。Rename 前的普通临时文件错误不会改变主代际，实例可以继续使用；读取当前主代际失败、主状态不变量错误和 rename 后错误会进入 sticky fatal。
 
 临时文件不参与恢复。任意崩溃点只能留下旧主文件或已经自包含的新主文件。
 

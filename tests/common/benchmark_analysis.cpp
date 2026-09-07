@@ -52,6 +52,17 @@ double extract_json_number(const std::string& json, const std::string& key) {
     return std::stod(json.substr(cursor, end - cursor));
 }
 
+double extract_json_number_with_fallback(
+    const std::string& json,
+    const std::string& preferred_key,
+    const std::string& fallback_key) {
+    const std::string preferred_needle = "\"" + preferred_key + "\":";
+    if (json.find(preferred_needle) != std::string::npos) {
+        return extract_json_number(json, preferred_key);
+    }
+    return extract_json_number(json, fallback_key);
+}
+
 std::vector<MicrobenchCaseResult> parse_microbench_results_json(const std::string& json) {
     std::vector<MicrobenchCaseResult> results;
     size_t search_from = 0;
@@ -133,14 +144,30 @@ BenchmarkBaselineComparison compare_benchmark_baseline(
     const double candidate_read_ops_per_s = extract_json_number(candidate_json, "read_ops_per_s");
     const double baseline_avg_write_latency_us = extract_json_number(baseline_json, "avg_write_latency_us");
     const double candidate_avg_write_latency_us = extract_json_number(candidate_json, "avg_write_latency_us");
-    const double baseline_p95_latency_us = extract_json_number(baseline_json, "approx_write_latency_p95_us");
-    const double candidate_p95_latency_us = extract_json_number(candidate_json, "approx_write_latency_p95_us");
-    const double baseline_p99_latency_us = extract_json_number(baseline_json, "approx_write_latency_p99_us");
-    const double candidate_p99_latency_us = extract_json_number(candidate_json, "approx_write_latency_p99_us");
-    const double baseline_fsync_pressure =
-        extract_json_number(baseline_json, "observed_fsync_pressure_per_1000_writes");
-    const double candidate_fsync_pressure =
-        extract_json_number(candidate_json, "observed_fsync_pressure_per_1000_writes");
+    const double baseline_p95_latency_us = extract_json_number_with_fallback(
+        baseline_json,
+        "measurement_write_latency_p95_us",
+        "approx_write_latency_p95_us");
+    const double candidate_p95_latency_us = extract_json_number_with_fallback(
+        candidate_json,
+        "measurement_write_latency_p95_us",
+        "approx_write_latency_p95_us");
+    const double baseline_p99_latency_us = extract_json_number_with_fallback(
+        baseline_json,
+        "measurement_write_latency_p99_us",
+        "approx_write_latency_p99_us");
+    const double candidate_p99_latency_us = extract_json_number_with_fallback(
+        candidate_json,
+        "measurement_write_latency_p99_us",
+        "approx_write_latency_p99_us");
+    const double baseline_fsync_pressure = extract_json_number_with_fallback(
+        baseline_json,
+        "measurement_fsync_pressure_per_1000_writes",
+        "observed_fsync_pressure_per_1000_writes");
+    const double candidate_fsync_pressure = extract_json_number_with_fallback(
+        candidate_json,
+        "measurement_fsync_pressure_per_1000_writes",
+        "observed_fsync_pressure_per_1000_writes");
     const double baseline_batch_fill = extract_json_number(baseline_json, "recent_batch_fill_per_1000");
     const double candidate_batch_fill = extract_json_number(candidate_json, "recent_batch_fill_per_1000");
 
